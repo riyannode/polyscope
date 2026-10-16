@@ -71,8 +71,9 @@ export async function testArtifact(root = process.cwd()) {
   checks.push({ tool: "get_quote", status: "passed", availability: quoteResult.structuredContent.availability, freshness: quoteResult.structuredContent.freshness, bookTimestamp: quoteResult.structuredContent.bookTimestamp, bookAgeMs: quoteResult.structuredContent.bookAgeMs });
   const prepareTool = tools.find((entry) => entry.name === "prepare_order_signing");
   if (!prepareTool) fail("prepare_order_signing was not returned by tools/list", "tool_catalog_invalid");
-  if (quoteResult.structuredContent.freshness !== "FRESH") {
-    checks.push({ tool: "prepare_order_signing", status: "skipped", reason: "live CLOB book is stale; deterministic payload preparation is covered by pnpm test" });
+  const bookAgeMs = quoteResult.structuredContent.bookAgeMs;
+  if (!Number.isSafeInteger(bookAgeMs) || bookAgeMs < 0 || bookAgeMs > 120_000) {
+    checks.push({ tool: "prepare_order_signing", status: "skipped", reason: "live CLOB book age is unknown, invalid, or exceeds the 120-second preparation limit; deterministic payload preparation is covered by pnpm test" });
   } else {
     const minimumShareMicros = toMicros(quoteResult.structuredContent.minOrderSize);
     const hundredthShares = (minimumShareMicros + 9_999n) / 10_000n;
