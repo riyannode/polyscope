@@ -17,6 +17,7 @@
   },
   "dependencies": {
     "@modelcontextprotocol/server": "2.0.0",
+    "fast-xml-parser": "5.11.2",
     "viem": "2.51.3",
     "zod": "4.4.3"
   },

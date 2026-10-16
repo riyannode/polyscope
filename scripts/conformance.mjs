@@ -49,12 +49,76 @@ export async function testArtifact(root = process.cwd()) {
   validateCallResult(response.result);
   if (response.result.isError === true) fail("sample tools/call returned isError: true", "tool_failed");
   validateSample(selected, config.arguments, response.result);
+  const checks = [{ tool: config.tool, status: "passed" }];
+  const researchTools = [
+    ["get_soccer_news", { limit: 3 }],
+    ...["PL", "PD", "SA", "CL"].map((league) => ["research_soccer", { league, days: 0, limit: 3 }]),
+  ];
+  for (const [toolName, argumentsValue] of researchTools) {
+    const tool = tools.find((entry) => entry.name === toolName);
+    if (!tool) fail(`${toolName} was not returned by tools/list`, "tool_catalog_invalid");
+    const result = await callTool(artifact, tool, argumentsValue);
+    checks.push({ tool: toolName, status: "passed", availability: result.structuredContent.availability, reason: result.structuredContent.reason });
+  }
+  const market = response.result.structuredContent?.markets?.find((entry) => entry.outcomes?.length > 0 && entry.acceptingOrders === true && entry.version != null);
+  const outcome = market?.outcomes?.[0];
+  if (!market || !outcome) fail("sample search did not return an accepting market outcome for quote conformance", "tool_failed");
+  const quoteTool = tools.find((entry) => entry.name === "get_quote");
+  if (!quoteTool) fail("get_quote was not returned by tools/list", "tool_catalog_invalid");
+  const quoteResult = await callTool(artifact, quoteTool, { marketId: market.marketId, assetId: outcome.assetId, side: "BUY", size: "1", depth: 5 });
+  checks.push({ tool: "get_quote", status: "passed", availability: quoteResult.structuredContent.availability, freshness: quoteResult.structuredContent.freshness, bookTimestamp: quoteResult.structuredContent.bookTimestamp, bookAgeMs: quoteResult.structuredContent.bookAgeMs });
+  const prepareTool = tools.find((entry) => entry.name === "prepare_order_signing");
+  if (!prepareTool) fail("prepare_order_signing was not returned by tools/list", "tool_catalog_invalid");
+  const minimumShareMicros = toMicros(quoteResult.structuredContent.minOrderSize);
+  const hundredthShares = (minimumShareMicros + 9_999n) / 10_000n;
+  const signingSize = formatHundredths(hundredthShares);
+  const preparedResult = await callTool(artifact, prepareTool, {
+    marketId: market.marketId,
+    assetId: outcome.assetId,
+    makerAddress: "0x0000000000000000000000000000000000000001",
+    signingAddress: "0x0000000000000000000000000000000000000001",
+    walletType: "EOA",
+    side: "BUY",
+    price: quoteResult.structuredContent.tickSize,
+    size: signingSize,
+    maxAmount: "999999999999999999999999999",
+  });
+  if (preparedResult.structuredContent.submitsOrder !== false || preparedResult.structuredContent.preparedOrder.market.outcome !== outcome.name) {
+    fail("prepared payload did not preserve the selected outcome or no-submit boundary", "result_invalid");
+  }
+  checks.push({ tool: "prepare_order_signing", status: "passed", submitsOrder: false });
   return {
     status: "passed",
-    sampleCall: { tool: config.tool, status: "passed" },
+    sampleCall: checks[0],
+    targetedCalls: checks.slice(1),
     artifact: { bytes: bytes.length, sha256: createHash("sha256").update(bytes).digest("hex") },
     discoveredToolCount: tools.length,
   };
+}
+
+async function callTool(artifact, tool, argumentsValue) {
+  const response = await runOperation(artifact, {
+    method: "tools/call",
+    params: { name: tool.name, arguments: argumentsValue },
+  });
+  validateCallResult(response.result);
+  if (response.result.isError === true) fail(`${tool.name} tools/call returned isError: true`, "tool_failed");
+  validateSample(tool, argumentsValue, response.result);
+  return response.result;
+}
+
+function toMicros(value) {
+  const [whole, fraction = ""] = value.split(".");
+  if (!/^\d+$/.test(whole) || !/^\d*$/.test(fraction) || fraction.length > 6) {
+    fail("provider minimum size is not a supported decimal", "tool_failed");
+  }
+  return BigInt(whole) * 1_000_000n + BigInt(fraction.padEnd(6, "0"));
+}
+
+function formatHundredths(value) {
+  const whole = value / 100n;
+  const fraction = (value % 100n).toString().padStart(2, "0");
+  return fraction === "00" ? String(whole) : `${whole}.${fraction}`;
 }
 
 async function validateArtifact(artifact) {
