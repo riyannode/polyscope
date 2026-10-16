@@ -16,6 +16,17 @@ function match(id, competition, date, status = "SCHEDULED") {
     score: { fullTime: { home: status === "FINISHED" ? 2 : null, away: status === "FINISHED" ? 1 : null } },
   };
 }
+const portfolioPosition = {
+  archived: false, avg_price: 0.42, condition_id: `0x${"2".repeat(64)}`, current_price: 0.51,
+  current_size: 12, current_value: 6.12, end_date: "2026-12-31T00:00:00Z", entry_cost_usdc: 5.04,
+  entry_fees_usdc: 0.02, event_id: "101", event_slug: "sample-event", first_entry_at: 1792231200,
+  icon: "https://example.test/market.png", last_event_at: 1792231200, mergeable: false,
+  name: "Sample outcome", negative_risk: false, opposite_outcome: "No", opposite_token_id: "456",
+  outcome: "Yes", outcome_index: 0, percent_pnl: 21.03, percent_realized_pnl: 0,
+  profile_image: "https://example.test/profile.png", proxy_wallet: "0x0000000000000000000000000000000000000001",
+  realized_pnl: 0, redeemable: false, slug: "sample-market", status: "OPEN", title: "Sample market title",
+  token_id: "123", total_cost_usdc: 5.06, total_pnl: 1.06, total_size: 12, unrealized_pnl: 1.06, verified: false,
+};
 const history = (teamId) => Array.from({ length: 5 }, (_, index) => {
   const homeId = index % 2 === 0 ? teamId : 303;
   const awayId = index % 2 === 0 ? 303 : teamId;
@@ -26,8 +37,12 @@ const history = (teamId) => Array.from({ length: 5 }, (_, index) => {
   };
 });
 
-globalThis.fetch = async (input) => {
+globalThis.fetch = async (input, init = {}) => {
   const url = new URL(typeof input === "string" ? input : input.url);
+  const scenario = process.env.POLYSCOPE_TEST_SCENARIO;
+  if (scenario === "submit-budget" && url.hostname !== "api.football-data.org" && url.pathname !== "/order") {
+    await new Promise((resolve) => setTimeout(resolve, 1_400));
+  }
   let body;
   if (url.hostname === "gamma-api.polymarket.com" && url.pathname === "/markets/1") {
     body = market;
@@ -41,6 +56,23 @@ globalThis.fetch = async (input) => {
     };
   } else if (url.hostname === "clob.polymarket.com" && url.pathname === `/clob-markets/${conditionId}`) {
     body = { fd: { r: 0.05, e: 1 } };
+  } else if (url.hostname === "clob.polymarket.com" && url.pathname === "/auth/derive-api-key") {
+    body = { apiKey: "fixture-api-key", secret: "dGVzdA==", passphrase: "fixture-passphrase" };
+  } else if (url.hostname === "clob.polymarket.com" && url.pathname === "/auth/ban-status/closed-only") {
+    body = { closed_only: false };
+  } else if (url.hostname === "clob.polymarket.com" && url.pathname === "/balance-allowance/update") {
+    body = {};
+  } else if (url.hostname === "clob.polymarket.com" && url.pathname === "/balance-allowance") {
+    body = {
+      balance: "100000000",
+      allowances: { "0xE111180000d2663C0091e4f400237545B87B996B": "100000000" },
+    };
+  } else if (url.hostname === "clob.polymarket.com" && url.pathname === "/order" && init.method === "POST") {
+    return new Response(JSON.stringify({ success: false, errorMsg: "offline fixture blocks order submission" }), {
+      status: 403, headers: { "content-type": "application/json" },
+    });
+  } else if (url.hostname === "polymarket.com" && url.pathname === "/api/geoblock") {
+    body = { blocked: false };
   } else if (url.hostname === "api.football-data.org" && url.pathname.startsWith("/v4/competitions/")) {
     const league = url.pathname.split("/")[3];
     if (url.searchParams.get("dateFrom") === "2026-11-01") return new Response("provider unavailable", { status: 403 });
@@ -59,7 +91,16 @@ globalThis.fetch = async (input) => {
     body = `<?xml version="1.0"?><rss><channel><item><title>Arsenal confirms training update</title><link>https://www.espn.com/soccer/story/1</link><description>Arsenal update.</description><pubDate>${publishedAt}</pubDate></item><item><title>General football headline</title><link>https://www.espn.com/soccer/story/2</link><pubDate>${publishedAt}</pubDate></item></channel></rss>`;
     return new Response(body, { headers: { "content-type": "application/rss+xml" } });
   } else if (url.hostname === "data-api.polymarket.com" && url.pathname === "/v2/positions") {
-    body = { data: [] };
+    const secondPage = url.searchParams.get("cursor") === "fixture-next-page";
+    body = {
+      data: [secondPage ? { ...portfolioPosition, condition_id: `0x${"3".repeat(64)}`, token_id: "789" } : portfolioPosition],
+      pagination: {
+        has_more: !secondPage,
+        limit: 10,
+        next_cursor: secondPage ? null : "fixture-next-page",
+        offset: secondPage ? 10 : 0,
+      },
+    };
   } else {
     return new Response(JSON.stringify({ error: "unexpected fixture request" }), {
       status: 404, headers: { "content-type": "application/json" },

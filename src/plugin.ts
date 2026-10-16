@@ -27,6 +27,8 @@ const ESPN_SOCCER_FEED = "https://www.espn.com/espn/rss/soccer/news";
 const FOOTBALL_DATA_API = "https://api.football-data.org/v4";
 const NEWS_STALE_AFTER_MS = 24 * 60 * 60 * 1000;
 const MAX_RSS_BYTES = 256 * 1024;
+const SUBMIT_EXECUTION_BUDGET_MS = 7_000;
+const POST_RECONCILIATION_RESERVE_MS = 3_500;
 const RSS_XML_PARSER = new XMLParser({ ignoreAttributes: true, processEntities: false, trimValues: false });
 const ZERO32 = `0x${"0".repeat(64)}` as const;
 const ORDER_TYPE = "Order(uint256 salt,address maker,address signer,uint256 tokenId,uint256 makerAmount,uint256 takerAmount,uint8 side,uint8 signatureType,uint256 timestamp,bytes32 metadata,bytes32 builder)";
@@ -258,22 +260,55 @@ const positionsResponseSchema = z.array(z.object({
   realized_pnl: z.number().finite().optional(), unrealized_pnl: z.number().finite().optional(),
   total_pnl: z.number().finite().optional(), redeemable: z.boolean().optional(), token_id: z.string().optional(),
 }).passthrough());
+const positionsPageSchema = z.object({
+  data: positionsResponseSchema,
+  pagination: z.object({
+    has_more: z.boolean(), limit: z.number().int().nonnegative(),
+    next_cursor: z.string().nullable(), offset: z.number().int().nonnegative(),
+  }).passthrough(),
+}).passthrough();
 
-async function getJson(url: string): Promise<unknown> {
+type ExecutionBudget = { deadline: number; reserveMs: number };
+
+function requestSignal(maximumMs: number, budget?: ExecutionBudget): AbortSignal {
+  const remainingMs = budget === undefined
+    ? maximumMs
+    : Math.min(maximumMs, Math.floor(budget.deadline - performance.now() - budget.reserveMs));
+  if (remainingMs <= 0) throw new Error("PS_EXECUTION_BUDGET_EXHAUSTED: Safe time for Polymarket preflight, submission, and reconciliation is unavailable; no order was sent.");
+  return AbortSignal.timeout(remainingMs);
+}
+
+function assertExecutionBudget(deadline: number, reserveMs: number): void {
+  if (deadline - performance.now() < reserveMs) {
+    throw new Error("PS_EXECUTION_BUDGET_EXHAUSTED: Safe time for the FAK request and one reconciliation is unavailable; no order was sent.");
+  }
+}
+
+function isBudgetLimitedTimeout(error: unknown, budget?: ExecutionBudget): boolean {
+  return budget !== undefined && error instanceof DOMException && error.name === "TimeoutError"
+    && budget.deadline - performance.now() <= budget.reserveMs + 100;
+}
+
+async function getJson(url: string, budget?: ExecutionBudget): Promise<unknown> {
   try {
     const response = await fetch(url, {
       headers: { accept: "application/json" },
       redirect: "error",
-      signal: AbortSignal.timeout(2_500),
+      signal: requestSignal(2_500, budget),
     });
     if (!response.ok) throw new Error(`PS_PROVIDER_UNAVAILABLE: Polymarket read returned HTTP ${response.status}.`);
     let body: string;
     try { body = await boundedResponseText(response, 1_000_000); }
-    catch { throw new Error("PS_RESPONSE_TOO_LARGE: Provider response exceeded the 1 MiB limit."); }
+    catch (error) {
+      if (isBudgetLimitedTimeout(error, budget)) throw new Error("PS_EXECUTION_BUDGET_EXHAUSTED: Safe time for the remaining Polymarket preflight and execution steps ran out; no order was sent.");
+      if (error instanceof DOMException && error.name === "TimeoutError") throw new Error("PS_PROVIDER_TIMEOUT: Polymarket read timed out.");
+      throw new Error("PS_RESPONSE_TOO_LARGE: Provider response exceeded the 1 MiB limit.");
+    }
     try { return JSON.parse(body) as unknown; }
     catch { throw new Error("PS_PROVIDER_INVALID: Polymarket returned invalid JSON."); }
   } catch (error) {
     if (error instanceof Error && error.message.startsWith("PS_")) throw error;
+    if (isBudgetLimitedTimeout(error, budget)) throw new Error("PS_EXECUTION_BUDGET_EXHAUSTED: Safe time for the remaining Polymarket preflight and execution steps ran out; no order was sent.");
     if (error instanceof DOMException && error.name === "TimeoutError") throw new Error("PS_PROVIDER_TIMEOUT: Polymarket read timed out.");
     throw new Error("PS_PROVIDER_UNAVAILABLE: Polymarket read failed before a response was received.");
   }
@@ -824,7 +859,8 @@ const EXECUTION_APPROVAL_FIELDS = [
   { name: "limitPriceMicros", type: "uint256" }, { name: "sizeMicros", type: "uint256" },
   { name: "maxNominalMicros", type: "uint256" }, { name: "maxFeeMicros", type: "uint256" },
   { name: "feeRateMicros", type: "uint256" }, { name: "feeExponent", type: "uint8" }, { name: "orderType", type: "string" },
-  { name: "signatureType", type: "uint8" }, { name: "deadline", type: "uint256" },
+  { name: "signatureType", type: "uint8" }, { name: "signingAddress", type: "address" },
+  { name: "orderHash", type: "bytes32" }, { name: "deadline", type: "uint256" },
 ] as const;
 const MICRO = 1_000_000n;
 
@@ -874,6 +910,7 @@ function executionApprovalPayload(prepared: PreparedOrderBase) {
       maxNominalMicros: toUnits(order.maxNominalPusd, 6), maxFeeMicros: toUnits(order.maxFeePusd, 6),
       feeRateMicros: toUnits(order.feeRate, 6), feeExponent: order.feeExponent,
       orderType: FAK, signatureType: prepared.wallet.signatureType,
+      signingAddress: address(prepared.wallet.signingAddress), orderHash: hashTypedData(standardOrderPayload(prepared)),
       deadline: BigInt(order.timestamp) / 1000n + 300n,
     },
   } as const;
@@ -885,7 +922,7 @@ function typedDataDigest(prepared: PreparedOrderBase): Hex {
     : hashTypedData(standardOrderPayload(prepared));
 }
 
-async function validateWalletSignature(prepared: PreparedOrder, signature: Hex) {
+async function validateWalletSignature(prepared: PreparedOrder, signature: Hex, budget?: ExecutionBudget) {
   const expected = address(prepared.wallet.signingAddress);
   let recovered: Address | null = null;
   try {
@@ -907,13 +944,15 @@ async function validateWalletSignature(prepared: PreparedOrder, signature: Hex) 
     const response = await fetch(POLYGON_RPC, {
       method: "POST", headers: { accept: "application/json", "content-type": "application/json" },
       body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "eth_call", params: [{ to: prepared.wallet.makerAddress, data: `${selector}${encoded.slice(2)}` }, "latest"] }),
-      redirect: "error", signal: AbortSignal.timeout(1_500),
+      redirect: "error", signal: requestSignal(1_500, budget),
     });
     if (!response.ok) return { valid: false, recovered, encoding: prepared.wallet.type === "DEPOSIT_WALLET" ? "ERC-7739" as const : "EIP-712" as const, walletValidation: "UNAVAILABLE" as const, signedSignature: null };
     const result = z.object({ result: z.string().regex(/^0x[0-9a-fA-F]*$/) }).safeParse(JSON.parse(await boundedResponseText(response, 16_384)) as unknown);
     const valid = result.success && result.data.result.toLowerCase().startsWith("0x1626ba7e");
     return { valid, recovered, encoding: prepared.wallet.type === "DEPOSIT_WALLET" ? "ERC-7739" as const : "EIP-712" as const, walletValidation: valid ? "VALIDATED" as const : "INVALID" as const, signedSignature: valid ? signedSignature : null };
-  } catch {
+  } catch (error) {
+    if (error instanceof Error && error.message.startsWith("PS_EXECUTION_BUDGET_EXHAUSTED")) throw error;
+    if (isBudgetLimitedTimeout(error, budget)) throw new Error("PS_EXECUTION_BUDGET_EXHAUSTED: Safe time for the remaining Polymarket preflight and execution steps ran out; no order was sent.");
     return { valid: false, recovered, encoding: prepared.wallet.type === "DEPOSIT_WALLET" ? "ERC-7739" as const : "EIP-712" as const, walletValidation: "UNAVAILABLE" as const, signedSignature: null };
   }
 }
@@ -929,7 +968,10 @@ function l1Headers(auth: z.infer<typeof clobAuthSchema>, signerAddress: string) 
   };
 }
 
-async function deriveClobCredentials(authInput: z.infer<typeof clobAuthSchema>, signerAddress: string, createOnMissing = false): Promise<ClobCredentials> {
+async function deriveClobCredentials(
+  authInput: z.infer<typeof clobAuthSchema>, signerAddress: string, createOnMissing = false,
+  budget?: ExecutionBudget,
+): Promise<ClobCredentials> {
   const auth = clobAuthSchema.parse(authInput);
   const signer = address(signerAddress);
   let recovered: Address;
@@ -941,10 +983,16 @@ async function deriveClobCredentials(authInput: z.infer<typeof clobAuthSchema>, 
   if (recovered.toLowerCase() !== signer.toLowerCase()) throw new Error("PS_AUTH_WALLET_MISMATCH: ClobAuth signer differs from the selected order signer.");
 
   const read = async (path: "/auth/derive-api-key" | "/auth/api-key", method: "GET" | "POST") => {
-    const response = await fetch(`${CLOB_API}${path}`, {
-      method, headers: { accept: "application/json", ...l1Headers(auth, signer) },
-      redirect: "error", signal: AbortSignal.timeout(1_500),
-    });
+    let response: Response;
+    try {
+      response = await fetch(`${CLOB_API}${path}`, {
+        method, headers: { accept: "application/json", ...l1Headers(auth, signer) },
+        redirect: "error", signal: requestSignal(1_500, budget),
+      });
+    } catch (error) {
+      if (isBudgetLimitedTimeout(error, budget)) throw new Error("PS_EXECUTION_BUDGET_EXHAUSTED: Safe time for the remaining Polymarket preflight and execution steps ran out; no order was sent.");
+      throw error;
+    }
     if (!response.ok) return { status: response.status, data: null };
     const data: unknown = JSON.parse(await boundedResponseText(response, 32_768));
     return { status: response.status, data };
@@ -967,24 +1015,30 @@ function l2Signature(secret: string, timestamp: string, method: string, path: st
 async function clobPrivateRequest(
   credentials: ClobCredentials, signerAddress: string, method: "GET" | "POST" | "DELETE",
   path: string, body?: string, signingPath = path,
+  budget?: ExecutionBudget,
 ): Promise<{ status: number; data: unknown | null }> {
   const timestamp = String(Math.floor(Date.now() / 1000));
   const signature = l2Signature(credentials.secret, timestamp, method, signingPath, body ?? "");
-  const response = await fetch(`${CLOB_API}${path}`, {
-    method,
-    headers: {
-      accept: "application/json", "content-type": "application/json",
-      POLY_ADDRESS: signerAddress, POLY_API_KEY: credentials.apiKey, POLY_PASSPHRASE: credentials.passphrase,
-      POLY_SIGNATURE: signature, POLY_TIMESTAMP: timestamp,
-    },
-    ...(body === undefined ? {} : { body }), redirect: "error", signal: AbortSignal.timeout(1_500),
-  });
-  if (response.status === 204 || response.status === 404) return { status: response.status, data: null };
-  const text = await boundedResponseText(response, 1_000_000);
-  let data: unknown;
-  try { data = JSON.parse(text) as unknown; }
-  catch { return { status: response.status, data: null }; }
-  return { status: response.status, data };
+  try {
+    const response = await fetch(`${CLOB_API}${path}`, {
+      method,
+      headers: {
+        accept: "application/json", "content-type": "application/json",
+        POLY_ADDRESS: signerAddress, POLY_API_KEY: credentials.apiKey, POLY_PASSPHRASE: credentials.passphrase,
+        POLY_SIGNATURE: signature, POLY_TIMESTAMP: timestamp,
+      },
+      ...(body === undefined ? {} : { body }), redirect: "error", signal: requestSignal(1_500, budget),
+    });
+    if (response.status === 204 || response.status === 404) return { status: response.status, data: null };
+    const text = await boundedResponseText(response, 1_000_000);
+    let data: unknown;
+    try { data = JSON.parse(text) as unknown; }
+    catch { return { status: response.status, data: null }; }
+    return { status: response.status, data };
+  } catch (error) {
+    if (isBudgetLimitedTimeout(error, budget)) throw new Error("PS_EXECUTION_BUDGET_EXHAUSTED: Safe time for the remaining Polymarket preflight and execution steps ran out; no order was sent.");
+    throw error;
+  }
 }
 
 function parseBaseUnits(value: string | number): bigint {
@@ -995,15 +1049,15 @@ function parseBaseUnits(value: string | number): bigint {
 
 async function refreshBalanceAllowance(
   credentials: ClobCredentials, signerAddress: string, signatureTypeValue: number,
-  assetType: "COLLATERAL" | "CONDITIONAL", tokenId?: string,
+  assetType: "COLLATERAL" | "CONDITIONAL", tokenId?: string, budget?: ExecutionBudget,
 ): Promise<z.infer<typeof balanceAllowanceSchema>> {
   const query = new URLSearchParams({ asset_type: assetType, signature_type: String(signatureTypeValue) });
   if (tokenId !== undefined) query.set("token_id", tokenId);
-  const result = await clobPrivateRequest(credentials, signerAddress, "GET", `/balance-allowance/update?${query.toString()}`, undefined, "/balance-allowance/update");
+  const result = await clobPrivateRequest(credentials, signerAddress, "GET", `/balance-allowance/update?${query.toString()}`, undefined, "/balance-allowance/update", budget);
   if (result.status < 200 || result.status >= 300) {
     throw new Error(`PS_BALANCE_ALLOWANCE: Polymarket could not refresh ${assetType.toLowerCase()} balance and allowance.`);
   }
-  const readResult = await clobPrivateRequest(credentials, signerAddress, "GET", `/balance-allowance?${query.toString()}`, undefined, "/balance-allowance");
+  const readResult = await clobPrivateRequest(credentials, signerAddress, "GET", `/balance-allowance?${query.toString()}`, undefined, "/balance-allowance", budget);
   const parsed = balanceAllowanceSchema.safeParse(readResult.data);
   if (readResult.status < 200 || readResult.status >= 300 || !parsed.success) throw new Error("PS_BALANCE_ALLOWANCE: Polymarket returned an unsupported balance and allowance shape.");
   return parsed.data;
@@ -1020,7 +1074,7 @@ function assertAllowanceForSpender(
   }
 }
 
-async function validateExecutionSnapshot(prepared: PreparedOrder): Promise<{
+async function validateExecutionSnapshot(prepared: PreparedOrder, budget?: ExecutionBudget): Promise<{
   market: z.infer<typeof gammaMarketSchema>; book: z.infer<typeof bookSchema>;
   feeRate: string; feeExponent: number; blocked: boolean;
 }> {
@@ -1028,8 +1082,8 @@ async function validateExecutionSnapshot(prepared: PreparedOrder): Promise<{
   const bookUrl = new URL(`${CLOB_API}/book`);
   bookUrl.searchParams.set("token_id", order.assetId);
   const [rawMarket, rawBook, rawMarketInfo, rawGeo] = await Promise.all([
-    getJson(`${GAMMA_API}/markets/${encodeURIComponent(approvedMarket.id)}`),
-    getJson(bookUrl.toString()), getJson(`${CLOB_API}/clob-markets/${encodeURIComponent(approvedMarket.conditionId)}`), getJson(GEOBLOCK_API),
+    getJson(`${GAMMA_API}/markets/${encodeURIComponent(approvedMarket.id)}`, budget),
+    getJson(bookUrl.toString(), budget), getJson(`${CLOB_API}/clob-markets/${encodeURIComponent(approvedMarket.conditionId)}`, budget), getJson(GEOBLOCK_API, budget),
   ]);
   const market = gammaMarketSchema.parse(rawMarket);
   const book = bookSchema.parse(rawBook);
@@ -1617,7 +1671,7 @@ async function createServer() {
     "submit_fak_order",
     {
       title: "Submit an explicitly approved Polymarket FAK order",
-      description: "Submits exactly one signed FAK order after validating the separately signed user approval, wallet binding, live market/book/fee, account close-only state, geoblock, balance, and exchange allowance. A timeout is reconciled once by order hash and is never resubmitted. The PayBox agent must obtain signatures through request_wallet_sign and poll get_request before this call.",
+      description: "Makes one signed FAK POST attempt per tool invocation after validating user approval, wallet binding, live market/book/fee, account close-only state, geoblock, balance, and exchange allowance. Ambiguous POST results get at most one order-hash read-back and are never automatically resubmitted; this does not guarantee exactly-once execution. The PayBox agent must obtain signatures through request_wallet_sign and poll get_request before this call.",
       inputSchema: z.object({
         preparedOrder: preparedOrderSchema,
         executionApprovalSignature: z.string().regex(/^0x[0-9a-fA-F]{130}$/),
@@ -1628,11 +1682,13 @@ async function createServer() {
       annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
     },
     async ({ preparedOrder: inputOrder, executionApprovalSignature, orderSignature, clobAuth }) => {
+      const executionDeadline = performance.now() + SUBMIT_EXECUTION_BUDGET_MS;
+      const preflightBudget: ExecutionBudget = { deadline: executionDeadline, reserveMs: POST_RECONCILIATION_RESERVE_MS };
       const prepared = preparedOrderSchema.parse(inputOrder);
       const amounts = validatePreparedOrder(prepared);
       const [approvalValid, orderValidation] = await Promise.all([
         validateExecutionApproval(prepared, signatureHex(executionApprovalSignature)),
-        validateWalletSignature(prepared, signatureHex(orderSignature)),
+        validateWalletSignature(prepared, signatureHex(orderSignature), preflightBudget),
       ]);
       if (!approvalValid) return tradeToolResult({
         status: "REJECTED", orderId: null, orderType: FAK, requestedSize: prepared.order.size,
@@ -1675,13 +1731,13 @@ async function createServer() {
       const assetType = prepared.order.side === "BUY" ? "COLLATERAL" as const : "CONDITIONAL" as const;
       try {
         [credentials, snapshot] = await Promise.all([
-          deriveClobCredentials(clobAuth, prepared.wallet.signingAddress, true),
-          validateExecutionSnapshot(prepared),
+          deriveClobCredentials(clobAuth, prepared.wallet.signingAddress, true, preflightBudget),
+          validateExecutionSnapshot(prepared, preflightBudget),
         ]);
         const [closeOnlyResult, allowanceResult] = await Promise.all([
-          clobPrivateRequest(credentials, prepared.wallet.signingAddress, "GET", "/auth/ban-status/closed-only"),
+          clobPrivateRequest(credentials, prepared.wallet.signingAddress, "GET", "/auth/ban-status/closed-only", undefined, undefined, preflightBudget),
           refreshBalanceAllowance(credentials, prepared.wallet.signingAddress,
-            prepared.wallet.signatureType, assetType, assetType === "CONDITIONAL" ? prepared.order.assetId : undefined),
+            prepared.wallet.signatureType, assetType, assetType === "CONDITIONAL" ? prepared.order.assetId : undefined, preflightBudget),
         ]);
         if (closeOnlyResult.status < 200 || closeOnlyResult.status >= 300 || closeOnlyResult.data === null) {
           throw new Error("PS_ACCOUNT_STATUS: Polymarket account status could not be verified.");
@@ -1692,7 +1748,7 @@ async function createServer() {
           return tradeToolResult({
             status: "REJECTED", orderId: null, orderType: FAK, requestedSize: prepared.order.size,
             filledSize: null, remainingSize: prepared.order.size, tradeIds: [],
-            message: snapshot.blocked ? "Polymarket geoblock prevents execution from this request location; no order was sent." : "This Polymarket account is close-only; BUY is not allowed.",
+            message: snapshot.blocked ? "Polymarket geoblock blocked the PayBox egress IP; this does not verify user eligibility, and no order was sent." : "This Polymarket account is close-only; BUY is not allowed.",
             errorCode: snapshot.blocked ? "PS_GEOBLOCKED" : "PS_ACCOUNT_CLOSE_ONLY",
           });
         }
@@ -1712,6 +1768,7 @@ async function createServer() {
           ? DOMAIN_BY_MARKET.v2.verifyingContract
           : prepared.market.negRisk ? DOMAIN_BY_MARKET.ctf.negRisk.verifyingContract : DOMAIN_BY_MARKET.ctf.regular.verifyingContract;
         assertAllowanceForSpender(allowance, spender, requiredUnits);
+        assertExecutionBudget(executionDeadline, POST_RECONCILIATION_RESERVE_MS);
       } catch (error) {
         const message = error instanceof Error && error.message.startsWith("PS_") ? error.message.split(":").slice(1).join(":").trim() : "Polymarket balance or allowance could not be verified; no order was sent.";
         return tradeToolResult({
@@ -1744,15 +1801,15 @@ async function createServer() {
       });
       let posted: { status: number; data: unknown | null };
       try {
-        posted = await clobPrivateRequest(credentials, prepared.wallet.signingAddress, "POST", "/order", orderBody);
+        posted = await clobPrivateRequest(credentials, prepared.wallet.signingAddress, "POST", "/order", orderBody, "/order", { deadline: executionDeadline, reserveMs: 2_000 });
       } catch {
-        const reconciled = await clobPrivateRequest(credentials, prepared.wallet.signingAddress, "GET", `/data/order/${orderHash}`).catch(() => null);
+        const reconciled = await clobPrivateRequest(credentials, prepared.wallet.signingAddress, "GET", `/data/order/${orderHash}`, undefined, undefined, { deadline: executionDeadline, reserveMs: 0 }).catch(() => null);
         const known = reconciled?.status === 200 && reconciled.data !== null
           ? orderStatusResult({ orderId: orderHash, requestedSize: prepared.order.size, record: reconciled.data }) : null;
         return tradeToolResult(known ?? {
           status: "UNKNOWN", orderId: orderHash, orderType: FAK, requestedSize: prepared.order.size,
           filledSize: null, remainingSize: null, tradeIds: [],
-          message: "Order submission timed out or returned no response. One read-only reconciliation found no authoritative result; do not resubmit.",
+          message: "Order submission timed out or returned no response. Bounded read-only reconciliation did not confirm a result within this invocation; do not resubmit.",
           errorCode: "PS_SUBMISSION_UNKNOWN",
         });
       }
@@ -1764,13 +1821,13 @@ async function createServer() {
           message: "Polymarket rejected the FAK request; no accepted order ID was returned.",
           errorCode: "PS_CLOB_REJECTED",
         });
-        const reconciled = await clobPrivateRequest(credentials, prepared.wallet.signingAddress, "GET", `/data/order/${orderHash}`).catch(() => null);
+        const reconciled = await clobPrivateRequest(credentials, prepared.wallet.signingAddress, "GET", `/data/order/${orderHash}`, undefined, undefined, { deadline: executionDeadline, reserveMs: 0 }).catch(() => null);
         const known = reconciled?.status === 200 && reconciled.data !== null
           ? orderStatusResult({ orderId: orderHash, requestedSize: prepared.order.size, record: reconciled.data }) : null;
         return tradeToolResult(known ?? {
           status: "UNKNOWN", orderId: orderHash, orderType: FAK, requestedSize: prepared.order.size,
           filledSize: null, remainingSize: null, tradeIds: [],
-          message: "Polymarket returned an ambiguous submission result. One read-only reconciliation found no authoritative result; do not resubmit.",
+          message: "Polymarket returned an ambiguous submission result. Bounded read-only reconciliation did not confirm a result within this invocation; do not resubmit.",
           errorCode: "PS_SUBMISSION_UNKNOWN",
         });
       }
@@ -1782,13 +1839,13 @@ async function createServer() {
       });
       const orderId = response.data.orderID;
       if (posted.status < 200 || posted.status >= 300 || response.data.success !== true || !orderId) {
-        const reconciled = await clobPrivateRequest(credentials, prepared.wallet.signingAddress, "GET", `/data/order/${orderHash}`).catch(() => null);
+        const reconciled = await clobPrivateRequest(credentials, prepared.wallet.signingAddress, "GET", `/data/order/${orderHash}`, undefined, undefined, { deadline: executionDeadline, reserveMs: 0 }).catch(() => null);
         const known = reconciled?.status === 200 && reconciled.data !== null
           ? orderStatusResult({ orderId: orderHash, requestedSize: prepared.order.size, record: reconciled.data }) : null;
         return tradeToolResult(known ?? {
           status: "UNKNOWN", orderId: orderId ?? orderHash, orderType: FAK, requestedSize: prepared.order.size,
           filledSize: null, remainingSize: null, tradeIds: response.data.tradeIDs ?? [],
-          message: "The CLOB response did not confirm acceptance and fill state. One read-only reconciliation found no authoritative result; do not resubmit.",
+          message: "The CLOB response did not confirm acceptance and fill state. Bounded read-only reconciliation did not confirm a result within this invocation; do not resubmit.",
           errorCode: "PS_SUBMISSION_UNKNOWN",
         });
       }
@@ -1847,25 +1904,36 @@ async function createServer() {
     "get_portfolio",
     {
       title: "Read public Polymarket positions and PnL",
-      description: "Reads the public position and PnL view for the supplied address. The address is caller-provided and is not treated as proof of wallet ownership. This returns single-market positions only, not combos.",
-      inputSchema: z.object({ walletAddress: addressSchema, limit: z.number().int().min(1).max(50).default(20) }).strict(),
-      outputSchema: z.object({ walletAddress: addressSchema, addressBinding: z.literal("PUBLIC_ADDRESS_UNVERIFIED"), observedAt: z.string().datetime(), sourceUrl: z.string().url(), positions: z.array(positionsResponseSchema.element) }).strict(),
+      description: "Reads one cursor-paginated page of the default OPEN single-market positions and PnL view from Polymarket Data API v2. Pass nextCursor to continue; complete is true only after the final page of this view. The caller-provided address is not proof of wallet ownership. Closed positions and combos are not included.",
+      inputSchema: z.object({
+        walletAddress: addressSchema, limit: z.number().int().min(1).max(50).default(20),
+        cursor: z.string().min(1).max(4_096).optional(),
+      }).strict(),
+      outputSchema: z.object({
+        walletAddress: addressSchema, addressBinding: z.literal("PUBLIC_ADDRESS_UNVERIFIED"),
+        observedAt: z.string().datetime(), sourceUrl: z.string().url(), positions: positionsResponseSchema,
+        complete: z.boolean(), hasMore: z.boolean(), nextCursor: z.string().nullable(),
+      }).strict(),
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
     },
-    async ({ walletAddress, limit }) => {
+    async ({ walletAddress, limit, cursor }) => {
       const url = new URL(`${DATA_API}/v2/positions`);
       url.searchParams.set("user", walletAddress);
       url.searchParams.set("limit", String(limit));
+      url.searchParams.set("status", "OPEN");
+      if (cursor !== undefined) url.searchParams.set("cursor", cursor);
       const raw = await getJson(url.toString());
-      const array = positionsResponseSchema.safeParse(raw);
-      const envelope = z.object({ data: positionsResponseSchema }).safeParse(raw);
-      const positions = array.success ? array.data : envelope.success ? envelope.data.data : null;
-      if (positions === null) throw new Error("PS_PORTFOLIO_INVALID: Polymarket returned an unsupported positions response.");
+      const page = positionsPageSchema.safeParse(raw);
+      if (!page.success || page.data.pagination.has_more !== (page.data.pagination.next_cursor !== null)) {
+        throw new Error("PS_PORTFOLIO_INVALID: Polymarket returned an unsupported positions page or inconsistent cursor metadata.");
+      }
+      const { data: positions, pagination } = page.data;
       return {
-        content: [{ type: "text", text: `Read ${positions.length} public single-market positions for the supplied address.` }],
+        content: [{ type: "text", text: `Read ${positions.length} public single-market positions for the supplied address; ${pagination.has_more ? "more pages remain" : "this is the final page"}.` }],
         structuredContent: {
           walletAddress, addressBinding: "PUBLIC_ADDRESS_UNVERIFIED", observedAt: new Date().toISOString(),
-          sourceUrl: url.toString(), positions,
+          sourceUrl: url.toString(), positions, complete: !pagination.has_more,
+          hasMore: pagination.has_more, nextCursor: pagination.next_cursor,
         },
       };
     },

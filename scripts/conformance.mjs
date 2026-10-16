@@ -5,6 +5,8 @@ import { basename, dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { realpathSync } from "node:fs";
 import { createInterface } from "node:readline";
+import { hashTypedData } from "viem";
+import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 
 import { checkEnvironment, ConformanceError, release, reportConformance } from "./report.mjs";
 import { withProcess } from "./process.mjs";
@@ -147,6 +149,65 @@ export async function testOfflineArtifact(root = process.cwd()) {
   if (approval?.orderType !== "FAK" || approval?.maxNominalMicros !== "5130000" || approval?.limitPriceMicros !== "500000" || approval?.sizeMicros !== "10000000" || approval?.feeRateMicros !== "50000" || approval?.feeExponent !== 1) {
     fail("execution approval did not bind FAK and the fee-inclusive cap", "order_policy_invalid");
   }
+  const replaySigner = privateKeyToAccount(generatePrivateKey());
+  const replayOrder = await callTool(artifact, prepareTool, {
+    ...base, makerAddress: replaySigner.address, signingAddress: replaySigner.address,
+    side: "BUY", priceLimit: "0.50",
+  }, { fixtures: true });
+  const replayPrepared = replayOrder.structuredContent.preparedOrder;
+  const replayApprovalData = replayOrder.structuredContent.executionApprovalSigningIntent.typedData;
+  const replayApprovalSignature = await replaySigner.signTypedData(replayApprovalData);
+  if (replayApprovalData.message.orderHash !== hashTypedData(replayPrepared.typedData)
+    || replayApprovalData.message.signingAddress.toLowerCase() !== replaySigner.address.toLowerCase()) {
+    fail("execution approval did not bind the exact order hash and signing address", "approval_binding_invalid");
+  }
+  const replayArgs = {
+    preparedOrder: replayPrepared,
+    executionApprovalSignature: replayApprovalSignature,
+    orderSignature: `0x${"0".repeat(130)}`,
+    clobAuth: { timestamp: String(Math.floor(Date.now() / 1000)), nonce: "0", signature: `0x${"0".repeat(130)}` },
+  };
+  const approvedOrderCheck = await callTool(artifact, submitTool, replayArgs, { fixtures: true });
+  if (approvedOrderCheck.structuredContent.errorCode !== "PS_SIGNATURE_INVALID") {
+    fail("valid approval for order A was not distinguished from its invalid order signature", "approval_binding_invalid");
+  }
+  const saltReplay = await callTool(artifact, submitTool, {
+    ...replayArgs,
+    preparedOrder: { ...replayPrepared, order: { ...replayPrepared.order, salt: (BigInt(replayPrepared.order.salt) + 1n).toString() } },
+  }, { fixtures: true });
+  if (saltReplay.structuredContent.errorCode !== "PS_APPROVAL_INVALID") {
+    fail("approval for order A authorized order B with a different salt", "approval_replay_accepted");
+  }
+  const otherReplaySigner = privateKeyToAccount(generatePrivateKey());
+  const signerReplay = await callTool(artifact, submitTool, {
+    ...replayArgs,
+    preparedOrder: {
+      ...replayPrepared,
+      wallet: {
+        ...replayPrepared.wallet, makerAddress: otherReplaySigner.address,
+        signingAddress: otherReplaySigner.address, orderSignerAddress: otherReplaySigner.address,
+      },
+    },
+  }, { fixtures: true });
+  if (signerReplay.structuredContent.errorCode !== "PS_APPROVAL_INVALID") {
+    fail("approval for order A authorized an order with a different signer", "approval_replay_accepted");
+  }
+  const clobAuthTool = tools.find((tool) => tool.name === "prepare_clob_auth");
+  const clobAuthResult = await callTool(artifact, clobAuthTool, { signerAddress: replaySigner.address, nonce: "0" }, { fixtures: true });
+  const clobAuth = {
+    timestamp: clobAuthResult.structuredContent.timestamp,
+    nonce: clobAuthResult.structuredContent.nonce,
+    signature: await replaySigner.signTypedData(clobAuthResult.structuredContent.typedData),
+  };
+  const budgetResult = await callTool(artifact, submitTool, {
+    ...replayArgs,
+    orderSignature: await replaySigner.signTypedData(replayPrepared.typedData),
+    clobAuth,
+  }, { fixtures: true, fixtureScenario: "submit-budget" });
+  if (budgetResult.structuredContent.status !== "FAILED"
+    || budgetResult.structuredContent.errorCode !== "PS_EXECUTION_BUDGET_EXHAUSTED") {
+    fail("submit did not stop before its FAK POST when safe budget for reconciliation was unavailable", "submit_budget_invalid");
+  }
   const sell = await callTool(artifact, prepareTool, { ...base, side: "SELL", priceLimit: "0.49" }, { fixtures: true });
   if (sell.structuredContent.preparedOrder.order.side !== "SELL" || sell.structuredContent.preparedOrder.order.orderType !== "FAK") {
     fail("SELL preparation did not preserve the user-selected FAK order", "order_policy_invalid");
@@ -231,8 +292,17 @@ export async function testOfflineArtifact(root = process.cwd()) {
   if (unavailable.structuredContent.availability !== "UNAVAILABLE") fail("provider failure was presented as available soccer data", "provider_failure_hidden");
   const portfolioTool = tools.find((tool) => tool.name === "get_portfolio");
   const portfolio = await callTool(artifact, portfolioTool, { walletAddress: "0x0000000000000000000000000000000000000001", limit: 10 }, { fixtures: true });
-  if (portfolio.structuredContent.addressBinding !== "PUBLIC_ADDRESS_UNVERIFIED" || portfolio.structuredContent.positions.length !== 0) {
-    fail("portfolio did not label caller-supplied addresses as unverified public addresses", "wallet_binding_invalid");
+  if (portfolio.structuredContent.addressBinding !== "PUBLIC_ADDRESS_UNVERIFIED"
+    || portfolio.structuredContent.positions.length !== 1 || portfolio.structuredContent.complete !== false
+    || portfolio.structuredContent.hasMore !== true || portfolio.structuredContent.nextCursor !== "fixture-next-page") {
+    fail("portfolio did not preserve the representative partial v2 page and unverified address label", "portfolio_pagination_invalid");
+  }
+  const portfolioNextPage = await callTool(artifact, portfolioTool, {
+    walletAddress: "0x0000000000000000000000000000000000000001", limit: 10, cursor: portfolio.structuredContent.nextCursor,
+  }, { fixtures: true });
+  if (portfolioNextPage.structuredContent.positions.length !== 1 || portfolioNextPage.structuredContent.complete !== true
+    || portfolioNextPage.structuredContent.hasMore !== false || portfolioNextPage.structuredContent.nextCursor !== null) {
+    fail("portfolio did not mark the final v2 cursor page complete", "portfolio_pagination_invalid");
   }
   const toolNames = new Set(tools.map((tool) => tool.name));
   for (const name of ["submit_fak_order", "get_order_status", "cancel_order", "get_portfolio"]) {
@@ -241,11 +311,11 @@ export async function testOfflineArtifact(root = process.cwd()) {
   return {
     status: "passed",
     deterministicCases: [
-      "BUY FAK fee-inclusive approval binding", "SELL FAK", "market fee descriptor and exact fee calculation",
+      "BUY FAK fee-inclusive approval binding", "order-hash and signer-bound approval replay rejection", "bounded preflight stops before POST", "SELL FAK", "market fee descriptor and exact fee calculation",
       "reject invalid approval before CLOB preflight", "reject invalid order signature", "Deposit Wallet TypedDataSign preparation",
       "reject stale book", "reject unsafe CLOB salt precision", "reject cap overrun", "reject wrong outcome asset",
       "team-attributed news", "PL/PD/SA/CL fixture mapping", "complete and unavailable form handling",
-      "provider failure remains unavailable", "public portfolio address is not wallet proof", "trade tools registered without submission",
+      "provider failure remains unavailable", "official v2 portfolio rows and cursor pagination completeness", "public portfolio address is not wallet proof", "trade tools registered without submission",
     ],
   };
 }
@@ -337,13 +407,16 @@ function validateCallResult(value) {
   if (result.isError !== undefined && typeof result.isError !== "boolean") fail("tools/call isError must be boolean");
 }
 
-export async function runOperation(artifact, operation, { fixtures = false } = {}) {
+export async function runOperation(artifact, operation, { fixtures = false, fixtureScenario } = {}) {
   const home = await mkdtemp(resolve(tmpdir(), "paybox-plugin-conformance-"));
   try {
     const args = fixtures ? ["--import", resolve(dirname(artifact), "../tests/network-fixtures.mjs"), artifact] : [artifact];
     return await withProcess(process.execPath, args, {
       cwd: dirname(artifact),
-      env: { HOME: home, NODE_ENV: "production", NO_COLOR: "1", PATH: process.env.PATH ?? "/usr/local/bin:/usr/bin:/bin" },
+      env: {
+        HOME: home, NODE_ENV: "production", NO_COLOR: "1", PATH: process.env.PATH ?? "/usr/local/bin:/usr/bin:/bin",
+        ...(fixtureScenario === undefined ? {} : { POLYSCOPE_TEST_SCENARIO: fixtureScenario }),
+      },
     }, async (child, closed, stop) => {
       let stdoutBytes = 0;
       let stderrBytes = 0;
