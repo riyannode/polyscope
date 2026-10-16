@@ -4,6 +4,8 @@
 
 PolyScope is a PayBox plugin for AI-assisted Polymarket research and user-approved, single-market trading. It provides structured market, quote, soccer research, signing-preparation, order-status, cancellation, and portfolio tools to a PayBox-connected AI agent.
 
+> PolyScope is an independent, unofficial project. It is not affiliated with, endorsed by, or sponsored by Polymarket.
+
 > **Implementation status:** Local deterministic checks and the plugin build are available. PayBox-hosted wallet signing and real BUY/SELL execution have not been verified. Soccer xG, injuries, and confirmed lineups are unavailable. See [`outputs/POLYSCOPE_COMPATIBILITY.md`](outputs/POLYSCOPE_COMPATIBILITY.md) for the latest evidence and known blockers.
 
 ## Research-to-trade workflow
@@ -30,7 +32,7 @@ FAK is the only supported order type. There is no GTC/resting-order strategy, Co
 | `prepare_clob_auth` | Prepare the Polygon ClobAuth EIP-712 payload for an existing signer. |
 | `validate_clob_auth_signature` | Recover and verify the signer of the exact ClobAuth payload. |
 | `prepare_order_signing` | Prepare one marketable FAK BUY or SELL for a selected outcome, price bound, size, and fee-inclusive maximum; return the order and separate execution-approval signing intents. |
-| `validate_order_signature` | Rebuild the prepared order and validate the approval, signer, order signature, wallet binding, and supported smart-wallet signature path. |
+| `validate_order_signature` | Rebuilds the prepared Polymarket order and validates its order signature, signer, wallet binding, and supported smart-wallet signature path. `submit_fak_order` separately validates the `ExecutionApproval` signature before submission. |
 | `submit_fak_order` | Revalidate live preconditions and make one signed FAK POST attempt for this invocation. An ambiguous result is reconciled at most once and is never automatically resubmitted. |
 | `get_order_status` | Read one authenticated Polymarket order record and report matched size and trade IDs. |
 | `cancel_order` | Request cancellation for one explicitly confirmed order and reconcile an ambiguous response once. |
@@ -109,7 +111,7 @@ Soccer research requires a developer-owned football-data.org token. Configure it
 
 ## Logo
 
-The project logo is available at [`assets/polyscope-logo.png`](assets/polyscope-logo.png) as a transparent PNG. The white emblem details remain opaque so the mark stays legible on dark and light backgrounds.
+The project logo is available at [`assets/polyscope-logo.png`](assets/polyscope-logo.png) as a transparent PNG. The white emblem details remain opaque. At 48×48, the blue/navy mark remains recognizable on light and dark backgrounds; its white details have strongest contrast on dark backgrounds and blend with a white canvas.
 
 ## Further documentation
 

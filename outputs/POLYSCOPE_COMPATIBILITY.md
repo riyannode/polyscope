@@ -4,9 +4,28 @@ Checked: 2026-10-17 (Asia/Jakarta)
 
 Runtime: official PayBox starter 1.0.2, Node.js 24.22.0, pnpm 11.11.0
 
-Decision: **LOCAL_CHECKS_PASSED; HOSTED_TRADING_COMPATIBILITY_NOT_PROVEN**
+Documentation-review build verification used Node.js 24.20.0 and pnpm 11.11.0 in a temporary copy so the existing uploaded bundle was not overwritten.
 
-This report records local implementation and public-network checks. No PayBox hosted test, wallet-signing request, order broadcast, deposit, deployment, merge, or submission was performed.
+Decision: **LOCAL_CHECKS_PASSED; HOSTED_DISCOVERY_AND_PREPARATION_PASSED; LIVE_TRADING_UNVERIFIED**
+
+This report records local implementation and public-network checks plus the project owner's PayBox hosted acceptance results below. This documentation update performed no additional hosted test, wallet-signing request, order broadcast, deposit, deployment, merge, or project submission.
+
+## PayBox hosted acceptance evidence
+
+The project owner reports the following results from the private PayBox Developer Dashboard and connected agent:
+
+| Check | Result | Scope |
+|---|---|---|
+| Hackathon submission | `Submitted` | Submission status only; not evidence of public listing or trading. |
+| PolyScope plugin | `Enabled privately` | Enabled for the owner's account; not publicly listed. |
+| Tool discovery | `PASS` — 12 tools discovered | Confirms the hosted plugin registered its 12 tools. |
+| Agent-invoked `search_markets` | `PASS` | Market discovery tool invocation. |
+| Agent-invoked `get_quote` | `PASS` | Quote tool invocation; not an order submission. |
+| Agent-invoked `research_soccer` | `PASS` | Soccer research tool invocation. |
+| Developer Dashboard `prepare_clob_auth` | `PASS` | Payload preparation only; no wallet signature was verified. |
+| Developer Dashboard `prepare_order_signing` | `PASS` | Order and approval payload preparation only; no wallet signature was verified. |
+
+**Still `UNVERIFIED`:** PayBox wallet credential selection and `request_wallet_sign` approval/read-back, wallet binding from a real signature, authenticated Polymarket CLOB L1/L2 access, real BUY/SELL submission, and order/fill read-back. Passing payload-preparation tools does not prove signing or trading compatibility.
 
 ## Implemented scope
 
@@ -53,7 +72,7 @@ The generic market search and order tools use a single selected Polymarket CLOB 
 
 The tools return `requestWalletSignIntent: { op: "typedData", typedData }` for ClobAuth, the Polymarket order, and PolyScope’s separate user execution approval. The connected PayBox agent must select its existing wallet credential, submit each applicable signing request through its native `request_wallet_sign`, poll `get_request`, and pass the returned signature to the matching plugin tool. The signed EOA is recovered against the supplied address; wallet-type, maker, signer, chain, and signature-type relationships are checked. Deposit Wallet preparation uses the documented `TypedDataSign` envelope and ERC-7739 wrapper path.
 
-**Blocker:** the supplied PayBox plugin guide does not define a plugin-callable `request_wallet_sign` contract or document the exact native tool input/output schema. The plugin cannot invoke another agent tool itself. The agent-to-plugin orchestration and actual PayBox credential binding therefore remain unverified until a hosted read-only/signing check is approved. Offline tests cover typed-data construction, invalid-signature rejection, and Deposit Wallet payload shape, but not a valid credential signature or live ERC-1271 acceptance.
+**Blocker:** the supplied PayBox plugin guide does not define a plugin-callable `request_wallet_sign` contract or document the exact native tool input/output schema. The plugin cannot invoke another agent tool itself. The reported hosted research calls and Dashboard payload-preparation checks do not validate the connected agent's signing handoff or PayBox wallet binding; wallet credential selection, `request_wallet_sign`, and `get_request` signature read-back remain `UNVERIFIED`. Offline tests cover typed-data construction, invalid-signature rejection, and Deposit Wallet payload shape, but not a valid credential signature or live ERC-1271 acceptance.
 
 For each submit/status/cancel operation, the plugin derives or creates Polymarket L2 credentials from the supplied ClobAuth signature, uses them only in that invocation for HMAC-authenticated requests, and never returns or logs the API key, secret, passphrase, or private key. No persistent storage or alternate wallet is used. A submit invocation has a 7-second monotonic callback budget, leaving 3 seconds of the PayBox 10-second ceiling for host startup and response overhead. Every submit preflight request shares that deadline and preserves 3.5 seconds for the FAK POST, one possible reconciliation, and a small tail margin. The POST and reconciliation requests have separate bounded deadlines. If preflight cannot preserve that window, it returns `PS_EXECUTION_BUDGET_EXHAUSTED` before the order POST. After an ambiguous POST, one read-only reconciliation is attempted only if time remains; otherwise the result is `UNKNOWN`, with no automatic retry. Offline fixtures verify the pre-POST stop. The 3-second startup/response reserve and the PayBox host's actual cold-start timing remain unverified until hosted acceptance.
 
@@ -98,6 +117,8 @@ Toolchain used: Node.js `24.22.0`, pnpm `11.11.0`.
 | `pnpm conformance` | PASS — market/news/quote reads succeeded; live quote was stale and FAK preparation was skipped. PL, PD, SA, and CL calls returned HTTP 403 without local PayBox secret injection and were reported `UNAVAILABLE` with a safe permission/plan reason. |
 | `pnpm audit --prod` | PASS — no known production dependency vulnerabilities reported |
 | `git diff --check` | PASS after source, report, and bundle updates |
+| Temporary-copy frozen install and build (Node.js `24.20.0`, pnpm `11.11.0`) | PASS — lockfile resolved without changes; generated `dist/plugin.mjs` was byte-identical to tracked `outputs/plugin.mjs` (581,357 bytes, SHA-256 `c5a2cb19ff0af7043a8d4efabd2752b9ddca6870c8fb15ca142d2913d82fc740`). The tracked/uploaded bundle was not modified. |
+| README links and logo review | PASS — all local README links resolve and all four external links returned HTTP 200. PNG corner alpha is 0 and sampled white emblem pixels remain opaque; a 48×48 preview was reviewed on white and dark backgrounds. White details blend into white backgrounds, while the overall mark remains recognizable. |
 
 Offline cases include BUY/SELL FAK, fee-inclusive cap and exact order-hash/signing-address approval binding, rejection of approval replay with a different salt or signer, slow preflight stopping before FAK POST without enough time reserved for reconciliation, official market fee descriptor math, invalid approval/order signature rejection, Deposit Wallet typed-data envelope, stale-book rejection, wrong outcome rejection, team attribution, all four deterministic competition mappings and numeric team-form filters, complete/incomplete form handling, safe HTTP 403 permission and 429 rate-limit diagnostics, provider failure handling, representative Data API v2 position rows and cursor pagination completeness, public portfolio address labeling, and tool registration without order submission. Local signatures use generated test-only keys; credential/account transport fixtures are not authenticated CLOB evidence or a successful trade.
 
@@ -113,6 +134,6 @@ The latest public CLOB book was 60,388 ms old, so the conformance harness skippe
 
 ## Readiness decision and next gate
 
-**Hosted PayBox Marketplace BUY/SELL: NOT PROVEN.** The source contains a FAK order path that performs the documented Polymarket checks and submission contract, but no authenticated order or fill was attempted. The final public quote was stale, soccer providers returned 403, PayBox's native signing handoff and actual 10-second cold-start budget have not been exercised, and no authenticated CLOB BUY/SELL was attempted. Hosted compatibility and separate explicit live-trading approval remain required before claiming an end-to-end trade works.
+**Hosted PayBox Marketplace BUY/SELL: NOT PROVEN.** The source contains a FAK order path that performs the documented Polymarket checks and submission contract, but no authenticated order or fill was attempted. The final local public quote was stale; the last local soccer conformance calls returned 403 without local PayBox secret injection. PayBox's native signing handoff and actual 10-second cold-start budget have not been exercised, and no authenticated CLOB BUY/SELL was attempted. Hosted compatibility and separate explicit live-trading approval remain required before claiming an end-to-end trade works.
 
-No upload, hosted check, live signature, order broadcast, deposit, deployment, merge, or project submission was performed. Stop here for approval before final acceptance.
+No new bundle was uploaded and no live signature, order broadcast, deposit, deployment, merge, or project resubmission was performed by this documentation update. The `Submitted` status above is the project owner's reported hackathon status, not an action taken in this update.
