@@ -1,7 +1,7 @@
 {
   "tool": "search_markets",
   "arguments": {
-    "query": "climate",
-    "limit": 1
+    "query": "Bitcoin",
+    "limit": 5
   }
 }
