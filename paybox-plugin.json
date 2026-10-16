@@ -1,0 +1,7 @@
+{
+  "tool": "search_markets",
+  "arguments": {
+    "query": "climate",
+    "limit": 1
+  }
+}
