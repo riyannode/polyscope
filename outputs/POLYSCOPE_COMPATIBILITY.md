@@ -38,13 +38,14 @@ Polymarket documents FAK as a supported market order, with a maximum BUY price o
 | Polymarket Gamma | `AVAILABLE` | Current sample market search returned valid active market/outcome data. |
 | Polymarket CLOB | `AVAILABLE`, `STALE` | The latest conformance quote book age was 141,342 ms, above the 30-second limit. Order preparation was correctly skipped for that stale book. |
 | ESPN RSS | `AVAILABLE` | Team-filtered soccer headlines and source timestamps were returned. This is not a verified injury or lineup feed. |
-| football-data.org | `UNAVAILABLE` for PL, PD, SA, and CL; each local request returned HTTP 403 with a safe access/plan-permission reason | No local fixture, result, or form coverage is claimed. The local runner has no configured provider token. The hosted report that PL fixtures worked proves fixture access only; form remains unverified. |
+| football-data.org direct API diagnostic | Brentford `402` and Liverpool `64`: baseline HTTP 200; adding `dateTo=2026-10-16` returned HTTP 400 for each; numeric `competitions=2021` without `dateTo` returned HTTP 200. The production query (`competitions=2021&status=FINISHED&limit=100`) returned HTTP 200 with six finished PL matches for each team. | The developer-supplied token can read PL team history for these two teams. It does not prove all-team or all-competition coverage, and no response body or token was retained. |
+| `pnpm conformance` soccer calls | `UNAVAILABLE` for PL, PD, SA, and CL; each call returned HTTP 403 because the local runner has no PayBox host-scoped secret injection. | The offline/runtime harness correctly reports missing local credentials. The direct token diagnostic above is separate and is not a hosted PayBox test. |
 
-football-data.org currently lists the Premier League, LaLiga, Serie A, and Champions League under its Free Tier, and the registered Free plan lists fixtures, delayed scores/schedules, league tables, and 10 calls per minute. The provider separately lists advanced trend/form data under ML Pack Light. PolyScope derives its last-five record from team-match results, but the free-tier entitlement for that history endpoint has not been confirmed for the developer's token. Each exact fixture lookup uses one fixture request plus two team-history requests. The API uses the `X-Auth-Token` header. This supports choosing the provider but does not prove that a configured token has permission to retrieve the needed history. [Coverage](https://www.football-data.org/coverage) · [Pricing and rate limits](https://www.football-data.org/pricing) · [API authentication examples](https://docs.football-data.org/general/v4/coding_client.html)
+football-data.org lists the four supported competitions in its Free Tier and sets a 10-request/minute rate limit for registered free clients. The controlled diagnostic used eight sequential requests, within that limit. Its successful `limit=100` query returned six rows for both tested PL teams; the data spanned Aug 22–Oct 10 for Brentford and Aug 23–Oct 11 for Liverpool, all before the Oct 17 fixture. This verifies those two team histories with the supplied token at the time of the check, not every supported league/team. PolyScope requests numeric competition ID, `status=FINISHED`, and `limit=100`, then independently filters exact competition ID, finished status, and kickoff earlier than the selected fixture before using five results. The `dateTo` failure's provider-side explanation remains unknown; the response body was not retained. The API uses `X-Auth-Token`. [Coverage](https://www.football-data.org/coverage) · [Pricing and rate limits](https://www.football-data.org/pricing) · [API authentication examples](https://docs.football-data.org/general/v4/coding_client.html)
 
-The v4 quickstart documents `competitions` as a comma-separated numeric competition-ID filter; the official lookup table maps the four supported leagues to the IDs above. The lookup table also says league codes may be used as aliases for IDs, so a prior `PL` filter is not by itself proven to explain the hosted `UNAVAILABLE` result. PolyScope now sends numeric IDs as requested. A 403 can still indicate token, competition, resource, or plan permissions; 401, 429, and other statuses are reported distinctly without returning provider response bodies or tokens. [v4 quickstart filter reference](https://www.football-data.org/documentation/quickstart) · [Official competition lookup table](https://docs.football-data.org/general/v4/lookup_tables.html)
+The official Team Match API reference does not list `competitions`, while the official v4 quickstart does. The controlled requests resolved this for the current provider path: `competitions=2021` alone returned 200 for both teams, including at `limit=100`; adding `dateTo=2026-10-16` to the baseline returned 400 for both. The final request omits `dateTo` and retains the numeric competition filter. The v4 quickstart and official lookup map PL/PD/SA/CL to `2021`/`2014`/`2019`/`2001`. Provider HTTP errors remain status-specific and do not include response bodies or tokens. [Team Match API reference](https://docs.football-data.org/general/v4/team.html) · [v4 quickstart filter reference](https://www.football-data.org/documentation/quickstart) · [Official competition lookup table](https://docs.football-data.org/general/v4/lookup_tables.html)
 
-The deterministic offline suite uses isolated fixtures to validate mapping and numeric team-form filters for all four competitions, complete/incomplete form handling, and safe 403/429 diagnostics. Those fixtures are test data, not provider-coverage evidence. TheSportsDB is removed from the current path; its known disabled free API was not debugged again.
+The deterministic offline suite uses isolated fixtures to validate mapping and numeric team-form filters without `dateTo` for all four competitions, client-side filtering of mixed competitions/statuses/kickoff times, complete/incomplete form handling, and safe 403/429 diagnostics. Those fixtures are test data, not provider-coverage evidence. TheSportsDB is removed from the current path; its known disabled free API was not debugged again.
 
 The generic market search and order tools use a single selected Polymarket CLOB market/outcome. Crypto, weather, soccer, politics, and finance are discoverable through the same market-data path when a corresponding active CLOB market exists. There are no specialized weather/xG/injury datasets or combo/multi-leg tools.
 
@@ -76,9 +77,9 @@ Polymarket documents ClobAuth, L2 credential derive/create endpoints, wallet sig
 
 ## Changed files
 
-- `src/plugin.ts` — exact order-hash and signer approval binding, bounded FAK submit/reconciliation budget, egress-IP geoblock wording, and v2 cursor-paginated OPEN positions.
-- `scripts/conformance.mjs` — approval replay, no-POST budget exhaustion, representative portfolio pagination, and numeric team-form filter/status regressions.
-- `tests/network-fixtures.mjs` — representative Data API v2 rows and pagination plus offline-only request timing, numeric competition filters, and safe 403/429 fixtures; not live CLOB credentials or trade evidence.
+- `src/plugin.ts` — exact order-hash and signer approval binding, bounded FAK submit/reconciliation budget, egress-IP geoblock wording, v2 cursor-paginated OPEN positions, and team history query without the 400-producing date filter.
+- `scripts/conformance.mjs` — approval replay, no-POST budget exhaustion, representative portfolio pagination, and numeric team-form filter/no-date regressions.
+- `tests/network-fixtures.mjs` — representative Data API v2 rows and pagination plus offline-only request timing, numeric competition filters, date-filter rejection, and safe 403/429 fixtures; not live CLOB credentials or trade evidence.
 - `docs/errors.md` — stable error codes, retry guidance, user-facing explanations, and safe football provider HTTP/network failure behavior.
 - `outputs/POLYSCOPE_COMPATIBILITY.md` — this report.
 - `outputs/plugin.mjs` — distributable copy of the built artifact.
@@ -94,7 +95,7 @@ Toolchain used: Node.js `24.22.0`, pnpm `11.11.0`.
 | `pnpm install --frozen-lockfile` | PASS — frozen lockfile unchanged; already up to date |
 | `pnpm typecheck` | PASS — `tsc --noEmit` |
 | `pnpm test` | PASS — deterministic build and 21 offline cases; includes numeric PL/PD/SA/CL team-form filters and safe 403/429 diagnostics; no live order submission |
-| `pnpm conformance` | PASS — market/news/quote reads succeeded; live quote was stale and FAK preparation was skipped. PL, PD, SA, and CL requests returned HTTP 403 and were reported `UNAVAILABLE` with a safe permission/plan reason. |
+| `pnpm conformance` | PASS — market/news/quote reads succeeded; live quote was stale and FAK preparation was skipped. PL, PD, SA, and CL calls returned HTTP 403 without local PayBox secret injection and were reported `UNAVAILABLE` with a safe permission/plan reason. |
 | `pnpm audit --prod` | PASS — no known production dependency vulnerabilities reported |
 | `git diff --check` | PASS after source, report, and bundle updates |
 
@@ -102,13 +103,13 @@ Offline cases include BUY/SELL FAK, fee-inclusive cap and exact order-hash/signi
 
 **Not covered locally:** PayBox `request_wallet_sign` handoff and wallet binding, actual EOA/Proxy/Safe/Deposit Wallet account binding, successful ERC-1271 validation, authenticated L2 credential derivation, live balance/allowance/geoblock behavior, partial-fill read-back, cancellation, or ambiguous POST reconciliation. These require hosted PayBox behavior and/or authenticated CLOB responses; local transport fixtures do not establish them. They remain release gates, not passing test claims.
 
-The last public CLOB book was 141,342 ms old, so the conformance harness skipped order preparation rather than use stale data. Market/news/quote read checks still passed. Public football-data.org requests returned 403 for all four leagues; no soccer coverage is claimed.
+The latest public CLOB book was 60,388 ms old, so the conformance harness skipped order preparation rather than use stale data. Market/news/quote read checks still passed. Local plugin conformance had no football-data.org token and returned 403 for all four leagues. Separately, the controlled direct API calls verified PL history for Brentford and Liverpool as described above; this does not substitute for a PayBox hosted retest or establish PD/SA/CL form coverage.
 
 ## Artifact
 
 - Path: `dist/plugin.mjs` (matching tracked copy at `outputs/plugin.mjs`)
-- Size: **580,376 bytes** (566.8 KiB; below 10 MiB)
-- SHA-256: `8abec2ef62808c5eca612993b8709a7deb59e4675d1fb379d8201e4048734eaa`
+- Size: **581,357 bytes** (567.7 KiB; below 10 MiB)
+- SHA-256: `c5a2cb19ff0af7043a8d4efabd2752b9ddca6870c8fb15ca142d2913d82fc740`
 
 ## Readiness decision and next gate
 

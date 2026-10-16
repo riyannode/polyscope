@@ -12,10 +12,17 @@ const footballCompetitionIds = { PL: "2021", PD: "2014", SA: "2019", CL: "2001" 
 function match(id, competition, date, status = "SCHEDULED") {
   return {
     id, utcDate: `${date}T19:00:00Z`, status, lastUpdated: "2026-10-16T12:00:00Z",
-    competition: { code: competition, name: competitionNames[competition] },
+    competition: { id: Number(footballCompetitionIds[competition]), code: competition, name: competitionNames[competition] },
     homeTeam: { id: 101, name: "Arsenal" }, awayTeam: { id: 202, name: "Chelsea" },
     score: { fullTime: { home: status === "FINISHED" ? 2 : null, away: status === "FINISHED" ? 1 : null } },
   };
+}
+function matchAt(id, competition, utcDate, status, teamId) {
+  const fixture = match(id, competition, utcDate.slice(0, 10), status);
+  fixture.utcDate = utcDate;
+  fixture.homeTeam = { id: teamId, name: teamId === 402 ? "Brentford FC" : "Liverpool FC" };
+  fixture.awayTeam = { id: 303, name: "Sample opponent" };
+  return fixture;
 }
 const portfolioPosition = {
   archived: false, avg_price: 0.42, condition_id: `0x${"2".repeat(64)}`, current_price: 0.51,
@@ -32,11 +39,22 @@ const history = (teamId, competition = "PL") => Array.from({ length: 5 }, (_, in
   const homeId = index % 2 === 0 ? teamId : 303;
   const awayId = index % 2 === 0 ? 303 : teamId;
   return {
-    ...match(8000 + teamId * 10 + index, competition, `2026-10-${String(10 - index).padStart(2, "0")}`, "FINISHED"),
+    ...match(Number(footballCompetitionIds[competition]) * 100_000 + teamId * 10 + index, competition, `2026-10-${String(10 - index).padStart(2, "0")}`, "FINISHED"),
     homeTeam: { id: homeId, name: homeId === teamId ? (teamId === 101 ? "Arsenal" : "Chelsea") : "Liverpool" },
     awayTeam: { id: awayId, name: awayId === teamId ? (teamId === 101 ? "Arsenal" : "Chelsea") : "Liverpool" },
   };
 });
+const allCompetitionHistory = (teamId) => Object.keys(footballCompetitionIds).flatMap((league) => history(teamId, league));
+const mixedHistory = (teamId) => [
+  matchAt(91001, "PL", "2026-10-17T12:00:00Z", "FINISHED", teamId),
+  matchAt(91002, "CL", "2026-10-16T20:00:00Z", "FINISHED", teamId),
+  matchAt(91003, "PL", "2026-10-16T19:00:00Z", "FINISHED", teamId),
+  matchAt(91004, "PL", "2026-10-15T19:00:00Z", "FINISHED", teamId),
+  matchAt(91005, "PL", "2026-10-14T19:00:00Z", "FINISHED", teamId),
+  matchAt(91006, "PL", "2026-10-13T19:00:00Z", "FINISHED", teamId),
+  matchAt(560611, "PL", "2026-10-17T19:00:00Z", "FINISHED", teamId),
+  matchAt(91007, "PL", "2026-10-17T10:00:00Z", "SCHEDULED", teamId),
+];
 
 globalThis.fetch = async (input, init = {}) => {
   const url = new URL(typeof input === "string" ? input : input.url);
@@ -80,32 +98,54 @@ globalThis.fetch = async (input, init = {}) => {
     body = { matches: [match(({ PL: 1001, PD: 2001, SA: 3001, CL: 4001 })[league], league, "2026-10-17")] };
   } else if (url.hostname === "api.football-data.org" && url.pathname === "/v4/matches/9999") {
     body = match(9999, "PL", "2026-10-20");
+    body.homeTeam = { id: 999, name: "Incomplete History FC" };
+    body.awayTeam = { id: 998, name: "Opponent FC" };
   } else if (url.hostname === "api.football-data.org" && url.pathname === "/v4/matches/8888") {
     body = match(8888, "PL", "2026-10-21");
+    body.homeTeam = { id: 888, name: "Permission Denied FC" };
+    body.awayTeam = { id: 887, name: "Opponent FC" };
   } else if (url.hostname === "api.football-data.org" && url.pathname === "/v4/matches/8889") {
     body = match(8889, "SA", "2026-10-22");
+    body.homeTeam = { id: 889, name: "Rate Limited FC" };
+    body.awayTeam = { id: 886, name: "Opponent FC" };
+  } else if (url.hostname === "api.football-data.org" && url.pathname === "/v4/matches/560611") {
+    body = match(560611, "PL", "2026-10-17");
+    body.homeTeam = { id: 402, name: "Brentford FC" };
+    body.awayTeam = { id: 64, name: "Liverpool FC" };
   } else if (url.hostname === "api.football-data.org" && url.pathname.startsWith("/v4/matches/")) {
     const id = Number(url.pathname.split("/").at(-1));
     const league = ({ 1001: "PL", 2001: "PD", 3001: "SA", 4001: "CL" })[id];
     body = match(id, league, "2026-10-17");
   } else if (url.hostname === "api.football-data.org" && url.pathname.startsWith("/v4/teams/")) {
     const teamId = Number(url.pathname.split("/")[3]);
-    const requestedCompetitionId = url.searchParams.get("competitions");
-    const league = Object.entries(footballCompetitionIds).find(([, id]) => id === requestedCompetitionId)?.[0];
-    if (!league) return new Response(JSON.stringify({ message: "Invalid competition identifier." }), {
+    if (url.searchParams.has("dateTo")) return new Response(JSON.stringify({ message: "Provider rejected dateTo for team history." }), {
       status: 400, headers: { "content-type": "application/json" },
     });
-    if (url.searchParams.get("dateTo") === "2026-10-20" && teamId === 101) {
+    const unsupportedParameters = [...url.searchParams.keys()].filter((key) => !["competitions", "dateFrom", "dateTo", "season", "status", "venue", "limit"].includes(key));
+    if (unsupportedParameters.length > 0) return new Response(JSON.stringify({ message: "Unsupported Team Match Subresource filter." }), {
+      status: 400, headers: { "content-type": "application/json" },
+    });
+    if (teamId === 888) {
       return new Response(JSON.stringify({ message: "Subscription permission denied.", diagnostic: "sensitive provider detail" }), {
         status: 403, headers: { "content-type": "application/json" },
       });
     }
-    if (url.searchParams.get("dateTo") === "2026-10-21" && teamId === 101) {
+    if (teamId === 889) {
       return new Response(JSON.stringify({ message: "Rate limit reached." }), {
         status: 429, headers: { "content-type": "application/json" },
       });
     }
-    body = { matches: history(teamId, league).slice(0, url.searchParams.get("dateTo") === "2026-10-19" && teamId === 101 ? 4 : 5) };
+    if (teamId === 64) {
+      return new Response(JSON.stringify({ message: "Team history unavailable for this account." }), {
+        status: 403, headers: { "content-type": "application/json" },
+      });
+    }
+    const matches = teamId === 402
+      ? mixedHistory(teamId)
+      : teamId === 999
+        ? history(teamId).slice(0, 4)
+        : allCompetitionHistory(teamId);
+    body = { matches: matches.slice(0, Number(url.searchParams.get("limit") ?? "100")) };
   } else if (url.hostname === "www.espn.com" && url.pathname === "/espn/rss/soccer/news") {
     const publishedAt = new Date().toUTCString();
     body = `<?xml version="1.0"?><rss><channel><item><title>Arsenal confirms training update</title><link>https://www.espn.com/soccer/story/1</link><description>Arsenal update.</description><pubDate>${publishedAt}</pubDate></item><item><title>General football headline</title><link>https://www.espn.com/soccer/story/2</link><pubDate>${publishedAt}</pubDate></item></channel></rss>`;
