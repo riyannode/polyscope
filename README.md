@@ -1,5 +1,7 @@
 # PolyScope
 
+![PolyScope logo](assets/polyscope-logo.png)
+
 PolyScope is a PayBox plugin for AI-assisted Polymarket research and user-approved, single-market trading. It provides structured market, quote, soccer research, signing-preparation, order-status, cancellation, and portfolio tools to a PayBox-connected AI agent.
 
 > **Implementation status:** Local deterministic checks and the plugin build are available. PayBox-hosted wallet signing and real BUY/SELL execution have not been verified. Soccer xG, injuries, and confirmed lineups are unavailable. See [`outputs/POLYSCOPE_COMPATIBILITY.md`](outputs/POLYSCOPE_COMPATIBILITY.md) for the latest evidence and known blockers.
@@ -107,7 +109,7 @@ Soccer research requires a developer-owned football-data.org token. Configure it
 
 ## Logo
 
-A location is reserved at `assets/polyscope-logo.svg`. No logo has been created or added; the asset is pending delivery from the project owner.
+The project logo is available at [`assets/polyscope-logo.png`](assets/polyscope-logo.png) as a transparent PNG. The white emblem details remain opaque so the mark stays legible on dark and light backgrounds.
 
 ## Further documentation
 
