@@ -27,6 +27,7 @@ const ESPN_SOCCER_FEED = "https://www.espn.com/espn/rss/soccer/news";
 const FOOTBALL_DATA_API = "https://api.football-data.org/v4";
 const NEWS_STALE_AFTER_MS = 24 * 60 * 60 * 1000;
 const MAX_RSS_BYTES = 256 * 1024;
+const PREPARATION_STALE_AFTER_MS = 120_000;
 const SUBMIT_EXECUTION_BUDGET_MS = 7_000;
 const POST_RECONCILIATION_RESERVE_MS = 3_500;
 const RSS_XML_PARSER = new XMLParser({ ignoreAttributes: true, processEntities: false, trimValues: false });
@@ -71,6 +72,16 @@ const TICK_RULES = {
 } as const;
 const TICK_SIZES = ["0.1", "0.01", "0.005", "0.0025", "0.001", "0.0001"] as const;
 const FAK = "FAK" as const;
+
+const preparationErrorCodeSchema = z.enum([
+  "PS_PREPARATION_STALE_BOOK", "PS_MARKET_IDENTITY", "PS_PROVIDER_INVALID", "PS_PROVIDER_UNAVAILABLE",
+  "PS_PROVIDER_TIMEOUT", "PS_RESPONSE_TOO_LARGE", "PS_MARKET_CLOSED", "PS_MARKET_UNSUPPORTED",
+  "PS_MARKET_VERSION", "PS_FEE_INVALID", "PS_WALLET_BINDING", "PS_AMOUNT_INVALID", "PS_AMOUNT_PRECISION",
+  "PS_PRICE_INVALID", "PS_SIZE_BELOW_MINIMUM", "PS_SPENDING_CAP", "PS_NO_MARKETABLE_LIQUIDITY",
+]);
+const preparationFreshnessSchema = z.object({
+  bookAgeMs: z.number().int().nonnegative().nullable(), staleAfterMs: z.literal(PREPARATION_STALE_AFTER_MS),
+}).strict();
 
 const addressSchema = z.string().regex(/^0x[0-9a-fA-F]{40}$/);
 const decimalIdSchema = z.string().regex(/^(0|[1-9][0-9]{0,77})$/);
@@ -1522,122 +1533,161 @@ async function createServer() {
     "prepare_order_signing",
     {
       title: "Prepare a bounded Polymarket BUY or SELL signature",
-      description: "Prepares one marketable FAK order for the selected market outcome. BUY priceLimit is a user-approved maximum; SELL priceLimit is a minimum. maxNominalPusd includes worst-case platform fees. The PayBox agent must obtain one signature for the PolyScope execution approval and one for the Polymarket order before calling submit_fak_order.",
+      description: "Prepares one unsigned marketable FAK draft using a book no older than 120 seconds; submission re-fetches and requires a book no older than 30 seconds. Check status: REJECTED has no order or signing intents. BUY priceLimit is a user-approved maximum; SELL priceLimit is a minimum. maxNominalPusd includes worst-case platform fees. The PayBox agent must obtain one signature for the PolyScope execution approval and one for the Polymarket order before calling submit_fak_order.",
       inputSchema: z.object({
         marketId: z.string().regex(/^[0-9]{1,32}$/), assetId: decimalIdSchema,
         makerAddress: addressSchema, signingAddress: addressSchema,
         walletType: walletTypeSchema, side: sideSchema,
         priceLimit: z.string().max(32), size: z.string().max(32), maxNominalPusd: z.string().max(32),
       }).strict(),
-      outputSchema: z.object({
-        preparedOrder: preparedOrderSchema,
-        requestWalletSignIntent: requestWalletSignIntentSchema,
-        executionApprovalSigningIntent: requestWalletSignIntentSchema,
-        submitsOrder: z.literal(false),
-        maxNominalIncludesFees: z.literal(true),
-      }).strict(),
+      outputSchema: z.discriminatedUnion("status", [
+        z.object({
+          status: z.literal("PREPARED"),
+          preparedOrder: preparedOrderSchema,
+          requestWalletSignIntent: requestWalletSignIntentSchema,
+          executionApprovalSigningIntent: requestWalletSignIntentSchema,
+          submitsOrder: z.literal(false),
+          maxNominalIncludesFees: z.literal(true),
+          preparationFreshness: preparationFreshnessSchema,
+        }).strict(),
+        z.object({
+          status: z.literal("REJECTED"), errorCode: preparationErrorCodeSchema, reason: z.string(),
+          submitsOrder: z.literal(false), preparationFreshness: preparationFreshnessSchema,
+        }).strict(),
+      ]),
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: false, openWorldHint: true },
     },
     async ({ marketId, assetId, makerAddress, signingAddress, walletType, side, priceLimit, size, maxNominalPusd }) => {
-      const marketUrl = `${GAMMA_API}/markets/${encodeURIComponent(marketId)}`;
-      const bookUrl = new URL(`${CLOB_API}/book`);
-      bookUrl.searchParams.set("token_id", assetId);
-      const [rawMarket, rawBook] = await Promise.all([getJson(marketUrl), getJson(bookUrl.toString())]);
-      const market = gammaMarketSchema.parse(rawMarket);
-      const book = bookSchema.parse(rawBook);
-      if (String(market.id) !== marketId || market.active !== true || market.closed !== false) {
-        throw new Error("PS_MARKET_CLOSED: The selected market is not active and tradable.");
-      }
-      if (market.enableOrderBook === false || market.acceptingOrders !== true || !market.conditionId) {
-        throw new Error("PS_MARKET_UNSUPPORTED: The selected market is missing supported CLOB trading metadata.");
-      }
-      const mappedOutcomes = marketOutcomeAssets(market);
-      const selectedOutcome = mappedOutcomes?.find((outcome) => outcome.assetId === assetId);
-      if (!selectedOutcome) throw new Error("PS_MARKET_IDENTITY: The asset ID is not mapped to an outcome in this market.");
-      if (book.asset_id !== assetId || book.market.toLowerCase() !== market.conditionId.toLowerCase()) {
-        throw new Error("PS_MARKET_IDENTITY: CLOB book identity does not match the selected market and outcome.");
-      }
-      const feeInfo = marketFeeInfo(await getJson(`${CLOB_API}/clob-markets/${encodeURIComponent(market.conditionId)}`));
-      if (market.negRisk !== undefined && market.negRisk !== book.neg_risk) {
-        throw new Error("PS_MARKET_VERSION: Market and CLOB book disagree about the negative-risk exchange.");
-      }
-      const protocolVersion = book.version ?? "v1";
-      if (market.version != null && market.version !== protocolVersion) {
-        throw new Error("PS_MARKET_VERSION: Gamma and CLOB do not agree on the order-book protocol version.");
-      }
-      const age = bookAgeMs(book.timestamp);
-      if (age === null || age > 30_000) throw new Error("PS_STALE_BOOK: Refreshed CLOB book timestamp is stale or invalid.");
+      let preparationFreshness: z.infer<typeof preparationFreshnessSchema> = { bookAgeMs: null, staleAfterMs: PREPARATION_STALE_AFTER_MS };
+      try {
+        const marketUrl = `${GAMMA_API}/markets/${encodeURIComponent(marketId)}`;
+        const bookUrl = new URL(`${CLOB_API}/book`);
+        bookUrl.searchParams.set("token_id", assetId);
+        const [rawMarket, rawBook] = await Promise.all([getJson(marketUrl), getJson(bookUrl.toString())]);
+        const parsedMarket = gammaMarketSchema.safeParse(rawMarket);
+        const parsedBook = bookSchema.safeParse(rawBook);
+        if (!parsedMarket.success || !parsedBook.success) {
+          throw new Error("PS_PROVIDER_INVALID: Polymarket market or order book does not match the required schema.");
+        }
+        const market = parsedMarket.data;
+        const book = parsedBook.data;
+        preparationFreshness = { bookAgeMs: bookAgeMs(book.timestamp), staleAfterMs: PREPARATION_STALE_AFTER_MS };
+        if (String(market.id) !== marketId) throw new Error("PS_MARKET_IDENTITY: Provider returned a different market ID.");
+        if (market.active !== true || market.closed !== false) {
+          throw new Error("PS_MARKET_CLOSED: The selected market is not active and tradable.");
+        }
+        if (market.enableOrderBook === false || market.acceptingOrders !== true || !market.conditionId) {
+          throw new Error("PS_MARKET_UNSUPPORTED: The selected market is missing supported CLOB trading metadata.");
+        }
+        const mappedOutcomes = marketOutcomeAssets(market);
+        const selectedOutcome = mappedOutcomes?.find((outcome) => outcome.assetId === assetId);
+        if (!selectedOutcome) throw new Error("PS_MARKET_IDENTITY: The asset ID is not mapped to an outcome in this market.");
+        if (book.asset_id !== assetId || book.market.toLowerCase() !== market.conditionId.toLowerCase()) {
+          throw new Error("PS_MARKET_IDENTITY: CLOB book identity does not match the selected market and outcome.");
+        }
+        const feeInfo = marketFeeInfo(await getJson(`${CLOB_API}/clob-markets/${encodeURIComponent(market.conditionId)}`));
+        if (market.negRisk !== undefined && market.negRisk !== book.neg_risk) {
+          throw new Error("PS_MARKET_VERSION: Market and CLOB book disagree about the negative-risk exchange.");
+        }
+        const protocolVersion = book.version ?? "v1";
+        if (market.version != null && market.version !== protocolVersion) {
+          throw new Error("PS_MARKET_VERSION: Gamma and CLOB do not agree on the order-book protocol version.");
+        }
+        preparationFreshness.bookAgeMs = bookAgeMs(book.timestamp);
+        const age = preparationFreshness.bookAgeMs;
+        if (age === null) throw new Error("PS_PROVIDER_INVALID: CLOB book timestamp is invalid or in the future.");
+        if (age > PREPARATION_STALE_AFTER_MS) throw new Error("PS_PREPARATION_STALE_BOOK: CLOB book is older than the 120-second unsigned preparation limit.");
 
-      const maker = address(makerAddress);
-      const signing = address(signingAddress);
-      if (walletType === "EOA" && maker.toLowerCase() !== signing.toLowerCase()) {
-        throw new Error("PS_WALLET_BINDING: For an EOA account, maker and signing addresses must match.");
-      }
-      const orderSigner = walletType === "DEPOSIT_WALLET" ? maker : signing;
-      const rules = TICK_RULES[book.tick_size];
-      const priceUnits = toUnits(priceLimit, 6, rules.priceDecimals);
-      const sizeUnits = toUnits(size, 6, 2);
-      const capUnits = toUnits(maxNominalPusd, 6, 6);
-      const tickUnits = toUnits(book.tick_size, 6, rules.priceDecimals);
-      const minSizeUnits = toUnits(book.min_order_size, 6, 6);
-      const quoteUnits = (priceUnits * sizeUnits) / 1_000_000n;
-      if (priceUnits <= 0n || priceUnits >= 1_000_000n || priceUnits % tickUnits !== 0n) {
-        throw new Error(`PS_PRICE_INVALID: Price must be between 0 and 1 and conform to tick size ${book.tick_size}.`);
-      }
-      if (sizeUnits < minSizeUnits) throw new Error(`PS_SIZE_BELOW_MINIMUM: Size is below the market minimum of ${book.min_order_size} shares.`);
-      if ((priceUnits * sizeUnits) % 1_000_000n !== 0n) throw new Error("PS_AMOUNT_PRECISION: Order amount cannot be represented at six-decimal precision.");
-      if (capUnits === 0n) throw new Error("PS_SPENDING_CAP: Provide a positive nominal cap.");
-      const maxGrossUnits = quoteUnits;
-      const maxFeePriceUnits = side === "BUY"
-        ? priceUnits < 500_000n ? priceUnits : 500_000n
-        : priceUnits > 500_000n ? priceUnits : 500_000n;
-      const maxFeeUnits = feeMicros(sizeUnits, maxFeePriceUnits, toUnits(feeInfo.rate, 6), feeInfo.exponent);
-      if (maxGrossUnits + maxFeeUnits > capUnits) {
-        throw new Error("PS_SPENDING_CAP: Fee-inclusive worst-case nominal exceeds the user-approved maximum.");
-      }
-      const amountPrecision = 10n ** BigInt(6 - rules.amountDecimals);
-      if (quoteUnits % amountPrecision !== 0n) throw new Error(`PS_AMOUNT_PRECISION: Order quote exceeds this market's ${rules.amountDecimals}-decimal amount precision.`);
-      const available = side === "BUY" ? book.asks : book.bids;
-      const marketable = available.some((level) => {
-        const levelPrice = toUnits(level.price, 6);
-        const levelSize = toUnits(level.size, 6);
-        return levelSize > 0n && (side === "BUY" ? levelPrice <= priceUnits : levelPrice >= priceUnits);
-      });
-      if (!marketable) throw new Error("PS_NO_MARKETABLE_LIQUIDITY: No visible order-book liquidity satisfies the approved FAK price limit.");
+        try {
+          if (toUnits(book.min_order_size, 6) <= 0n) throw new Error();
+          for (const level of [...book.bids, ...book.asks]) {
+            const price = toUnits(level.price, 6);
+            if (price <= 0n || price >= MICRO || toUnits(level.size, 6) <= 0n) throw new Error();
+          }
+        } catch {
+          throw new Error("PS_PROVIDER_INVALID: CLOB returned an invalid minimum size or price/size level.");
+        }
 
-      const saltBytes = crypto.getRandomValues(new Uint8Array(8));
-      const rawSalt = BigInt(bytesToHex(saltBytes));
-      const salt = (rawSalt % BigInt(Number.MAX_SAFE_INTEGER)).toString();
-      const timestamp = String(Date.now());
-      const maxGrossPusd = formatUnits(maxGrossUnits, 6);
-      const maxFeePusd = formatUnits(maxFeeUnits, 6);
-      const makerAmount = (side === "BUY" ? quoteUnits : sizeUnits).toString();
-      const takerAmount = (side === "BUY" ? sizeUnits : quoteUnits).toString();
-      const preparedBase = preparedOrderBaseSchema.parse({
-        market: {
-          id: marketId, conditionId: market.conditionId, version: protocolVersion, outcome: selectedOutcome.name,
-          negRisk: book.neg_risk, marketRestricted: market.restricted ?? null,
-          acceptingOrders: market.acceptingOrders, tickSize: book.tick_size,
-          minOrderSize: book.min_order_size, bookTimestamp: book.timestamp,
-        },
-        wallet: {
-          type: walletType, makerAddress: maker, signingAddress: signing,
-          orderSignerAddress: orderSigner, signatureType: signatureType(walletType),
-        },
-        order: {
-          salt, timestamp, assetId, side, price: priceLimit, size, maxNominalPusd,
-          maxGrossPusd, maxFeePusd, feeRate: feeInfo.rate, feeExponent: feeInfo.exponent, orderType: FAK,
-          makerAmount, takerAmount, metadata: ZERO32, builder: ZERO32,
-        },
-      });
-      const typedData = wireTypedData(signingPayload(preparedBase));
-      const preparedOrder = preparedOrderSchema.parse({ ...preparedBase, typedData });
-      const intent = { op: "typedData" as const, typedData };
-      const executionApprovalSigningIntent = { op: "typedData" as const, typedData: wireTypedData(executionApprovalPayload(preparedBase)) };
-      return {
-        content: [{ type: "text", text: `Prepared a bounded ${side} FAK order. PayBox must obtain the separate approval and Polymarket order signatures; no order was submitted.` }],
-        structuredContent: { preparedOrder, requestWalletSignIntent: intent, executionApprovalSigningIntent, submitsOrder: false, maxNominalIncludesFees: true },
-      };
+        const maker = address(makerAddress);
+        const signing = address(signingAddress);
+        if (walletType === "EOA" && maker.toLowerCase() !== signing.toLowerCase()) {
+          throw new Error("PS_WALLET_BINDING: For an EOA account, maker and signing addresses must match.");
+        }
+        const orderSigner = walletType === "DEPOSIT_WALLET" ? maker : signing;
+        const rules = TICK_RULES[book.tick_size];
+        const priceUnits = toUnits(priceLimit, 6, rules.priceDecimals);
+        const sizeUnits = toUnits(size, 6, 2);
+        const capUnits = toUnits(maxNominalPusd, 6, 6);
+        const tickUnits = toUnits(book.tick_size, 6, rules.priceDecimals);
+        const minSizeUnits = toUnits(book.min_order_size, 6, 6);
+        const quoteUnits = (priceUnits * sizeUnits) / 1_000_000n;
+        if (priceUnits <= 0n || priceUnits >= 1_000_000n || priceUnits % tickUnits !== 0n) {
+          throw new Error(`PS_PRICE_INVALID: Price must be between 0 and 1 and conform to tick size ${book.tick_size}.`);
+        }
+        if (sizeUnits < minSizeUnits) throw new Error(`PS_SIZE_BELOW_MINIMUM: Size is below the market minimum of ${book.min_order_size} shares.`);
+        if ((priceUnits * sizeUnits) % 1_000_000n !== 0n) throw new Error("PS_AMOUNT_PRECISION: Order amount cannot be represented at six-decimal precision.");
+        if (capUnits === 0n) throw new Error("PS_SPENDING_CAP: Provide a positive nominal cap.");
+        const maxGrossUnits = quoteUnits;
+        const maxFeePriceUnits = side === "BUY"
+          ? priceUnits < 500_000n ? priceUnits : 500_000n
+          : priceUnits > 500_000n ? priceUnits : 500_000n;
+        const maxFeeUnits = feeMicros(sizeUnits, maxFeePriceUnits, toUnits(feeInfo.rate, 6), feeInfo.exponent);
+        if (maxGrossUnits + maxFeeUnits > capUnits) {
+          throw new Error("PS_SPENDING_CAP: Fee-inclusive worst-case nominal exceeds the user-approved maximum.");
+        }
+        const amountPrecision = 10n ** BigInt(6 - rules.amountDecimals);
+        if (quoteUnits % amountPrecision !== 0n) throw new Error(`PS_AMOUNT_PRECISION: Order quote exceeds this market's ${rules.amountDecimals}-decimal amount precision.`);
+        const available = side === "BUY" ? book.asks : book.bids;
+        const marketable = available.some((level) => {
+          const levelPrice = toUnits(level.price, 6);
+          const levelSize = toUnits(level.size, 6);
+          return levelSize > 0n && (side === "BUY" ? levelPrice <= priceUnits : levelPrice >= priceUnits);
+        });
+        if (!marketable) throw new Error("PS_NO_MARKETABLE_LIQUIDITY: No visible order-book liquidity satisfies the approved FAK price limit.");
+
+        const saltBytes = crypto.getRandomValues(new Uint8Array(8));
+        const rawSalt = BigInt(bytesToHex(saltBytes));
+        const salt = (rawSalt % BigInt(Number.MAX_SAFE_INTEGER)).toString();
+        const timestamp = String(Date.now());
+        const maxGrossPusd = formatUnits(maxGrossUnits, 6);
+        const maxFeePusd = formatUnits(maxFeeUnits, 6);
+        const makerAmount = (side === "BUY" ? quoteUnits : sizeUnits).toString();
+        const takerAmount = (side === "BUY" ? sizeUnits : quoteUnits).toString();
+        const preparedBase = preparedOrderBaseSchema.parse({
+          market: {
+            id: marketId, conditionId: market.conditionId, version: protocolVersion, outcome: selectedOutcome.name,
+            negRisk: book.neg_risk, marketRestricted: market.restricted ?? null,
+            acceptingOrders: market.acceptingOrders, tickSize: book.tick_size,
+            minOrderSize: book.min_order_size, bookTimestamp: book.timestamp,
+          },
+          wallet: {
+            type: walletType, makerAddress: maker, signingAddress: signing,
+            orderSignerAddress: orderSigner, signatureType: signatureType(walletType),
+          },
+          order: {
+            salt, timestamp, assetId, side, price: priceLimit, size, maxNominalPusd,
+            maxGrossPusd, maxFeePusd, feeRate: feeInfo.rate, feeExponent: feeInfo.exponent, orderType: FAK,
+            makerAmount, takerAmount, metadata: ZERO32, builder: ZERO32,
+          },
+        });
+        const typedData = wireTypedData(signingPayload(preparedBase));
+        const preparedOrder = preparedOrderSchema.parse({ ...preparedBase, typedData });
+        const intent = { op: "typedData" as const, typedData };
+        const executionApprovalSigningIntent = { op: "typedData" as const, typedData: wireTypedData(executionApprovalPayload(preparedBase)) };
+        return {
+          content: [{ type: "text", text: `Prepared a bounded ${side} FAK order. PayBox must obtain the separate approval and Polymarket order signatures; no order was submitted.` }],
+          structuredContent: { status: "PREPARED" as const, preparedOrder, requestWalletSignIntent: intent, executionApprovalSigningIntent, submitsOrder: false as const, maxNominalIncludesFees: true as const, preparationFreshness },
+        };
+      } catch (error) {
+        if (!(error instanceof Error)) throw error;
+        const code = preparationErrorCodeSchema.safeParse(error.message.split(":", 1)[0]);
+        if (!code.success) throw error;
+        const reason = error.message.slice(code.data.length + 1).trim();
+        return {
+          content: [{ type: "text" as const, text: `Preparation rejected (${code.data}): ${reason} No order or signing intent was created.` }],
+          structuredContent: { status: "REJECTED" as const, errorCode: code.data, reason, submitsOrder: false as const, preparationFreshness },
+        };
+      }
     },
   );
 
