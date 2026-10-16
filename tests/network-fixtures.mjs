@@ -8,6 +8,7 @@ const market = {
 };
 
 const competitionNames = { PL: "Premier League", PD: "LaLiga", SA: "Serie A", CL: "UEFA Champions League" };
+const footballCompetitionIds = { PL: "2021", PD: "2014", SA: "2019", CL: "2001" };
 function match(id, competition, date, status = "SCHEDULED") {
   return {
     id, utcDate: `${date}T19:00:00Z`, status, lastUpdated: "2026-10-16T12:00:00Z",
@@ -27,11 +28,11 @@ const portfolioPosition = {
   realized_pnl: 0, redeemable: false, slug: "sample-market", status: "OPEN", title: "Sample market title",
   token_id: "123", total_cost_usdc: 5.06, total_pnl: 1.06, total_size: 12, unrealized_pnl: 1.06, verified: false,
 };
-const history = (teamId) => Array.from({ length: 5 }, (_, index) => {
+const history = (teamId, competition = "PL") => Array.from({ length: 5 }, (_, index) => {
   const homeId = index % 2 === 0 ? teamId : 303;
   const awayId = index % 2 === 0 ? 303 : teamId;
   return {
-    ...match(8000 + teamId * 10 + index, "PL", `2026-10-${String(10 - index).padStart(2, "0")}`, "FINISHED"),
+    ...match(8000 + teamId * 10 + index, competition, `2026-10-${String(10 - index).padStart(2, "0")}`, "FINISHED"),
     homeTeam: { id: homeId, name: homeId === teamId ? (teamId === 101 ? "Arsenal" : "Chelsea") : "Liverpool" },
     awayTeam: { id: awayId, name: awayId === teamId ? (teamId === 101 ? "Arsenal" : "Chelsea") : "Liverpool" },
   };
@@ -79,13 +80,32 @@ globalThis.fetch = async (input, init = {}) => {
     body = { matches: [match(({ PL: 1001, PD: 2001, SA: 3001, CL: 4001 })[league], league, "2026-10-17")] };
   } else if (url.hostname === "api.football-data.org" && url.pathname === "/v4/matches/9999") {
     body = match(9999, "PL", "2026-10-20");
+  } else if (url.hostname === "api.football-data.org" && url.pathname === "/v4/matches/8888") {
+    body = match(8888, "PL", "2026-10-21");
+  } else if (url.hostname === "api.football-data.org" && url.pathname === "/v4/matches/8889") {
+    body = match(8889, "SA", "2026-10-22");
   } else if (url.hostname === "api.football-data.org" && url.pathname.startsWith("/v4/matches/")) {
     const id = Number(url.pathname.split("/").at(-1));
     const league = ({ 1001: "PL", 2001: "PD", 3001: "SA", 4001: "CL" })[id];
     body = match(id, league, "2026-10-17");
   } else if (url.hostname === "api.football-data.org" && url.pathname.startsWith("/v4/teams/")) {
     const teamId = Number(url.pathname.split("/")[3]);
-    body = { matches: history(teamId).slice(0, url.searchParams.get("dateTo") === "2026-10-19" && teamId === 101 ? 4 : 5) };
+    const requestedCompetitionId = url.searchParams.get("competitions");
+    const league = Object.entries(footballCompetitionIds).find(([, id]) => id === requestedCompetitionId)?.[0];
+    if (!league) return new Response(JSON.stringify({ message: "Invalid competition identifier." }), {
+      status: 400, headers: { "content-type": "application/json" },
+    });
+    if (url.searchParams.get("dateTo") === "2026-10-20" && teamId === 101) {
+      return new Response(JSON.stringify({ message: "Subscription permission denied.", diagnostic: "sensitive provider detail" }), {
+        status: 403, headers: { "content-type": "application/json" },
+      });
+    }
+    if (url.searchParams.get("dateTo") === "2026-10-21" && teamId === 101) {
+      return new Response(JSON.stringify({ message: "Rate limit reached." }), {
+        status: 429, headers: { "content-type": "application/json" },
+      });
+    }
+    body = { matches: history(teamId, league).slice(0, url.searchParams.get("dateTo") === "2026-10-19" && teamId === 101 ? 4 : 5) };
   } else if (url.hostname === "www.espn.com" && url.pathname === "/espn/rss/soccer/news") {
     const publishedAt = new Date().toUTCString();
     body = `<?xml version="1.0"?><rss><channel><item><title>Arsenal confirms training update</title><link>https://www.espn.com/soccer/story/1</link><description>Arsenal update.</description><pubDate>${publishedAt}</pubDate></item><item><title>General football headline</title><link>https://www.espn.com/soccer/story/2</link><pubDate>${publishedAt}</pubDate></item></channel></rss>`;

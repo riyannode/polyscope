@@ -280,13 +280,32 @@ export async function testOfflineArtifact(root = process.cwd()) {
       fail(`${league} soccer fixture was not mapped from football-data.org data`, "soccer_mapping_invalid");
     }
   }
-  const exactForm = await callTool(artifact, researchTool, { league: "PL", fixtureId: "1001", date: "2026-10-17", days: 0, limit: 3 }, { fixtures: true });
-  if (exactForm.structuredContent.fixtures[0]?.formCoverage !== "COMPLETE_LAST_5" || exactForm.structuredContent.fixtures[0]?.homeRecentResults.length !== 5 || exactForm.structuredContent.fixtures[0]?.awayRecentResults.length !== 5) {
-    fail("soccer form was not reported as complete with exactly five results per team", "soccer_form_invalid");
+  const exactFixtureIds = { PL: "1001", PD: "2001", SA: "3001", CL: "4001" };
+  const competitionIds = { PL: "2021", PD: "2014", SA: "2019", CL: "2001" };
+  for (const [league, fixtureId] of Object.entries(exactFixtureIds)) {
+    const exactForm = await callTool(artifact, researchTool, { league, fixtureId, date: "2026-10-17", days: 0, limit: 3 }, { fixtures: true });
+    const fixture = exactForm.structuredContent.fixtures[0];
+    const teamFormSources = exactForm.structuredContent.sources.filter((source) => source.purpose === "TEAM_FORM");
+    const requestedCompetitionIds = teamFormSources.map((source) => new URL(source.url).searchParams.get("competitions"));
+    if (fixture?.formCoverage !== "COMPLETE_LAST_5" || fixture.homeRecentResults.length !== 5 || fixture.awayRecentResults.length !== 5) {
+      fail(`${league} form was not reported as complete with exactly five results per team`, "soccer_form_invalid");
+    }
+    if (requestedCompetitionIds.length !== 2 || requestedCompetitionIds.some((id) => id !== competitionIds[league])) {
+      fail(`${league} team-form requests did not use competition ID ${competitionIds[league]}`, "soccer_competition_filter_invalid");
+    }
   }
   const incompleteForm = await callTool(artifact, researchTool, { league: "PL", fixtureId: "9999", date: "2026-10-20", days: 0, limit: 3 }, { fixtures: true });
   if (incompleteForm.structuredContent.fixtures[0]?.formCoverage !== "UNAVAILABLE" || incompleteForm.structuredContent.fixtures[0]?.homeRecentResults.length !== 0) {
     fail("incomplete historical soccer form was silently presented as complete", "soccer_form_invalid");
+  }
+  const deniedForm = await callTool(artifact, researchTool, { league: "PL", fixtureId: "8888", date: "2026-10-21", days: 0, limit: 3 }, { fixtures: true });
+  const deniedReason = deniedForm.structuredContent.fixtures[0]?.formReason ?? "";
+  if (!deniedReason.includes("HTTP 403") || !deniedReason.toLowerCase().includes("permission") || deniedReason.includes("sensitive provider detail")) {
+    fail("team-form permission failures did not expose a safe HTTP status", "soccer_provider_error_invalid");
+  }
+  const rateLimitedForm = await callTool(artifact, researchTool, { league: "SA", fixtureId: "8889", date: "2026-10-22", days: 0, limit: 3 }, { fixtures: true });
+  if (!(rateLimitedForm.structuredContent.fixtures[0]?.formReason ?? "").includes("HTTP 429")) {
+    fail("team-form rate-limit failures did not expose the HTTP status", "soccer_provider_error_invalid");
   }
   const unavailable = await callTool(artifact, researchTool, { league: "PL", date: "2026-11-01", days: 0, limit: 3 }, { fixtures: true });
   if (unavailable.structuredContent.availability !== "UNAVAILABLE") fail("provider failure was presented as available soccer data", "provider_failure_hidden");
@@ -314,8 +333,8 @@ export async function testOfflineArtifact(root = process.cwd()) {
       "BUY FAK fee-inclusive approval binding", "order-hash and signer-bound approval replay rejection", "bounded preflight stops before POST", "SELL FAK", "market fee descriptor and exact fee calculation",
       "reject invalid approval before CLOB preflight", "reject invalid order signature", "Deposit Wallet TypedDataSign preparation",
       "reject stale book", "reject unsafe CLOB salt precision", "reject cap overrun", "reject wrong outcome asset",
-      "team-attributed news", "PL/PD/SA/CL fixture mapping", "complete and unavailable form handling",
-      "provider failure remains unavailable", "official v2 portfolio rows and cursor pagination completeness", "public portfolio address is not wallet proof", "trade tools registered without submission",
+      "team-attributed news", "PL/PD/SA/CL fixture mapping", "numeric PL/PD/SA/CL team-form filters", "complete and unavailable form handling",
+      "safe team-form HTTP 403 permission and 429 rate-limit diagnostics", "provider failure remains unavailable", "official v2 portfolio rows and cursor pagination completeness", "public portfolio address is not wallet proof", "trade tools registered without submission",
     ],
   };
 }

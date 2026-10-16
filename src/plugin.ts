@@ -318,6 +318,19 @@ type ProviderFetchResult =
   | { ok: true; data: unknown }
   | { ok: false; reason: string };
 
+function footballDataHttpReason(status: number): string {
+  switch (status) {
+    case 400: return "football-data.org rejected the request parameters (HTTP 400).";
+    case 401: return "football-data.org rejected or did not receive the API token (HTTP 401).";
+    case 403: return "football-data.org denied access to this resource or competition (HTTP 403); check token permissions and plan coverage.";
+    case 404: return "football-data.org resource was not found (HTTP 404).";
+    case 429: return "football-data.org rate limit reached (HTTP 429).";
+    default: return status >= 500
+      ? `football-data.org is temporarily unavailable (HTTP ${status}).`
+      : `football-data.org request failed (HTTP ${status}).`;
+  }
+}
+
 async function getProviderJson(url: string): Promise<ProviderFetchResult> {
   try {
     const response = await fetch(url, {
@@ -325,22 +338,22 @@ async function getProviderJson(url: string): Promise<ProviderFetchResult> {
       redirect: "error",
       signal: AbortSignal.timeout(2_500),
     });
-    if (!response.ok) return { ok: false, reason: `Provider returned HTTP ${response.status}.` };
+    if (!response.ok) return { ok: false, reason: footballDataHttpReason(response.status) };
     const body = await boundedResponseText(response, 1_000_000);
     try {
       const data: unknown = JSON.parse(body);
       return { ok: true, data };
     } catch {
-      return { ok: false, reason: "Provider returned invalid JSON." };
+      return { ok: false, reason: "football-data.org returned invalid JSON." };
     }
   } catch (error) {
     return {
       ok: false,
       reason: error instanceof Error && error.message === "response_too_large"
-        ? "Provider response exceeded the 1 MB limit."
+        ? "football-data.org response exceeded the 1 MB limit."
         : error instanceof DOMException && error.name === "TimeoutError"
-          ? "Provider request timed out."
-          : "Provider request failed.",
+          ? "football-data.org request timed out."
+          : "football-data.org request failed before receiving a response.",
     };
   }
 }
@@ -455,10 +468,10 @@ function rssItems(value: unknown): z.infer<typeof rssItemSchema>[] | null {
 }
 
 const SPORTS_COMPETITIONS = {
-  PL: { name: "Premier League" },
-  PD: { name: "LaLiga" },
-  SA: { name: "Serie A" },
-  CL: { name: "UEFA Champions League" },
+  PL: { name: "Premier League", competitionId: "2021" },
+  PD: { name: "LaLiga", competitionId: "2014" },
+  SA: { name: "Serie A", competitionId: "2019" },
+  CL: { name: "UEFA Champions League", competitionId: "2001" },
 } as const;
 
 type SoccerLeague = keyof typeof SPORTS_COMPETITIONS;
@@ -651,7 +664,7 @@ async function getSoccerResearch(input: {
     const cutoffDate = addDays(exactMatch.utcDate.slice(0, 10), -1);
     const teamRequests = [exactMatch.homeTeam, exactMatch.awayTeam].map((team) => {
       const url = footballDataUrl(`teams/${team.id}/matches`, {
-        competitions: input.league, dateTo: cutoffDate, status: "FINISHED", limit: "5",
+        competitions: definition.competitionId, dateTo: cutoffDate, status: "FINISHED", limit: "5",
       });
       return { url, team, request: getProviderJson(url) };
     });
@@ -661,7 +674,7 @@ async function getSoccerResearch(input: {
       if (!request) continue;
       sources.push({ provider: "football-data.org", purpose: "TEAM_FORM", url: request.url, observedAt: new Date().toISOString() });
       if (!response.ok) {
-        formReason = `football-data.org did not return complete recent form (HTTP or network failure).`;
+        formReason = response.reason;
         continue;
       }
       const parsed = footballDataMatchesSchema.safeParse(response.data);
