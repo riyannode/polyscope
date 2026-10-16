@@ -51,7 +51,7 @@ export async function testArtifact(root = process.cwd()) {
   validateSample(selected, config.arguments, response.result);
   const checks = [{ tool: config.tool, status: "passed" }];
   const researchTools = [
-    ["get_soccer_news", { limit: 3 }],
+    ["get_soccer_news", { teams: ["Arsenal"], limit: 3 }],
     ...["PL", "PD", "SA", "CL"].map((league) => ["research_soccer", { league, days: 0, limit: 3 }]),
   ];
   for (const [toolName, argumentsValue] of researchTools) {
@@ -60,7 +60,7 @@ export async function testArtifact(root = process.cwd()) {
     const result = await callTool(artifact, tool, argumentsValue);
     checks.push({ tool: toolName, status: "passed", availability: result.structuredContent.availability, reason: result.structuredContent.reason });
   }
-  const market = response.result.structuredContent?.markets?.find((entry) => entry.outcomes?.length > 0 && entry.acceptingOrders === true && entry.version != null);
+  const market = response.result.structuredContent?.markets?.find((entry) => entry.outcomes?.length > 0 && entry.acceptingOrders === true);
   const outcome = market?.outcomes?.[0];
   if (!market || !outcome) fail("sample search did not return an accepting market outcome for quote conformance", "tool_failed");
   const quoteTool = tools.find((entry) => entry.name === "get_quote");
@@ -69,24 +69,42 @@ export async function testArtifact(root = process.cwd()) {
   checks.push({ tool: "get_quote", status: "passed", availability: quoteResult.structuredContent.availability, freshness: quoteResult.structuredContent.freshness, bookTimestamp: quoteResult.structuredContent.bookTimestamp, bookAgeMs: quoteResult.structuredContent.bookAgeMs });
   const prepareTool = tools.find((entry) => entry.name === "prepare_order_signing");
   if (!prepareTool) fail("prepare_order_signing was not returned by tools/list", "tool_catalog_invalid");
-  const minimumShareMicros = toMicros(quoteResult.structuredContent.minOrderSize);
-  const hundredthShares = (minimumShareMicros + 9_999n) / 10_000n;
-  const signingSize = formatHundredths(hundredthShares);
-  const preparedResult = await callTool(artifact, prepareTool, {
-    marketId: market.marketId,
-    assetId: outcome.assetId,
-    makerAddress: "0x0000000000000000000000000000000000000001",
-    signingAddress: "0x0000000000000000000000000000000000000001",
-    walletType: "EOA",
-    side: "BUY",
-    price: quoteResult.structuredContent.tickSize,
-    size: signingSize,
-    maxAmount: "999999999999999999999999999",
-  });
-  if (preparedResult.structuredContent.submitsOrder !== false || preparedResult.structuredContent.preparedOrder.market.outcome !== outcome.name) {
-    fail("prepared payload did not preserve the selected outcome or no-submit boundary", "result_invalid");
+  if (quoteResult.structuredContent.freshness !== "FRESH") {
+    checks.push({ tool: "prepare_order_signing", status: "skipped", reason: "live CLOB book is stale; deterministic payload preparation is covered by pnpm test" });
+  } else {
+    const minimumShareMicros = toMicros(quoteResult.structuredContent.minOrderSize);
+    const hundredthShares = (minimumShareMicros + 9_999n) / 10_000n;
+    const signingSize = formatHundredths(hundredthShares);
+    const prepareArguments = {
+      marketId: market.marketId,
+      assetId: outcome.assetId,
+      makerAddress: "0x0000000000000000000000000000000000000001",
+      signingAddress: "0x0000000000000000000000000000000000000001",
+      walletType: "EOA",
+      side: "BUY",
+      priceLimit: formatMicros(1_000_000n - toMicros(quoteResult.structuredContent.tickSize)),
+      size: signingSize,
+      maxNominalPusd: "999999999999999999999999999",
+    };
+    const preparedResponse = await runOperation(artifact, {
+      method: "tools/call", params: { name: prepareTool.name, arguments: prepareArguments },
+    });
+    validateCallResult(preparedResponse.result);
+    if (preparedResponse.result.isError === true) {
+      const message = preparedResponse.result.content.find((item) => item.type === "text")?.text ?? "";
+      if (message.startsWith("PS_STALE_BOOK:")) {
+        checks.push({ tool: "prepare_order_signing", status: "skipped", reason: "live CLOB book aged out before preparation; deterministic payload preparation is covered by pnpm test" });
+      } else {
+        fail("prepare_order_signing failed for the fresh conformance market", "tool_failed");
+      }
+    } else {
+      validateSample(prepareTool, prepareArguments, preparedResponse.result);
+      if (preparedResponse.result.structuredContent?.submitsOrder !== false || preparedResponse.result.structuredContent?.preparedOrder?.market?.outcome !== outcome.name) {
+        fail("prepared payload did not preserve the selected outcome or no-submit boundary", "result_invalid");
+      }
+      checks.push({ tool: "prepare_order_signing", status: "passed", submitsOrder: false });
+    }
   }
-  checks.push({ tool: "prepare_order_signing", status: "passed", submitsOrder: false });
   return {
     status: "passed",
     sampleCall: checks[0],
@@ -96,15 +114,140 @@ export async function testArtifact(root = process.cwd()) {
   };
 }
 
-async function callTool(artifact, tool, argumentsValue) {
+async function callTool(artifact, tool, argumentsValue, options = {}) {
   const response = await runOperation(artifact, {
     method: "tools/call",
     params: { name: tool.name, arguments: argumentsValue },
-  });
+  }, options);
   validateCallResult(response.result);
   if (response.result.isError === true) fail(`${tool.name} tools/call returned isError: true`, "tool_failed");
   validateSample(tool, argumentsValue, response.result);
   return response.result;
+}
+
+export async function testOfflineArtifact(root = process.cwd()) {
+  const artifact = resolve(root, "dist/plugin.mjs");
+  const tools = await listTools(artifact);
+  const prepareTool = tools.find((tool) => tool.name === "prepare_order_signing");
+  if (!prepareTool) fail("prepare_order_signing was not returned by tools/list", "tool_catalog_invalid");
+  const submitTool = tools.find((tool) => tool.name === "submit_fak_order");
+  if (!submitTool) fail("submit_fak_order was not returned by tools/list", "tool_catalog_invalid");
+  const base = {
+    marketId: "1", assetId: "123",
+    makerAddress: "0x0000000000000000000000000000000000000001",
+    signingAddress: "0x0000000000000000000000000000000000000001",
+    walletType: "EOA", size: "10", maxNominalPusd: "5.13",
+  };
+  const buy = await callTool(artifact, prepareTool, { ...base, side: "BUY", priceLimit: "0.50" }, { fixtures: true });
+  const buyOrder = buy.structuredContent.preparedOrder.order;
+  if (buyOrder.orderType !== "FAK" || buyOrder.maxFeePusd !== "0.125" || buyOrder.maxNominalPusd !== "5.13") {
+    fail("BUY preparation did not preserve FAK and the fee-inclusive cap", "order_policy_invalid");
+  }
+  const approval = buy.structuredContent.executionApprovalSigningIntent?.typedData?.message;
+  if (approval?.orderType !== "FAK" || approval?.maxNominalMicros !== "5130000" || approval?.limitPriceMicros !== "500000" || approval?.sizeMicros !== "10000000" || approval?.feeRateMicros !== "50000" || approval?.feeExponent !== 1) {
+    fail("execution approval did not bind FAK and the fee-inclusive cap", "order_policy_invalid");
+  }
+  const sell = await callTool(artifact, prepareTool, { ...base, side: "SELL", priceLimit: "0.49" }, { fixtures: true });
+  if (sell.structuredContent.preparedOrder.order.side !== "SELL" || sell.structuredContent.preparedOrder.order.orderType !== "FAK") {
+    fail("SELL preparation did not preserve the user-selected FAK order", "order_policy_invalid");
+  }
+  const deposit = await callTool(artifact, prepareTool, {
+    ...base, makerAddress: "0x0000000000000000000000000000000000000002",
+    walletType: "DEPOSIT_WALLET", side: "BUY", priceLimit: "0.50",
+  }, { fixtures: true });
+  const depositTypedData = deposit.structuredContent.preparedOrder.typedData;
+  if (depositTypedData.primaryType !== "TypedDataSign"
+    || depositTypedData.message.verifyingContract !== "0x0000000000000000000000000000000000000002"
+    || depositTypedData.message.contents.signatureType !== 3
+    || deposit.structuredContent.preparedOrder.wallet.orderSignerAddress !== "0x0000000000000000000000000000000000000002") {
+    fail("Deposit Wallet order payload did not use the documented ERC-7739 TypedDataSign shape", "deposit_wallet_payload_invalid");
+  }
+  const validateOrderTool = tools.find((tool) => tool.name === "validate_order_signature");
+  const invalidOrderSignature = await callTool(artifact, validateOrderTool, {
+    preparedOrder: buy.structuredContent.preparedOrder, signature: `0x${"0".repeat(130)}`,
+  }, { fixtures: true });
+  if (invalidOrderSignature.structuredContent.valid !== false || invalidOrderSignature.structuredContent.recoveredSignerAddress !== null) {
+    fail("invalid order signature was accepted", "signature_validation_invalid");
+  }
+  const unsafeSaltOrder = await runOperation(artifact, {
+    method: "tools/call",
+    params: { name: submitTool.name, arguments: {
+      preparedOrder: { ...buy.structuredContent.preparedOrder, order: { ...buyOrder, salt: "9007199254740992" } },
+      executionApprovalSignature: `0x${"0".repeat(130)}`, orderSignature: `0x${"0".repeat(130)}`,
+      clobAuth: { timestamp: String(Math.floor(Date.now() / 1000)), nonce: "0", signature: `0x${"0".repeat(130)}` },
+    } },
+  }, { fixtures: true });
+  if (unsafeSaltOrder.result?.isError !== true) fail("submit accepted an order salt that cannot be serialized exactly", "order_serialization_invalid");
+  const staleBook = await runOperation(artifact, {
+    method: "tools/call",
+    params: { name: prepareTool.name, arguments: { ...base, assetId: "124", side: "BUY", priceLimit: "0.50" } },
+  }, { fixtures: true });
+  if (staleBook.result?.isError !== true) fail("order preparation accepted a stale book", "stale_book_accepted");
+  const quoteTool = tools.find((tool) => tool.name === "get_quote");
+  const quote = await callTool(artifact, quoteTool, { marketId: "1", assetId: "123", side: "BUY", size: "10" }, { fixtures: true });
+  if (quote.structuredContent.feeRate !== "0.05" || quote.structuredContent.feeExponent !== 1 || quote.structuredContent.estimatedFeePusd !== "0.125") {
+    fail("quote did not use the official per-market fee descriptor and exact fee calculation", "fee_calculation_invalid");
+  }
+  const rejected = await callTool(artifact, submitTool, {
+    preparedOrder: buy.structuredContent.preparedOrder,
+    executionApprovalSignature: `0x${"0".repeat(130)}`,
+    orderSignature: `0x${"0".repeat(130)}`,
+    clobAuth: { timestamp: String(Math.floor(Date.now() / 1000)), nonce: "0", signature: `0x${"0".repeat(130)}` },
+  }, { fixtures: true });
+  if (rejected.structuredContent.status !== "REJECTED" || rejected.structuredContent.errorCode !== "PS_APPROVAL_INVALID") {
+    fail("invalid execution approval did not reject before the CLOB preflight", "approval_validation_invalid");
+  }
+  const overCap = await runOperation(artifact, {
+    method: "tools/call",
+    params: { name: prepareTool.name, arguments: { ...base, side: "BUY", priceLimit: "0.50", maxNominalPusd: "5.12" } },
+  }, { fixtures: true });
+  if (overCap.result?.isError !== true) fail("BUY preparation accepted a fee-inclusive amount above the user cap", "order_policy_invalid");
+  const wrongAsset = await runOperation(artifact, {
+    method: "tools/call",
+    params: { name: prepareTool.name, arguments: { ...base, assetId: "999", side: "BUY", priceLimit: "0.50" } },
+  }, { fixtures: true });
+  if (wrongAsset.result?.isError !== true) fail("order preparation accepted an asset not mapped to the market outcome", "market_identity_invalid");
+  const newsTool = tools.find((tool) => tool.name === "get_soccer_news");
+  const news = await callTool(artifact, newsTool, { teams: ["Arsenal"], limit: 5 }, { fixtures: true });
+  if (news.structuredContent.items.length !== 1 || news.structuredContent.items[0].matchedTeams[0] !== "Arsenal") {
+    fail("soccer news included a headline unrelated to the requested team", "news_attribution_invalid");
+  }
+  const researchTool = tools.find((tool) => tool.name === "research_soccer");
+  for (const league of ["PL", "PD", "SA", "CL"]) {
+    const research = await callTool(artifact, researchTool, { league, date: "2026-10-17", days: 0, limit: 3 }, { fixtures: true });
+    if (research.structuredContent.availability !== "AVAILABLE" || research.structuredContent.fixtures[0]?.leagueProviderId !== league) {
+      fail(`${league} soccer fixture was not mapped from football-data.org data`, "soccer_mapping_invalid");
+    }
+  }
+  const exactForm = await callTool(artifact, researchTool, { league: "PL", fixtureId: "1001", date: "2026-10-17", days: 0, limit: 3 }, { fixtures: true });
+  if (exactForm.structuredContent.fixtures[0]?.formCoverage !== "COMPLETE_LAST_5" || exactForm.structuredContent.fixtures[0]?.homeRecentResults.length !== 5 || exactForm.structuredContent.fixtures[0]?.awayRecentResults.length !== 5) {
+    fail("soccer form was not reported as complete with exactly five results per team", "soccer_form_invalid");
+  }
+  const incompleteForm = await callTool(artifact, researchTool, { league: "PL", fixtureId: "9999", date: "2026-10-20", days: 0, limit: 3 }, { fixtures: true });
+  if (incompleteForm.structuredContent.fixtures[0]?.formCoverage !== "UNAVAILABLE" || incompleteForm.structuredContent.fixtures[0]?.homeRecentResults.length !== 0) {
+    fail("incomplete historical soccer form was silently presented as complete", "soccer_form_invalid");
+  }
+  const unavailable = await callTool(artifact, researchTool, { league: "PL", date: "2026-11-01", days: 0, limit: 3 }, { fixtures: true });
+  if (unavailable.structuredContent.availability !== "UNAVAILABLE") fail("provider failure was presented as available soccer data", "provider_failure_hidden");
+  const portfolioTool = tools.find((tool) => tool.name === "get_portfolio");
+  const portfolio = await callTool(artifact, portfolioTool, { walletAddress: "0x0000000000000000000000000000000000000001", limit: 10 }, { fixtures: true });
+  if (portfolio.structuredContent.addressBinding !== "PUBLIC_ADDRESS_UNVERIFIED" || portfolio.structuredContent.positions.length !== 0) {
+    fail("portfolio did not label caller-supplied addresses as unverified public addresses", "wallet_binding_invalid");
+  }
+  const toolNames = new Set(tools.map((tool) => tool.name));
+  for (const name of ["submit_fak_order", "get_order_status", "cancel_order", "get_portfolio"]) {
+    if (!toolNames.has(name)) fail(`${name} was not registered`, "tool_catalog_invalid");
+  }
+  return {
+    status: "passed",
+    deterministicCases: [
+      "BUY FAK fee-inclusive approval binding", "SELL FAK", "market fee descriptor and exact fee calculation",
+      "reject invalid approval before CLOB preflight", "reject invalid order signature", "Deposit Wallet TypedDataSign preparation",
+      "reject stale book", "reject unsafe CLOB salt precision", "reject cap overrun", "reject wrong outcome asset",
+      "team-attributed news", "PL/PD/SA/CL fixture mapping", "complete and unavailable form handling",
+      "provider failure remains unavailable", "public portfolio address is not wallet proof", "trade tools registered without submission",
+    ],
+  };
 }
 
 function toMicros(value) {
@@ -119,6 +262,12 @@ function formatHundredths(value) {
   const whole = value / 100n;
   const fraction = (value % 100n).toString().padStart(2, "0");
   return fraction === "00" ? String(whole) : `${whole}.${fraction}`;
+}
+
+function formatMicros(value) {
+  const whole = value / 1_000_000n;
+  const fraction = (value % 1_000_000n).toString().padStart(6, "0").replace(/0+$/, "");
+  return fraction.length === 0 ? String(whole) : `${whole}.${fraction}`;
 }
 
 async function validateArtifact(artifact) {
@@ -188,10 +337,11 @@ function validateCallResult(value) {
   if (result.isError !== undefined && typeof result.isError !== "boolean") fail("tools/call isError must be boolean");
 }
 
-async function runOperation(artifact, operation) {
+export async function runOperation(artifact, operation, { fixtures = false } = {}) {
   const home = await mkdtemp(resolve(tmpdir(), "paybox-plugin-conformance-"));
   try {
-    return await withProcess(process.execPath, [artifact], {
+    const args = fixtures ? ["--import", resolve(dirname(artifact), "../tests/network-fixtures.mjs"), artifact] : [artifact];
+    return await withProcess(process.execPath, args, {
       cwd: dirname(artifact),
       env: { HOME: home, NODE_ENV: "production", NO_COLOR: "1", PATH: process.env.PATH ?? "/usr/local/bin:/usr/bin:/bin" },
     }, async (child, closed, stop) => {

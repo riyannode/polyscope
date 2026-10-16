@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 
-import { ConformanceError, reportConformance, testArtifact } from "./conformance.mjs";
+import { ConformanceError, reportConformance, testOfflineArtifact } from "./conformance.mjs";
 import { withProcess } from "./process.mjs";
 
 const root = process.cwd();
@@ -17,7 +17,7 @@ await reportConformance(async () => {
   if (first.hash !== second.hash || first.bytes !== second.bytes) {
     throw new ConformanceError("build is not deterministic", "build_not_deterministic");
   }
-  return testArtifact(root);
+  return testOfflineArtifact(root);
 });
 
 async function build(script = "build") {
