@@ -126,7 +126,7 @@ async function callTool(artifact, tool, argumentsValue, options = {}) {
 export async function testOfflineArtifact(root = process.cwd()) {
   const artifact = resolve(root, "dist/plugin.mjs");
   const tools = await listTools(artifact);
-  if (tools.length !== 12) fail(`expected 12 MCP tools, received ${tools.length}`, "tool_catalog_invalid");
+  if (tools.length !== 13) fail(`expected 13 MCP tools, received ${tools.length}`, "tool_catalog_invalid");
   const removedSchemaFields = ["ExecutionApproval", "executionApprovalSignature", "executionApprovalSigningIntent", "marketRestricted", "accountGeoblockChecked"];
   for (const tool of tools) {
     const schemas = JSON.stringify({ inputSchema: tool.inputSchema, outputSchema: tool.outputSchema });
@@ -410,6 +410,8 @@ export async function testOfflineArtifact(root = process.cwd()) {
   for (const phrase of ["Form returned, xG missing", "Injury information missing", "Browser unavailable", "original URL", "manager statements", "head-to-head history"]) {
     if (!soccerSkill.includes(phrase)) fail(`soccer research skill is missing expected workflow guidance: ${phrase}`, "soccer_skill_invalid");
   }
+  const edgeTool = tools.find((tool) => tool.name === "analyze_soccer_edge");
+  if (!edgeTool) fail("analyze_soccer_edge was not returned by tools/list", "tool_catalog_invalid");
   for (const league of ["PL", "PD", "SA", "CL"]) {
     const research = await callTool(artifact, researchTool, { league, date: "2026-10-17", days: 0, limit: 3 }, { fixtures: true });
     if (research.structuredContent.availability !== "AVAILABLE" || research.structuredContent.fixtures[0]?.leagueProviderId !== league) {
@@ -434,6 +436,179 @@ export async function testOfflineArtifact(root = process.cwd()) {
     })) {
       fail(`${league} team-form requests did not use a numeric competition ID without the failing date filter`, "soccer_team_filter_invalid");
     }
+  }
+  const enriched = await callTool(artifact, researchTool, {
+    league: "PL", fixtureId: "1001", date: "2026-10-17", includeApiFootball: true,
+  }, { fixtures: true });
+  const enrichedFixture = enriched.structuredContent.fixtures[0];
+  const apiFootball = enrichedFixture?.apiFootball;
+  if (apiFootball?.availability !== "AVAILABLE" || apiFootball.matchIdentity?.providerFixtureId !== "90001"
+    || apiFootball.matchIdentity.homeTeamProviderId !== "501" || enrichedFixture.homeTeamProviderId === "501"
+    || apiFootball.homeStats?.playedAtHome !== 8 || apiFootball.awayStats?.playedAway !== 6
+    || !apiFootball.sources.some((source) => source.purpose === "TEAM_STATISTICS" && new URL(source.url).searchParams.get("date") === "2026-10-16")) {
+    fail("API-Football enrichment did not preserve independent IDs, source samples, and the pre-kickoff cutoff", "soccer_provider_invalid");
+  }
+  const quoteToolForAnalysis = tools.find((tool) => tool.name === "get_quote");
+  const analysisQuote = await callTool(artifact, quoteToolForAnalysis, { marketId: "1", assetId: "123", side: "BUY", size: "10", depth: 10 }, { fixtures: true });
+  const resolutionRules = "The market resolves to the named team winning the scheduled 90 minutes; extra time and penalties do not count.";
+  const baselineForm = await callTool(artifact, researchTool, { league: "PL", fixtureId: "1001", date: "2026-10-17" }, { fixtures: true });
+  const baselineModel = await callTool(artifact, edgeTool, {
+    fixture: baselineForm.structuredContent.fixtures[0], quote: analysisQuote.structuredContent, outcome: "HOME_WIN",
+    marketResolutionType: "REGULATION_1X2", marketResolutionRules: resolutionRules,
+  }, { fixtures: true });
+  if (baselineModel.structuredContent.probabilityStatus !== "AVAILABLE"
+    || baselineModel.structuredContent.model.inputs.statisticsProvider !== "football-data.org"
+    || baselineModel.structuredContent.model.inputs.homeMatchesAtHome !== 3
+    || baselineModel.structuredContent.model.inputs.awayMatchesAway !== 2
+    || baselineModel.structuredContent.model.sources.length !== 2) {
+    fail("independent model did not use and attribute available pre-kickoff venue form when API-Football was not requested", "soccer_edge_invalid");
+  }
+  const positiveEdge = await callTool(artifact, edgeTool, {
+    fixture: enrichedFixture, quote: analysisQuote.structuredContent, outcome: "HOME_WIN",
+    marketResolutionType: "REGULATION_1X2", marketResolutionRules: resolutionRules,
+  }, { fixtures: true });
+  const probabilities = positiveEdge.structuredContent.model;
+  if (positiveEdge.structuredContent.probabilityStatus !== "AVAILABLE"
+    || Math.abs((probabilities.homeWin + probabilities.draw + probabilities.awayWin) - 1) > 1e-12
+    || probabilities.expectedHomeGoals !== 1.675 || probabilities.expectedAwayGoals !== 0.975
+    || positiveEdge.structuredContent.edgeStatus !== "AVAILABLE"
+    || positiveEdge.structuredContent.depthWeightedExecutionPrice !== analysisQuote.structuredContent.averagePrice
+    || positiveEdge.structuredContent.effectiveBuyCostPerShare !== "0.5125") {
+    fail("independent Poisson probabilities or fee-inclusive edge did not match deterministic inputs", "soccer_edge_invalid");
+  }
+  const favorableQuote = await callTool(artifact, quoteToolForAnalysis, { marketId: "1", assetId: "123", side: "BUY", size: "10", depth: 10 }, { fixtures: true, fixtureScenario: "analysis-favorable" });
+  const positiveNetEdge = await callTool(artifact, edgeTool, {
+    fixture: enrichedFixture, quote: favorableQuote.structuredContent, outcome: "HOME_WIN",
+    marketResolutionType: "REGULATION_1X2", marketResolutionRules: resolutionRules,
+  }, { fixtures: true });
+  if (Number(positiveNetEdge.structuredContent.netEdgePerShare) <= 0) {
+    fail("positive model-based edge was not represented as a positive numeric result", "soccer_edge_invalid");
+  }
+  const multilevelQuote = await callTool(artifact, quoteToolForAnalysis, { marketId: "1", assetId: "123", side: "BUY", size: "10", depth: 10 }, { fixtures: true, fixtureScenario: "analysis-multilevel" });
+  const multilevelEdge = await callTool(artifact, edgeTool, {
+    fixture: enrichedFixture, quote: multilevelQuote.structuredContent, outcome: "HOME_WIN",
+    marketResolutionType: "REGULATION_1X2", marketResolutionRules: resolutionRules,
+  }, { fixtures: true });
+  if (multilevelQuote.structuredContent.bestAsk !== "0.5" || multilevelQuote.structuredContent.averagePrice !== "0.55"
+    || multilevelEdge.structuredContent.depthWeightedExecutionPrice !== "0.55"
+    || multilevelEdge.structuredContent.effectiveBuyCostPerShare !== "0.56225") {
+    fail("edge calculation used the best ask or midpoint instead of fee-inclusive depth-weighted execution cost", "soccer_edge_invalid");
+  }
+  const negativeEdge = await callTool(artifact, edgeTool, {
+    fixture: enrichedFixture, quote: analysisQuote.structuredContent, outcome: "AWAY_WIN",
+    marketResolutionType: "REGULATION_1X2", marketResolutionRules: resolutionRules,
+  }, { fixtures: true });
+  if (negativeEdge.structuredContent.edgeStatus !== "AVAILABLE" || Number(negativeEdge.structuredContent.netEdgePerShare) >= 0) {
+    fail("negative model-based edge was not represented as a numeric analysis result", "soccer_edge_invalid");
+  }
+  const partialQuote = await callTool(artifact, quoteToolForAnalysis, {
+    marketId: "1", assetId: "123", side: "BUY", size: "10", depth: 10,
+  }, { fixtures: true, fixtureScenario: "analysis-partial-depth" });
+  const partialEdge = await callTool(artifact, edgeTool, {
+    fixture: enrichedFixture, quote: partialQuote.structuredContent, outcome: "HOME_WIN",
+    marketResolutionType: "REGULATION_1X2", marketResolutionRules: resolutionRules,
+  }, { fixtures: true });
+  if (partialEdge.structuredContent.edgeStatus !== "AVAILABLE" || partialEdge.structuredContent.fillableShares !== "4"
+    || partialEdge.structuredContent.unfilledShares !== "6"
+    || !partialEdge.structuredContent.model.uncertainty.some((item) => item.includes("partial fill"))) {
+    fail("edge calculation did not limit expected value to visible partial FAK fillability", "soccer_edge_invalid");
+  }
+  const emptyQuote = await callTool(artifact, quoteToolForAnalysis, { marketId: "1", assetId: "123", side: "BUY", size: "10", depth: 10 }, { fixtures: true, fixtureScenario: "no-visible-liquidity" });
+  const emptyEdge = await callTool(artifact, edgeTool, {
+    fixture: enrichedFixture, quote: emptyQuote.structuredContent, outcome: "HOME_WIN",
+    marketResolutionType: "REGULATION_1X2", marketResolutionRules: resolutionRules,
+  }, { fixtures: true });
+  if (emptyEdge.structuredContent.edgeStatus !== "UNAVAILABLE" || emptyEdge.structuredContent.netEdgePerShare !== null) {
+    fail("edge calculation invented an executable price when the CLOB had no visible liquidity", "soccer_edge_invalid");
+  }
+  const sellQuote = await callTool(artifact, quoteToolForAnalysis, { marketId: "1", assetId: "123", side: "SELL", size: "10", depth: 10 }, { fixtures: true });
+  const sellEdge = await callTool(artifact, edgeTool, {
+    fixture: enrichedFixture, quote: sellQuote.structuredContent, outcome: "HOME_WIN",
+    marketResolutionType: "REGULATION_1X2", marketResolutionRules: resolutionRules,
+  }, { fixtures: true });
+  if (sellEdge.structuredContent.edgeStatus !== "UNAVAILABLE" || !sellEdge.structuredContent.edgeReason?.includes("SELL edge is not calculated")) {
+    fail("SELL edge was calculated without an existing position and sale-proceeds basis", "soccer_edge_invalid");
+  }
+  const unsupportedEdge = await callTool(artifact, edgeTool, {
+    fixture: enrichedFixture, quote: analysisQuote.structuredContent, outcome: "HOME_WIN",
+    marketResolutionType: "OTHER", marketResolutionRules: "The market resolves to qualify after possible extra time and penalties.",
+  }, { fixtures: true });
+  if (unsupportedEdge.structuredContent.edgeStatus !== "UNSUPPORTED_MARKET" || unsupportedEdge.structuredContent.netEdgePerShare !== null) {
+    fail("unsupported market resolution was assigned a misleading edge", "soccer_edge_invalid");
+  }
+  const noProvider = await callTool(artifact, researchTool, {
+    league: "PL", fixtureId: "1001", date: "2026-10-17", includeApiFootball: true,
+  }, { fixtures: true, fixtureScenario: "api-football-403" });
+  if (noProvider.structuredContent.availability !== "AVAILABLE" || noProvider.structuredContent.fixtures[0]?.apiFootball?.availability !== "UNAVAILABLE") {
+    fail("API-Football authorization failure erased football-data.org baseline evidence", "soccer_provider_invalid");
+  }
+  const ambiguousProvider = await callTool(artifact, researchTool, {
+    league: "PL", fixtureId: "1001", date: "2026-10-17", includeApiFootball: true,
+  }, { fixtures: true, fixtureScenario: "api-football-ambiguous" });
+  if (ambiguousProvider.structuredContent.fixtures[0]?.apiFootball?.availability !== "UNAVAILABLE"
+    || !ambiguousProvider.structuredContent.fixtures[0]?.apiFootball?.reason?.includes("multiple fixtures")) {
+    fail("ambiguous cross-provider fixture matches were silently joined", "soccer_provider_invalid");
+  }
+  const mismatchProvider = await callTool(artifact, researchTool, {
+    league: "PL", fixtureId: "1001", date: "2026-10-17", includeApiFootball: true,
+  }, { fixtures: true, fixtureScenario: "api-football-mismatch" });
+  if (mismatchProvider.structuredContent.fixtures[0]?.apiFootball?.availability !== "UNAVAILABLE") {
+    fail("nonmatching provider fixture was accepted as an enrichment", "soccer_provider_invalid");
+  }
+  const providerApiError = await callTool(artifact, researchTool, {
+    league: "PL", fixtureId: "1001", date: "2026-10-17", includeApiFootball: true,
+  }, { fixtures: true, fixtureScenario: "api-football-api-error" });
+  if (providerApiError.structuredContent.availability !== "AVAILABLE"
+    || !providerApiError.structuredContent.fixtures[0]?.apiFootball?.reason?.includes("endpoint error")) {
+    fail("API-Football's HTTP 200 error envelope was reported as a valid empty fixture set", "soccer_provider_invalid");
+  }
+  const providerNoContent = await callTool(artifact, researchTool, {
+    league: "PL", fixtureId: "1001", date: "2026-10-17", includeApiFootball: true,
+  }, { fixtures: true, fixtureScenario: "api-football-204" });
+  if (providerNoContent.structuredContent.availability !== "AVAILABLE"
+    || !providerNoContent.structuredContent.fixtures[0]?.apiFootball?.reason?.includes("HTTP 204")) {
+    fail("API-Football HTTP 204 was conflated with an authentication failure", "soccer_provider_invalid");
+  }
+  const kickoffConflict = await callTool(artifact, researchTool, {
+    league: "PL", fixtureId: "1001", date: "2026-10-17", includeApiFootball: true,
+  }, { fixtures: true, fixtureScenario: "api-football-kickoff-conflict" });
+  if (kickoffConflict.structuredContent.availability !== "AVAILABLE"
+    || kickoffConflict.structuredContent.fixtures[0]?.apiFootball?.availability !== "UNAVAILABLE") {
+    fail("conflicting cross-provider kickoff times were silently joined", "soccer_provider_invalid");
+  }
+  const unavailableStats = await callTool(artifact, researchTool, {
+    league: "PL", fixtureId: "1001", date: "2026-10-17", includeApiFootball: true,
+  }, { fixtures: true, fixtureScenario: "api-football-stats-403" });
+  if (unavailableStats.structuredContent.availability !== "AVAILABLE"
+    || unavailableStats.structuredContent.fixtures[0]?.apiFootball?.availability !== "UNAVAILABLE"
+    || unavailableStats.structuredContent.fixtures[0]?.apiFootball?.matchIdentity?.providerFixtureId !== "90001") {
+    fail("API-Football statistics failure discarded the matched fixture or baseline research", "soccer_provider_invalid");
+  }
+  const emptyStats = await callTool(artifact, researchTool, {
+    league: "PL", fixtureId: "1001", date: "2026-10-17", includeApiFootball: true,
+  }, { fixtures: true, fixtureScenario: "api-football-empty-stats" });
+  if (emptyStats.structuredContent.availability !== "AVAILABLE"
+    || emptyStats.structuredContent.fixtures[0]?.apiFootball?.availability !== "UNAVAILABLE"
+    || !emptyStats.structuredContent.fixtures[0]?.apiFootball?.reason?.includes("positive venue sample counts")) {
+    fail("missing API-Football venue statistics were presented as usable research", "soccer_provider_invalid");
+  }
+  const unavailableModel = await callTool(artifact, edgeTool, {
+    fixture: unavailableStats.structuredContent.fixtures[0], quote: analysisQuote.structuredContent, outcome: "HOME_WIN",
+    marketResolutionType: "REGULATION_1X2", marketResolutionRules: resolutionRules,
+  }, { fixtures: true });
+  if (unavailableModel.structuredContent.probabilityStatus !== "AVAILABLE"
+    || unavailableModel.structuredContent.model.inputs.statisticsProvider !== "football-data.org") {
+    fail("baseline venue form was not used when optional API-Football statistics failed", "soccer_edge_invalid");
+  }
+  const noHistory = await callTool(artifact, researchTool, { league: "PL", fixtureId: "7776", date: "2026-10-20" }, { fixtures: true });
+  const unavailableModelResult = await callTool(artifact, edgeTool, {
+    fixture: noHistory.structuredContent.fixtures[0], quote: analysisQuote.structuredContent, outcome: "HOME_WIN",
+    marketResolutionType: "REGULATION_1X2", marketResolutionRules: resolutionRules,
+  }, { fixtures: true });
+  if (unavailableModelResult.structuredContent.probabilityStatus !== "UNAVAILABLE"
+    || unavailableModelResult.structuredContent.model.homeWin !== null
+    || unavailableModelResult.structuredContent.edgeStatus !== "UNAVAILABLE") {
+    fail("missing all statistical inputs generated a probability or edge", "soccer_edge_invalid");
   }
   const mixedCompetitionForm = await callTool(artifact, researchTool, { league: "PL", fixtureId: "560611", date: "2026-10-17", days: 0, limit: 3 }, { fixtures: true });
   const mixedFixture = mixedCompetitionForm.structuredContent.fixtures[0];
@@ -513,7 +688,10 @@ export async function testOfflineArtifact(root = process.cwd()) {
       "reject invalid Polymarket order signature", "reject real provider geoblock", "missing CLOB credentials handled", "Deposit Wallet TypedDataSign preparation", "local smart-wallet signer recovery is distinct from deferred CLOB acceptance", "Deposit Wallet ERC-7739 order reaches exactly one intercepted CLOB POST without Polygon RPC",
       "121s book age is informational for preparation", "future, invalid, missing, and stale book timestamps do not block bounded FAK execution", "changed minimum decrease and still-valid tick are accepted", "increased minimum and invalid current tick reject the exact signed order", "zero current minimum is rejected as invalid provider data", "changed risk mode rejects an incompatible exchange domain", "restricted Gamma metadata omitted and does not reject preparation/submission", "market and quote responses omit removed eligibility metadata", "unsigned book metadata does not change EIP-712 signature validation", "51s quote remains labeled stale", "51s book age alone does not block bounded FAK execution", "ambiguous submission is reconciled once and never reposted", "provider-invalid structured diagnostics", "reject unsafe CLOB salt precision", "reject fee-inclusive cap overrun", "reject wrong outcome asset",
       "team-attributed news", "PL/PD/SA/CL fixture mapping", "documented team-form filters with mixed-competition history filtering", "form counts and explanations for 5/5, 5/4, 5/0, and 0/0 histories",
-      "safe team-form HTTP 403 permission and 429 rate-limit diagnostics", "soccer skill continuation for missing xG, missing injury reports, and unavailable browser tools", "provider failure remains unavailable", "official v2 portfolio rows and cursor pagination completeness", "public portfolio address is not wallet proof", "trade tools registered without submission",
+      "safe team-form HTTP 403 permission and 429 rate-limit diagnostics", "API-Football optional enrichment, independent provider IDs, exact fixture matching, and cutoff date",
+      "provider 403, 204, HTTP 200 error envelope, unavailable/missing stats, mismatched names, kickoff conflicts, and ambiguous duplicates do not replace baseline data", "Poisson probability normalization and venue-specific API-Football and football-data fallback inputs",
+      "CLOB multilevel depth-weighted price, fee-inclusive cost, positive and negative edge, partial fill, no liquidity, unsupported market rules, and honest SELL limitation",
+      "soccer skill continuation for missing xG, missing injury reports, and unavailable browser tools", "provider failure remains unavailable", "official v2 portfolio rows and cursor pagination completeness", "public portfolio address is not wallet proof", "13-tool catalog without an order from analysis",
     ],
   };
 }

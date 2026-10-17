@@ -24,6 +24,7 @@ const market = {
 
 const competitionNames = { PL: "Premier League", PD: "LaLiga", SA: "Serie A", CL: "UEFA Champions League" };
 const footballCompetitionIds = { PL: "2021", PD: "2014", SA: "2019", CL: "2001" };
+const apiFootballLeagueNames = { PL: "Premier League", PD: "La Liga", SA: "Serie A", CL: "UEFA Champions League" };
 function match(id, competition, date, status = "SCHEDULED") {
   return {
     id, utcDate: `${date}T19:00:00Z`, status, lastUpdated: "2026-10-16T12:00:00Z",
@@ -87,9 +88,11 @@ globalThis.fetch = async (input, init = {}) => {
     body = {
       asset_id: assetId, market: conditionId,
       timestamp: String(Date.now() - (ageScenario ? Number(ageScenario[1]) : scenario === "submit-stale-book" ? 51_000 : assetId === "124" ? 121_000 : 0)),
-      bids: [{ price: "0.49", size: "100" }], asks: [{ price: "0.50", size: "100" }],
+      bids: [{ price: "0.49", size: "100" }], asks: [{ price: "0.50", size: scenario === "analysis-partial-depth" ? "4" : "100" }],
       min_order_size: "5", tick_size: "0.01", neg_risk: false, version: "v1",
     };
+    if (scenario === "analysis-multilevel") body.asks = [{ price: "0.50", size: "5" }, { price: "0.60", size: "100" }];
+    if (scenario === "analysis-favorable") body.asks = [{ price: "0.25", size: "100" }];
     if (scenario === "snapshot-min-decrease") body.min_order_size = "1";
     if (scenario === "snapshot-min-increase") body.min_order_size = "11";
     if (scenario === "snapshot-min-zero") body.min_order_size = "0";
@@ -132,6 +135,25 @@ globalThis.fetch = async (input, init = {}) => {
     body = { blocked: scenario === "geoblocked" };
   } else if (url.hostname === "polygon-rpc.com") {
     process.exit(91);
+  } else if (url.hostname === "v3.football.api-sports.io" && url.pathname === "/fixtures") {
+    if (scenario === "api-football-403") return new Response("forbidden", { status: 403 });
+    if (scenario === "api-football-204") return new Response(null, { status: 204 });
+    const league = url.searchParams.get("date") === "2026-10-17" ? "PL" : "PL";
+    const fixture = {
+      fixture: { id: 90001, date: scenario === "api-football-kickoff-conflict" ? "2026-10-17T20:00:00+00:00" : "2026-10-17T19:00:00+00:00" },
+      league: { id: 39, name: apiFootballLeagueNames[league], season: 2026 },
+      teams: { home: { id: 501, name: "Arsenal FC" }, away: { id: 502, name: "Chelsea" } },
+    };
+    body = scenario === "api-football-api-error" ? { errors: { token: "fixture detail suppressed" }, response: [] }
+      : { errors: [], response: scenario === "api-football-mismatch" ? [] : scenario === "api-football-ambiguous" ? [fixture, { ...fixture, fixture: { ...fixture.fixture, id: 90002 } }] : [fixture] };
+  } else if (url.hostname === "v3.football.api-sports.io" && url.pathname === "/teams/statistics") {
+    if (scenario === "api-football-stats-403") return new Response("forbidden", { status: 403 });
+    const home = url.searchParams.get("team") === "501";
+    body = { response: {
+      fixtures: { played: { home: scenario === "api-football-empty-stats" ? 0 : home ? 8 : 4, away: scenario === "api-football-empty-stats" ? 0 : home ? 5 : 6 } },
+      goals: { for: { average: { home: scenario === "api-football-empty-stats" ? null : home ? "1.75" : "0.90", away: scenario === "api-football-empty-stats" ? null : home ? "1.10" : "1.20" } },
+        against: { average: { home: scenario === "api-football-empty-stats" ? null : home ? "0.75" : "1.30", away: scenario === "api-football-empty-stats" ? null : home ? "1.40" : "1.60" } } },
+    } };
   } else if (url.hostname === "api.football-data.org" && url.pathname.startsWith("/v4/competitions/")) {
     const league = url.pathname.split("/")[3];
     if (url.searchParams.get("dateFrom") === "2026-11-01") return new Response("provider unavailable", { status: 403 });

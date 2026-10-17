@@ -10,6 +10,20 @@ Decision: **PR3_MERGED; LOCAL_INTEGRATION_CHECKS_PASSED; PAYBOX_SKILL_AUTO_LOADI
 
 This report records the integrated PR #3 trading implementation and PR #4 soccer research extension. The hosted acceptance rows below are historical owner-reported evidence, not a retest of this bundle. This integration performs no hosted test, wallet-signing request, order broadcast, deposit, deployment, or PR merge.
 
+## PR #5 — multi-provider soccer research and independent edge
+
+This branch is based on `main` at `d2c678f8b15d5cfeb7017e3b2a5ca596eb094cdf`, where PR #3 and PR #4 are already merged. The current bundle has **13 MCP tools**; the 12-tool counts and hosted observations in the historical PR #4 report below describe that older bundle, not this branch.
+
+`research_soccer` keeps football-data.org as the baseline and optionally calls API-Football only for an exact fixture when `includeApiFootball: true`. It requests `/fixtures?date=...&timezone=UTC` and `/teams/statistics` for each provider-specific team ID, using the provider fixture's league and season and a cutoff on the UTC day before kickoff. Names, competition, and exact kickoff are checked before joining; ambiguous, missing, conflicting, or unavailable provider data does not replace baseline evidence. Three API-Football calls are made per opt-in enrichment. The official v3 documentation documents `/fixtures`, `/teams/statistics`, `/injuries`, `/fixtures/lineups`, `/fixtures/statistics`, and `/predictions`; account-specific access, competition coverage, and quota were not checked because no API-Football credential was available. The published free plan currently advertises 100 requests/day, but that is not evidence of this developer account's entitlement. `/fixtures/statistics` documents shots, possession, cards, and passes, not xG. Injuries and lineups remain host-agent/browser research topics in this implementation.
+
+TheSportsDB free v1 was checked on 2026-10-17: `searchteams.php?t=Arsenal` and `eventslast.php?id=133604` both returned HTTP 200. The first mapped Arsenal to TheSportsDB team ID `133604`; the second returned one Arsenal home event (Arsenal vs Lille, 2026-10-13). Official docs indicate free v1 endpoint-specific limits, including one-result free team search/schedule, and that free team schedules show only home events. The free API can supply isolated supplementary metadata but is incomplete for two-team form, so PolyScope keeps it disabled rather than making calls on every research request. Premium v2 and premium endpoint limits are not assumed to be free.
+
+`analyze_soccer_edge` is a read-only deterministic tool. It uses API-Football venue averages when both teams have sourced venue samples and goals-for/against averages; otherwise it uses the exact fixture's pre-kickoff, same-venue recent results from football-data.org. Expected home goals are `(home home GF average + away away GA average) / 2`; expected away goals are `(away away GF average + home home GA average) / 2`. Independent Poisson score probabilities are evaluated over a dynamic grid, tail mass is reported, and the included score outcomes are normalized to Home/Draw/Away. No market odds enter this model. It only evaluates a market after the agent identifies exact regulation-time 1X2 resolution semantics. The BUY edge uses `get_quote` fillable asks, weighted cost, and estimated fees: `(gross fill cost + fees) / fillable shares`, `probability - effective cost/share`, and `fillable shares × net edge/share`. Partial FAK depth limits expected value to visible fillable shares. SELL economics, non-1X2 resolution rules, and missing model data are reported unsupported or unavailable; no trading gate is introduced.
+
+PayBox automatic loading of repository `SKILL.md` files and hosted agent browsing remain **UNVERIFIED**. API-Football's `x-apisports-key` and football-data.org's `X-Auth-Token` are intended to use PayBox host-scoped secrets, but hosted secret injection was not verified. No live Polymarket submission or wallet signing was performed. The hosted PayBox `primaryType: undefined` signing-window issue remains outside this change.
+
+Final Node/pnpm validation and bundle checksum for this branch are recorded below after the PR #5 implementation is built.
+
 ## PayBox hosted acceptance evidence
 
 The project owner reports the following results from the private PayBox Developer Dashboard and connected agent:
@@ -173,3 +187,23 @@ Current public conformance returned an AVAILABLE CLOB quote marked STALE at 97,3
 **Hosted PayBox Marketplace BUY/SELL: NOT PROVEN. PayBox automatic loading of this repository skill: UNVERIFIED. Live host-agent browser research: UNVERIFIED.** The source contains a FAK order path that performs the documented Polymarket checks and submission contract, but no authenticated order or fill was attempted. The latest local quote was marked stale and preparation succeeded; live trading remains unverified. Soccer calls returned 403 without local PayBox secret injection. PayBox's signing-window `primaryType` blocker, real wallet signing, and authenticated CLOB BUY/SELL have not been exercised. PayBox-hosted signing and CLOB execution remain unverified; any order still follows PayBox's normal approval and signing flow.
 
 The tracked bundle was rebuilt in this PR and was not uploaded to hosted PayBox. No live signature, order broadcast, deposit, deployment, merge, or project resubmission was performed. The `Submitted` status above is the project owner's reported hackathon status, not an action taken in this update.
+
+## PR #5 branch validation
+
+Toolchain used for this branch: Node.js `24.19.0`, pnpm `11.11.0`.
+
+| Command | Result |
+|---|---|
+| `pnpm install --frozen-lockfile` | PASS — lockfile unchanged; dependencies already current |
+| `pnpm typecheck` | PASS — `tsc --noEmit` |
+| `pnpm test` | PASS — two deterministic builds, strict typecheck, all PR #3 trading regressions, PR #4 soccer regressions, API-Football normalization/error fixtures, Poisson source/fallback cases, and CLOB net-edge cases |
+| `pnpm conformance` | PASS — 13 tools discovered; public market/news/quote reads and unsigned preparation succeeded. football-data.org returned HTTP 403 for PL/PD/SA/CL without a local token. CLOB quote was STALE at 61,334 ms. No order was submitted. |
+| `pnpm build` twice | PASS — byte-identical output; `dist/plugin.mjs` and `outputs/plugin.mjs` match exactly |
+| `pnpm audit --prod` | PASS — no known production dependency vulnerabilities reported |
+| `git diff --check` | PASS |
+
+Offline provider coverage includes API-Football HTTP 403/204, HTTP 200 error envelope, missing or malformed stats, provider ID mismatch, kickoff conflict, ambiguous duplicate, and preservation of football-data.org evidence. Model cases cover source attribution, venue samples, normalization, unavailable inputs, positive/negative edges, depth-weighted price, fees, partial fill, no liquidity, unsupported rules, and unsupported SELL basis. They are deterministic fixture evidence, not prediction-accuracy or live-provider claims.
+
+The built bundle contains **13 MCP tools**, including the read-only `analyze_soccer_edge`. Both existing soccer tools retain host-browser continuation instructions. Active tool schemas contain no removed PR #3 trading policy fields or extra signing requirements.
+
+Current `outputs/plugin.mjs` and `dist/plugin.mjs` size is **593,288 bytes**. SHA-256 is `3b6b9a5b6cc7672888755e4e372f13aa7e90f3e74f537fd7b53abc5c8eab6c97` for both files. PayBox skill auto-loading, host-scoped secret injection, live agent browsing, API-Football account entitlement, and hosted wallet signing remain unverified.
