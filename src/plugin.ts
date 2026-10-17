@@ -27,9 +27,6 @@ const ESPN_SOCCER_FEED = "https://www.espn.com/espn/rss/soccer/news";
 const FOOTBALL_DATA_API = "https://api.football-data.org/v4";
 const NEWS_STALE_AFTER_MS = 24 * 60 * 60 * 1000;
 const MAX_RSS_BYTES = 256 * 1024;
-const PREPARATION_STALE_AFTER_MS = 120_000;
-const SUBMIT_EXECUTION_BUDGET_MS = 7_000;
-const POST_RECONCILIATION_RESERVE_MS = 3_500;
 const RSS_XML_PARSER = new XMLParser({ ignoreAttributes: true, processEntities: false, trimValues: false });
 const ZERO32 = `0x${"0".repeat(64)}` as const;
 const ORDER_TYPE = "Order(uint256 salt,address maker,address signer,uint256 tokenId,uint256 makerAmount,uint256 takerAmount,uint8 side,uint8 signatureType,uint256 timestamp,bytes32 metadata,bytes32 builder)";
@@ -74,13 +71,13 @@ const TICK_SIZES = ["0.1", "0.01", "0.005", "0.0025", "0.001", "0.0001"] as cons
 const FAK = "FAK" as const;
 
 const preparationErrorCodeSchema = z.enum([
-  "PS_PREPARATION_STALE_BOOK", "PS_MARKET_IDENTITY", "PS_PROVIDER_INVALID", "PS_PROVIDER_UNAVAILABLE",
+  "PS_MARKET_IDENTITY", "PS_PROVIDER_INVALID", "PS_PROVIDER_UNAVAILABLE",
   "PS_PROVIDER_TIMEOUT", "PS_RESPONSE_TOO_LARGE", "PS_MARKET_CLOSED", "PS_MARKET_UNSUPPORTED",
   "PS_MARKET_VERSION", "PS_FEE_INVALID", "PS_WALLET_BINDING", "PS_AMOUNT_INVALID", "PS_AMOUNT_PRECISION",
   "PS_PRICE_INVALID", "PS_SIZE_BELOW_MINIMUM", "PS_SPENDING_CAP", "PS_NO_MARKETABLE_LIQUIDITY",
 ]);
 const preparationFreshnessSchema = z.object({
-  bookAgeMs: z.number().int().nonnegative().nullable(), staleAfterMs: z.literal(PREPARATION_STALE_AFTER_MS),
+  bookAgeMs: z.number().int().nonnegative().nullable(),
 }).strict();
 
 const addressSchema = z.string().regex(/^0x[0-9a-fA-F]{40}$/);
@@ -262,12 +259,7 @@ const executionResultSchema = z.object({
   requestedSize: z.string(), filledSize: z.string().nullable(), remainingSize: z.string().nullable(),
   tradeIds: z.array(z.string()), message: z.string(), errorCode: z.string().regex(/^PS_[A-Z_]+$/).nullable().default(null),
 }).strict();
-const balanceAllowanceSchema = z.object({
-  balance: z.union([z.string(), z.number()]),
-  allowances: z.record(z.string(), z.union([z.string(), z.number()])).optional(),
-}).passthrough();
 const geoblockSchema = z.object({ blocked: z.boolean() }).passthrough();
-const closedOnlySchema = z.object({ closed_only: z.boolean() }).passthrough();
 const positionsResponseSchema = z.array(z.object({
   condition_id: z.string(), title: z.string().optional(), outcome: z.string().optional(),
   current_size: z.number().finite(), avg_price: z.number().finite().optional(),
@@ -283,39 +275,17 @@ const positionsPageSchema = z.object({
   }).passthrough(),
 }).passthrough();
 
-type ExecutionBudget = { deadline: number; reserveMs: number };
-
-function requestSignal(maximumMs: number, budget?: ExecutionBudget): AbortSignal {
-  const remainingMs = budget === undefined
-    ? maximumMs
-    : Math.min(maximumMs, Math.floor(budget.deadline - performance.now() - budget.reserveMs));
-  if (remainingMs <= 0) throw new Error("PS_EXECUTION_BUDGET_EXHAUSTED: Safe time for Polymarket preflight, submission, and reconciliation is unavailable; no order was sent.");
-  return AbortSignal.timeout(remainingMs);
-}
-
-function assertExecutionBudget(deadline: number, reserveMs: number): void {
-  if (deadline - performance.now() < reserveMs) {
-    throw new Error("PS_EXECUTION_BUDGET_EXHAUSTED: Safe time for the FAK request and one reconciliation is unavailable; no order was sent.");
-  }
-}
-
-function isBudgetLimitedTimeout(error: unknown, budget?: ExecutionBudget): boolean {
-  return budget !== undefined && error instanceof DOMException && error.name === "TimeoutError"
-    && budget.deadline - performance.now() <= budget.reserveMs + 100;
-}
-
-async function getJson(url: string, budget?: ExecutionBudget): Promise<unknown> {
+async function getJson(url: string): Promise<unknown> {
   try {
     const response = await fetch(url, {
       headers: { accept: "application/json" },
       redirect: "error",
-      signal: requestSignal(2_500, budget),
+      signal: AbortSignal.timeout(2_500),
     });
     if (!response.ok) throw new Error(`PS_PROVIDER_UNAVAILABLE: Polymarket read returned HTTP ${response.status}.`);
     let body: string;
     try { body = await boundedResponseText(response, 1_000_000); }
     catch (error) {
-      if (isBudgetLimitedTimeout(error, budget)) throw new Error("PS_EXECUTION_BUDGET_EXHAUSTED: Safe time for the remaining Polymarket preflight and execution steps ran out; no order was sent.");
       if (error instanceof DOMException && error.name === "TimeoutError") throw new Error("PS_PROVIDER_TIMEOUT: Polymarket read timed out.");
       throw new Error("PS_RESPONSE_TOO_LARGE: Provider response exceeded the 1 MiB limit.");
     }
@@ -323,7 +293,6 @@ async function getJson(url: string, budget?: ExecutionBudget): Promise<unknown> 
     catch { throw new Error("PS_PROVIDER_INVALID: Polymarket returned invalid JSON."); }
   } catch (error) {
     if (error instanceof Error && error.message.startsWith("PS_")) throw error;
-    if (isBudgetLimitedTimeout(error, budget)) throw new Error("PS_EXECUTION_BUDGET_EXHAUSTED: Safe time for the remaining Polymarket preflight and execution steps ran out; no order was sent.");
     if (error instanceof DOMException && error.name === "TimeoutError") throw new Error("PS_PROVIDER_TIMEOUT: Polymarket read timed out.");
     throw new Error("PS_PROVIDER_UNAVAILABLE: Polymarket read failed before a response was received.");
   }
@@ -903,15 +872,6 @@ function wrapDepositWalletSignature(prepared: PreparedOrder, signature: Hex): He
   ]);
 }
 
-const EXECUTION_APPROVAL_FIELDS = [
-  { name: "marketId", type: "uint256" }, { name: "conditionId", type: "bytes32" },
-  { name: "assetId", type: "uint256" }, { name: "side", type: "uint8" },
-  { name: "limitPriceMicros", type: "uint256" }, { name: "sizeMicros", type: "uint256" },
-  { name: "maxNominalMicros", type: "uint256" }, { name: "maxFeeMicros", type: "uint256" },
-  { name: "feeRateMicros", type: "uint256" }, { name: "feeExponent", type: "uint8" }, { name: "orderType", type: "string" },
-  { name: "signatureType", type: "uint8" }, { name: "signingAddress", type: "address" },
-  { name: "orderHash", type: "bytes32" }, { name: "deadline", type: "uint256" },
-] as const;
 const MICRO = 1_000_000n;
 
 function ceilDiv(numerator: bigint, denominator: bigint): bigint {
@@ -947,32 +907,13 @@ function bookAgeMs(timestamp: string, now = Date.now()): number | null {
   return Number.isSafeInteger(timestampMs) && timestampMs <= now ? now - timestampMs : null;
 }
 
-function executionApprovalPayload(prepared: PreparedOrderBase) {
-  const order = prepared.order;
-  return {
-    domain: { name: "PolyScope FAK Authorization", version: "1", chainId: 137, verifyingContract: address(prepared.wallet.makerAddress) },
-    types: { ExecutionApproval: EXECUTION_APPROVAL_FIELDS },
-    primaryType: "ExecutionApproval",
-    message: {
-      marketId: BigInt(prepared.market.id), conditionId: prepared.market.conditionId as Hex,
-      assetId: BigInt(order.assetId), side: order.side === "BUY" ? 0 : 1,
-      limitPriceMicros: toUnits(order.price, 6), sizeMicros: toUnits(order.size, 6),
-      maxNominalMicros: toUnits(order.maxNominalPusd, 6), maxFeeMicros: toUnits(order.maxFeePusd, 6),
-      feeRateMicros: toUnits(order.feeRate, 6), feeExponent: order.feeExponent,
-      orderType: FAK, signatureType: prepared.wallet.signatureType,
-      signingAddress: address(prepared.wallet.signingAddress), orderHash: hashTypedData(standardOrderPayload(prepared)),
-      deadline: BigInt(order.timestamp) / 1000n + 300n,
-    },
-  } as const;
-}
-
 function typedDataDigest(prepared: PreparedOrderBase): Hex {
   return prepared.wallet.type === "DEPOSIT_WALLET"
     ? hashTypedData(depositOrderPayload(prepared))
     : hashTypedData(standardOrderPayload(prepared));
 }
 
-async function validateWalletSignature(prepared: PreparedOrder, signature: Hex, budget?: ExecutionBudget) {
+async function validateWalletSignature(prepared: PreparedOrder, signature: Hex) {
   const expected = address(prepared.wallet.signingAddress);
   let recovered: Address | null = null;
   try {
@@ -994,15 +935,13 @@ async function validateWalletSignature(prepared: PreparedOrder, signature: Hex, 
     const response = await fetch(POLYGON_RPC, {
       method: "POST", headers: { accept: "application/json", "content-type": "application/json" },
       body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "eth_call", params: [{ to: prepared.wallet.makerAddress, data: `${selector}${encoded.slice(2)}` }, "latest"] }),
-      redirect: "error", signal: requestSignal(1_500, budget),
+      redirect: "error", signal: AbortSignal.timeout(1_500),
     });
     if (!response.ok) return { valid: false, recovered, encoding: prepared.wallet.type === "DEPOSIT_WALLET" ? "ERC-7739" as const : "EIP-712" as const, walletValidation: "UNAVAILABLE" as const, signedSignature: null };
     const result = z.object({ result: z.string().regex(/^0x[0-9a-fA-F]*$/) }).safeParse(JSON.parse(await boundedResponseText(response, 16_384)) as unknown);
     const valid = result.success && result.data.result.toLowerCase().startsWith("0x1626ba7e");
     return { valid, recovered, encoding: prepared.wallet.type === "DEPOSIT_WALLET" ? "ERC-7739" as const : "EIP-712" as const, walletValidation: valid ? "VALIDATED" as const : "INVALID" as const, signedSignature: valid ? signedSignature : null };
   } catch (error) {
-    if (error instanceof Error && error.message.startsWith("PS_EXECUTION_BUDGET_EXHAUSTED")) throw error;
-    if (isBudgetLimitedTimeout(error, budget)) throw new Error("PS_EXECUTION_BUDGET_EXHAUSTED: Safe time for the remaining Polymarket preflight and execution steps ran out; no order was sent.");
     return { valid: false, recovered, encoding: prepared.wallet.type === "DEPOSIT_WALLET" ? "ERC-7739" as const : "EIP-712" as const, walletValidation: "UNAVAILABLE" as const, signedSignature: null };
   }
 }
@@ -1020,7 +959,6 @@ function l1Headers(auth: z.infer<typeof clobAuthSchema>, signerAddress: string) 
 
 async function deriveClobCredentials(
   authInput: z.infer<typeof clobAuthSchema>, signerAddress: string, createOnMissing = false,
-  budget?: ExecutionBudget,
 ): Promise<ClobCredentials> {
   const auth = clobAuthSchema.parse(authInput);
   const signer = address(signerAddress);
@@ -1033,16 +971,10 @@ async function deriveClobCredentials(
   if (recovered.toLowerCase() !== signer.toLowerCase()) throw new Error("PS_AUTH_WALLET_MISMATCH: ClobAuth signer differs from the selected order signer.");
 
   const read = async (path: "/auth/derive-api-key" | "/auth/api-key", method: "GET" | "POST") => {
-    let response: Response;
-    try {
-      response = await fetch(`${CLOB_API}${path}`, {
-        method, headers: { accept: "application/json", ...l1Headers(auth, signer) },
-        redirect: "error", signal: requestSignal(1_500, budget),
-      });
-    } catch (error) {
-      if (isBudgetLimitedTimeout(error, budget)) throw new Error("PS_EXECUTION_BUDGET_EXHAUSTED: Safe time for the remaining Polymarket preflight and execution steps ran out; no order was sent.");
-      throw error;
-    }
+    const response = await fetch(`${CLOB_API}${path}`, {
+      method, headers: { accept: "application/json", ...l1Headers(auth, signer) },
+      redirect: "error", signal: AbortSignal.timeout(1_500),
+    });
     if (!response.ok) return { status: response.status, data: null };
     const data: unknown = JSON.parse(await boundedResponseText(response, 32_768));
     return { status: response.status, data };
@@ -1065,66 +997,27 @@ function l2Signature(secret: string, timestamp: string, method: string, path: st
 async function clobPrivateRequest(
   credentials: ClobCredentials, signerAddress: string, method: "GET" | "POST" | "DELETE",
   path: string, body?: string, signingPath = path,
-  budget?: ExecutionBudget,
 ): Promise<{ status: number; data: unknown | null }> {
   const timestamp = String(Math.floor(Date.now() / 1000));
   const signature = l2Signature(credentials.secret, timestamp, method, signingPath, body ?? "");
-  try {
-    const response = await fetch(`${CLOB_API}${path}`, {
-      method,
-      headers: {
-        accept: "application/json", "content-type": "application/json",
-        POLY_ADDRESS: signerAddress, POLY_API_KEY: credentials.apiKey, POLY_PASSPHRASE: credentials.passphrase,
-        POLY_SIGNATURE: signature, POLY_TIMESTAMP: timestamp,
-      },
-      ...(body === undefined ? {} : { body }), redirect: "error", signal: requestSignal(1_500, budget),
-    });
-    if (response.status === 204 || response.status === 404) return { status: response.status, data: null };
-    const text = await boundedResponseText(response, 1_000_000);
-    let data: unknown;
-    try { data = JSON.parse(text) as unknown; }
-    catch { return { status: response.status, data: null }; }
-    return { status: response.status, data };
-  } catch (error) {
-    if (isBudgetLimitedTimeout(error, budget)) throw new Error("PS_EXECUTION_BUDGET_EXHAUSTED: Safe time for the remaining Polymarket preflight and execution steps ran out; no order was sent.");
-    throw error;
-  }
+  const response = await fetch(`${CLOB_API}${path}`, {
+    method,
+    headers: {
+      accept: "application/json", "content-type": "application/json",
+      POLY_ADDRESS: signerAddress, POLY_API_KEY: credentials.apiKey, POLY_PASSPHRASE: credentials.passphrase,
+      POLY_SIGNATURE: signature, POLY_TIMESTAMP: timestamp,
+    },
+    ...(body === undefined ? {} : { body }), redirect: "error", signal: AbortSignal.timeout(1_500),
+  });
+  if (response.status === 204 || response.status === 404) return { status: response.status, data: null };
+  const text = await boundedResponseText(response, 1_000_000);
+  let data: unknown;
+  try { data = JSON.parse(text) as unknown; }
+  catch { return { status: response.status, data: null }; }
+  return { status: response.status, data };
 }
 
-function parseBaseUnits(value: string | number): bigint {
-  const raw = String(value);
-  if (!/^(0|[1-9][0-9]{0,77})$/.test(raw)) throw new Error("PS_BALANCE_ALLOWANCE: Polymarket returned an invalid balance or allowance amount.");
-  return BigInt(raw);
-}
-
-async function refreshBalanceAllowance(
-  credentials: ClobCredentials, signerAddress: string, signatureTypeValue: number,
-  assetType: "COLLATERAL" | "CONDITIONAL", tokenId?: string, budget?: ExecutionBudget,
-): Promise<z.infer<typeof balanceAllowanceSchema>> {
-  const query = new URLSearchParams({ asset_type: assetType, signature_type: String(signatureTypeValue) });
-  if (tokenId !== undefined) query.set("token_id", tokenId);
-  const result = await clobPrivateRequest(credentials, signerAddress, "GET", `/balance-allowance/update?${query.toString()}`, undefined, "/balance-allowance/update", budget);
-  if (result.status < 200 || result.status >= 300) {
-    throw new Error(`PS_BALANCE_ALLOWANCE: Polymarket could not refresh ${assetType.toLowerCase()} balance and allowance.`);
-  }
-  const readResult = await clobPrivateRequest(credentials, signerAddress, "GET", `/balance-allowance?${query.toString()}`, undefined, "/balance-allowance", budget);
-  const parsed = balanceAllowanceSchema.safeParse(readResult.data);
-  if (readResult.status < 200 || readResult.status >= 300 || !parsed.success) throw new Error("PS_BALANCE_ALLOWANCE: Polymarket returned an unsupported balance and allowance shape.");
-  return parsed.data;
-}
-
-function assertAllowanceForSpender(
-  record: z.infer<typeof balanceAllowanceSchema>, spender: string, required: bigint,
-): void {
-  const allowances = record.allowances;
-  if (allowances === undefined) throw new Error("PS_ALLOWANCE: Polymarket did not return exchange-specific allowances.");
-  const entry = Object.entries(allowances).find(([addressValue]) => addressValue.toLowerCase() === spender.toLowerCase())?.[1];
-  if (entry === undefined || parseBaseUnits(entry) < required) {
-    throw new Error("PS_ALLOWANCE: The selected wallet has insufficient allowance for the Polymarket exchange.");
-  }
-}
-
-async function validateExecutionSnapshot(prepared: PreparedOrder, budget?: ExecutionBudget): Promise<{
+async function validateExecutionSnapshot(prepared: PreparedOrder): Promise<{
   market: z.infer<typeof gammaMarketSchema>; book: z.infer<typeof bookSchema>;
   feeRate: string; feeExponent: number; blocked: boolean;
 }> {
@@ -1132,8 +1025,8 @@ async function validateExecutionSnapshot(prepared: PreparedOrder, budget?: Execu
   const bookUrl = new URL(`${CLOB_API}/book`);
   bookUrl.searchParams.set("token_id", order.assetId);
   const [rawMarket, rawBook, rawMarketInfo, rawGeo] = await Promise.all([
-    getJson(`${GAMMA_API}/markets/${encodeURIComponent(approvedMarket.id)}`, budget),
-    getJson(bookUrl.toString(), budget), getJson(`${CLOB_API}/clob-markets/${encodeURIComponent(approvedMarket.conditionId)}`, budget), getJson(GEOBLOCK_API, budget),
+    getJson(`${GAMMA_API}/markets/${encodeURIComponent(approvedMarket.id)}`),
+    getJson(bookUrl.toString()), getJson(`${CLOB_API}/clob-markets/${encodeURIComponent(approvedMarket.conditionId)}`), getJson(GEOBLOCK_API),
   ]);
   const market = gammaMarketSchema.parse(rawMarket);
   const book = bookSchema.parse(rawBook);
@@ -1153,16 +1046,15 @@ async function validateExecutionSnapshot(prepared: PreparedOrder, budget?: Execu
   if (market.version != null && book.version != null && market.version !== book.version) {
     throw new Error("PS_MARKET_VERSION: Refreshed Gamma market and CLOB book versions disagree.");
   }
-  const age = bookAgeMs(book.timestamp);
-  if (age === null || age > 30_000) throw new Error("PS_STALE_BOOK: Refreshed CLOB book timestamp is stale or invalid.");
-  if (feeInfo.rate !== order.feeRate || feeInfo.exponent !== order.feeExponent) throw new Error("PS_APPROVAL_STALE: Market fee changed after the user approved the order.");
-  const levels = order.side === "BUY" ? book.asks : book.bids;
-  const limitUnits = toUnits(order.price, 6);
-  const hasLiquidity = levels.some((level) => {
-    const levelPrice = toUnits(level.price, 6);
-    return toUnits(level.size, 6) > 0n && (order.side === "BUY" ? levelPrice <= limitUnits : levelPrice >= limitUnits);
-  });
-  if (!hasLiquidity) throw new Error("PS_NO_MARKETABLE_LIQUIDITY: No fresh liquidity satisfies the approved FAK limit.");
+  if (bookAgeMs(book.timestamp) === null) throw new Error("PS_PROVIDER_INVALID: CLOB book timestamp is invalid or in the future.");
+  const limitPriceUnits = toUnits(order.price, 6);
+  const feePriceUnits = order.side === "BUY"
+    ? limitPriceUnits < MICRO / 2n ? limitPriceUnits : MICRO / 2n
+    : limitPriceUnits > MICRO / 2n ? limitPriceUnits : MICRO / 2n;
+  const currentFeeUnits = feeMicros(toUnits(order.size, 6), feePriceUnits, toUnits(feeInfo.rate, 6), feeInfo.exponent);
+  if (toUnits(order.maxGrossPusd, 6) + currentFeeUnits > toUnits(order.maxNominalPusd, 6)) {
+    throw new Error("PS_SPENDING_CAP: Current Polymarket fees would exceed the user-approved all-in spending cap.");
+  }
   return { market, book, feeRate: feeInfo.rate, feeExponent: feeInfo.exponent, blocked: geo.blocked };
 }
 
@@ -1233,8 +1125,8 @@ function validatePreparedOrder(prepared: PreparedOrder): {
   if (BigInt(order.salt) > BigInt(Number.MAX_SAFE_INTEGER)) {
     throw new Error("PS_ORDER_INVALID: Order salt exceeds the exact integer range of the CLOB JSON format.");
   }
-  if (!Number.isSafeInteger(timestamp) || timestamp > Date.now() + 5_000 || Date.now() - timestamp > 300_000) {
-    throw new Error("PS_APPROVAL_EXPIRED: Order approval is expired or has an invalid timestamp.");
+  if (!Number.isSafeInteger(timestamp) || timestamp <= 0 || timestamp > Date.now() + 5_000) {
+    throw new Error("PS_ORDER_INVALID: Prepared order timestamp is invalid.");
   }
   if (priceUnits <= 0n || priceUnits >= MICRO || priceUnits % toUnits(prepared.market.tickSize, 6) !== 0n) {
     throw new Error("PS_PRICE_INVALID: Prepared order price does not match its tick size.");
@@ -1262,17 +1154,6 @@ function validatePreparedOrder(prepared: PreparedOrder): {
     throw new Error("PS_WALLET_BINDING: EOA maker and signing addresses must match.");
   }
   return { priceUnits, sizeUnits, quoteUnits, capUnits, feeRateMicros, feeExponent };
-}
-
-async function validateExecutionApproval(prepared: PreparedOrder, signature: Hex): Promise<boolean> {
-  const payload = executionApprovalPayload(prepared);
-  if (BigInt(payload.message.deadline) < BigInt(Math.floor(Date.now() / 1000))) return false;
-  try {
-    const recovered = await recoverTypedDataAddress({ ...payload, signature });
-    return recovered.toLowerCase() === address(prepared.wallet.signingAddress).toLowerCase();
-  } catch {
-    return false;
-  }
 }
 
 function tradeToolResult(value: unknown) {
@@ -1529,7 +1410,7 @@ async function createServer() {
     "prepare_order_signing",
     {
       title: "Prepare a bounded Polymarket BUY or SELL signature",
-      description: "Prepares one unsigned marketable FAK draft using a book no older than 120 seconds; submission re-fetches and requires a book no older than 30 seconds. Check status: REJECTED has no order or signing intents. BUY priceLimit is a user-approved maximum; SELL priceLimit is a minimum. maxNominalPusd includes worst-case platform fees. The PayBox agent must obtain one signature for the PolyScope execution approval and one for the Polymarket order before calling submit_fak_order.",
+      description: "Prepares one unsigned FAK draft for the selected outcome, side, price bound, size, and fee-inclusive cap. Book age is returned for visibility and does not block preparation or submission. Check status: REJECTED has no order or signing intent. BUY priceLimit is the maximum; SELL priceLimit is the minimum. PayBox handles human approval and wallet signing for the Polymarket order.",
       inputSchema: z.object({
         marketId: z.string().regex(/^[0-9]{1,32}$/), assetId: decimalIdSchema,
         makerAddress: addressSchema, signingAddress: addressSchema,
@@ -1541,7 +1422,6 @@ async function createServer() {
           status: z.literal("PREPARED"),
           preparedOrder: preparedOrderSchema,
           requestWalletSignIntent: requestWalletSignIntentSchema,
-          executionApprovalSigningIntent: requestWalletSignIntentSchema,
           submitsOrder: z.literal(false),
           maxNominalIncludesFees: z.literal(true),
           preparationFreshness: preparationFreshnessSchema,
@@ -1554,7 +1434,7 @@ async function createServer() {
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: false, openWorldHint: true },
     },
     async ({ marketId, assetId, makerAddress, signingAddress, walletType, side, priceLimit, size, maxNominalPusd }) => {
-      let preparationFreshness: z.infer<typeof preparationFreshnessSchema> = { bookAgeMs: null, staleAfterMs: PREPARATION_STALE_AFTER_MS };
+      let preparationFreshness: z.infer<typeof preparationFreshnessSchema> = { bookAgeMs: null };
       try {
         const marketUrl = `${GAMMA_API}/markets/${encodeURIComponent(marketId)}`;
         const bookUrl = new URL(`${CLOB_API}/book`);
@@ -1567,7 +1447,7 @@ async function createServer() {
         }
         const market = parsedMarket.data;
         const book = parsedBook.data;
-        preparationFreshness = { bookAgeMs: bookAgeMs(book.timestamp), staleAfterMs: PREPARATION_STALE_AFTER_MS };
+        preparationFreshness = { bookAgeMs: bookAgeMs(book.timestamp) };
         if (String(market.id) !== marketId) throw new Error("PS_MARKET_IDENTITY: Provider returned a different market ID.");
         if (market.active !== true || market.closed !== false) {
           throw new Error("PS_MARKET_CLOSED: The selected market is not active and tradable.");
@@ -1592,7 +1472,6 @@ async function createServer() {
         preparationFreshness.bookAgeMs = bookAgeMs(book.timestamp);
         const age = preparationFreshness.bookAgeMs;
         if (age === null) throw new Error("PS_PROVIDER_INVALID: CLOB book timestamp is invalid or in the future.");
-        if (age > PREPARATION_STALE_AFTER_MS) throw new Error("PS_PREPARATION_STALE_BOOK: CLOB book is older than the 120-second unsigned preparation limit.");
 
         try {
           if (toUnits(book.min_order_size, 6) <= 0n) throw new Error();
@@ -1669,10 +1548,9 @@ async function createServer() {
         const typedData = wireTypedData(signingPayload(preparedBase));
         const preparedOrder = preparedOrderSchema.parse({ ...preparedBase, typedData });
         const intent = { op: "typedData" as const, typedData };
-        const executionApprovalSigningIntent = { op: "typedData" as const, typedData: wireTypedData(executionApprovalPayload(preparedBase)) };
         return {
-          content: [{ type: "text", text: `Prepared a bounded ${side} FAK order. PayBox must obtain the separate approval and Polymarket order signatures; no order was submitted.` }],
-          structuredContent: { status: "PREPARED" as const, preparedOrder, requestWalletSignIntent: intent, executionApprovalSigningIntent, submitsOrder: false as const, maxNominalIncludesFees: true as const, preparationFreshness },
+          content: [{ type: "text", text: `Prepared a bounded ${side} FAK order for PayBox approval and Polymarket signing; no order was submitted.` }],
+          structuredContent: { status: "PREPARED" as const, preparedOrder, requestWalletSignIntent: intent, submitsOrder: false as const, maxNominalIncludesFees: true as const, preparationFreshness },
         };
       } catch (error) {
         if (!(error instanceof Error)) throw error;
@@ -1723,7 +1601,7 @@ async function createServer() {
     "validate_order_signature",
     {
       title: "Validate a Polymarket order signature",
-      description: "Rebuilds the exact EIP-712 order, validates FAK policy and the fee-inclusive approval cap, recovers the PayBox signer, and checks ERC-1271 wallets over Polygon RPC. Deposit Wallet output includes the ERC-7739 wrapper.",
+      description: "Rebuilds the exact Polymarket EIP-712 order, checks its price, size, amount precision, fee-inclusive cap, and PayBox signer, then validates ERC-1271 wallets over Polygon RPC. Deposit Wallet output includes the ERC-7739 wrapper.",
       inputSchema: z.object({ preparedOrder: preparedOrderSchema, signature: z.string().regex(/^0x[0-9a-fA-F]{130}$/) }).strict(),
       outputSchema: z.object({
         valid: z.boolean(), expectedSignerAddress: addressSchema, recoveredSignerAddress: addressSchema.nullable(),
@@ -1756,32 +1634,20 @@ async function createServer() {
   server.registerTool(
     "submit_fak_order",
     {
-      title: "Submit an explicitly approved Polymarket FAK order",
-      description: "Makes one signed FAK POST attempt per tool invocation after validating user approval, wallet binding, live market/book/fee, account close-only state, geoblock, balance, and exchange allowance. Ambiguous POST results get at most one order-hash read-back and are never automatically resubmitted; this does not guarantee exactly-once execution. The PayBox agent must obtain signatures through request_wallet_sign and poll get_request before this call.",
+      title: "Submit a PayBox-approved Polymarket FAK order",
+      description: "Makes one signed FAK POST attempt per tool invocation after validating the Polymarket order signature, wallet binding, current market identity and exchange constraints, user price and spend bounds, and official geoblock response. Polymarket validates balance, allowance, and account constraints. Ambiguous POST results get at most one order-hash read-back and are never automatically resubmitted; this does not guarantee exactly-once execution.",
       inputSchema: z.object({
         preparedOrder: preparedOrderSchema,
-        executionApprovalSignature: z.string().regex(/^0x[0-9a-fA-F]{130}$/),
         orderSignature: z.string().regex(/^0x[0-9a-fA-F]{130}$/),
         clobAuth: clobAuthSchema,
       }).strict(),
       outputSchema: executionResultSchema,
       annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
     },
-    async ({ preparedOrder: inputOrder, executionApprovalSignature, orderSignature, clobAuth }) => {
-      const executionDeadline = performance.now() + SUBMIT_EXECUTION_BUDGET_MS;
-      const preflightBudget: ExecutionBudget = { deadline: executionDeadline, reserveMs: POST_RECONCILIATION_RESERVE_MS };
+    async ({ preparedOrder: inputOrder, orderSignature, clobAuth }) => {
       const prepared = preparedOrderSchema.parse(inputOrder);
-      const amounts = validatePreparedOrder(prepared);
-      const [approvalValid, orderValidation] = await Promise.all([
-        validateExecutionApproval(prepared, signatureHex(executionApprovalSignature)),
-        validateWalletSignature(prepared, signatureHex(orderSignature), preflightBudget),
-      ]);
-      if (!approvalValid) return tradeToolResult({
-        status: "REJECTED", orderId: null, orderType: FAK, requestedSize: prepared.order.size,
-        filledSize: null, remainingSize: prepared.order.size, tradeIds: [],
-        message: "The user-approved FAK execution authorization is invalid or expired; no order was sent.",
-        errorCode: "PS_APPROVAL_INVALID",
-      });
+      validatePreparedOrder(prepared);
+      const orderValidation = await validateWalletSignature(prepared, signatureHex(orderSignature));
       if (!orderValidation.valid || orderValidation.walletValidation === "INVALID") return tradeToolResult({
         status: "REJECTED", orderId: null, orderType: FAK, requestedSize: prepared.order.size,
         filledSize: null, remainingSize: prepared.order.size, tradeIds: [],
@@ -1807,35 +1673,17 @@ async function createServer() {
 
       let credentials: ClobCredentials;
       let snapshot: Awaited<ReturnType<typeof validateExecutionSnapshot>>;
-      let closeOnly: z.infer<typeof closedOnlySchema>;
-      let allowance: z.infer<typeof balanceAllowanceSchema>;
-      const requiredUnits = prepared.order.side === "BUY"
-        ? amounts.quoteUnits + feeMicros(amounts.sizeUnits,
-          amounts.priceUnits < MICRO / 2n ? amounts.priceUnits : MICRO / 2n,
-          amounts.feeRateMicros, amounts.feeExponent)
-        : amounts.sizeUnits;
-      const assetType = prepared.order.side === "BUY" ? "COLLATERAL" as const : "CONDITIONAL" as const;
       try {
         [credentials, snapshot] = await Promise.all([
-          deriveClobCredentials(clobAuth, prepared.wallet.signingAddress, true, preflightBudget),
-          validateExecutionSnapshot(prepared, preflightBudget),
+          deriveClobCredentials(clobAuth, prepared.wallet.signingAddress, true),
+          validateExecutionSnapshot(prepared),
         ]);
-        const [closeOnlyResult, allowanceResult] = await Promise.all([
-          clobPrivateRequest(credentials, prepared.wallet.signingAddress, "GET", "/auth/ban-status/closed-only", undefined, undefined, preflightBudget),
-          refreshBalanceAllowance(credentials, prepared.wallet.signingAddress,
-            prepared.wallet.signatureType, assetType, assetType === "CONDITIONAL" ? prepared.order.assetId : undefined, preflightBudget),
-        ]);
-        if (closeOnlyResult.status < 200 || closeOnlyResult.status >= 300 || closeOnlyResult.data === null) {
-          throw new Error("PS_ACCOUNT_STATUS: Polymarket account status could not be verified.");
-        }
-        closeOnly = closedOnlySchema.parse(closeOnlyResult.data);
-        allowance = allowanceResult;
-        if (snapshot.blocked || (closeOnly.closed_only && prepared.order.side === "BUY")) {
+        if (snapshot.blocked) {
           return tradeToolResult({
             status: "REJECTED", orderId: null, orderType: FAK, requestedSize: prepared.order.size,
             filledSize: null, remainingSize: prepared.order.size, tradeIds: [],
-            message: snapshot.blocked ? "Polymarket geoblock blocked the PayBox egress IP; this does not verify user eligibility, and no order was sent." : "This Polymarket account is close-only; BUY is not allowed.",
-            errorCode: snapshot.blocked ? "PS_GEOBLOCKED" : "PS_ACCOUNT_CLOSE_ONLY",
+            message: "Polymarket geoblock reports this request as blocked; no order was sent.",
+            errorCode: "PS_GEOBLOCKED",
           });
         }
       } catch (error) {
@@ -1844,23 +1692,6 @@ async function createServer() {
           status: "FAILED", orderId: null, orderType: FAK, requestedSize: prepared.order.size,
           filledSize: null, remainingSize: prepared.order.size, tradeIds: [], message,
           errorCode: stableErrorCode(error, "PS_PREFLIGHT_FAILED"),
-        });
-      }
-
-      try {
-        const balanceUnits = parseBaseUnits(allowance.balance);
-        if (balanceUnits < requiredUnits) throw new Error("PS_BALANCE: The selected wallet balance is below the approved FAK order amount and fees.");
-        const spender = prepared.market.version === "v2"
-          ? DOMAIN_BY_MARKET.v2.verifyingContract
-          : prepared.market.negRisk ? DOMAIN_BY_MARKET.ctf.negRisk.verifyingContract : DOMAIN_BY_MARKET.ctf.regular.verifyingContract;
-        assertAllowanceForSpender(allowance, spender, requiredUnits);
-        assertExecutionBudget(executionDeadline, POST_RECONCILIATION_RESERVE_MS);
-      } catch (error) {
-        const message = error instanceof Error && error.message.startsWith("PS_") ? error.message.split(":").slice(1).join(":").trim() : "Polymarket balance or allowance could not be verified; no order was sent.";
-        return tradeToolResult({
-          status: "FAILED", orderId: null, orderType: FAK, requestedSize: prepared.order.size,
-          filledSize: null, remainingSize: prepared.order.size, tradeIds: [], message,
-          errorCode: stableErrorCode(error, "PS_BALANCE_ALLOWANCE"),
         });
       }
 
@@ -1887,9 +1718,9 @@ async function createServer() {
       });
       let posted: { status: number; data: unknown | null };
       try {
-        posted = await clobPrivateRequest(credentials, prepared.wallet.signingAddress, "POST", "/order", orderBody, "/order", { deadline: executionDeadline, reserveMs: 2_000 });
+        posted = await clobPrivateRequest(credentials, prepared.wallet.signingAddress, "POST", "/order", orderBody, "/order");
       } catch {
-        const reconciled = await clobPrivateRequest(credentials, prepared.wallet.signingAddress, "GET", `/data/order/${orderHash}`, undefined, undefined, { deadline: executionDeadline, reserveMs: 0 }).catch(() => null);
+        const reconciled = await clobPrivateRequest(credentials, prepared.wallet.signingAddress, "GET", `/data/order/${orderHash}`).catch(() => null);
         const known = reconciled?.status === 200 && reconciled.data !== null
           ? orderStatusResult({ orderId: orderHash, requestedSize: prepared.order.size, record: reconciled.data }) : null;
         return tradeToolResult(known ?? {
@@ -1907,7 +1738,7 @@ async function createServer() {
           message: "Polymarket rejected the FAK request; no accepted order ID was returned.",
           errorCode: "PS_CLOB_REJECTED",
         });
-        const reconciled = await clobPrivateRequest(credentials, prepared.wallet.signingAddress, "GET", `/data/order/${orderHash}`, undefined, undefined, { deadline: executionDeadline, reserveMs: 0 }).catch(() => null);
+        const reconciled = await clobPrivateRequest(credentials, prepared.wallet.signingAddress, "GET", `/data/order/${orderHash}`).catch(() => null);
         const known = reconciled?.status === 200 && reconciled.data !== null
           ? orderStatusResult({ orderId: orderHash, requestedSize: prepared.order.size, record: reconciled.data }) : null;
         return tradeToolResult(known ?? {
@@ -1925,7 +1756,7 @@ async function createServer() {
       });
       const orderId = response.data.orderID;
       if (posted.status < 200 || posted.status >= 300 || response.data.success !== true || !orderId) {
-        const reconciled = await clobPrivateRequest(credentials, prepared.wallet.signingAddress, "GET", `/data/order/${orderHash}`, undefined, undefined, { deadline: executionDeadline, reserveMs: 0 }).catch(() => null);
+        const reconciled = await clobPrivateRequest(credentials, prepared.wallet.signingAddress, "GET", `/data/order/${orderHash}`).catch(() => null);
         const known = reconciled?.status === 200 && reconciled.data !== null
           ? orderStatusResult({ orderId: orderHash, requestedSize: prepared.order.size, record: reconciled.data }) : null;
         return tradeToolResult(known ?? {
