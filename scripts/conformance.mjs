@@ -624,8 +624,8 @@ export async function testOfflineArtifact(root = process.cwd()) {
   if (providerMinimumResult.structuredContent.status !== "REJECTED" || providerMinimumResult.structuredContent.httpStatus !== 400) {
     fail("provider minimum-size rejection was not authoritative", "provider_authority_invalid");
   }
-  const geoblocked = await callTool(artifact, submitTool, submitArgs, { fixtures: true, fixtureScenario: "geoblocked" });
-  if (geoblocked.structuredContent.errorCode !== "PS_GEOBLOCKED") fail("official blocked geoblock response did not prevent submission", "geoblock_invalid");
+  const directSubmit = await callTool(artifact, submitTool, submitArgs, { fixtures: true, fixtureScenario: "submit-without-standalone-preflight" });
+  if (directSubmit.structuredContent.status !== "SUBMITTED") fail("valid submission did not reach one CLOB POST without a standalone website preflight", "submit_preflight_invalid");
   const missingCredentials = await callTool(artifact, submitTool, submitArgs, { fixtures: true, fixtureScenario: "missing-credentials" });
   if (missingCredentials.structuredContent.errorCode !== "PS_CLOB_AUTH_REJECTED"
     || missingCredentials.structuredContent.httpStatus !== 401
@@ -633,7 +633,7 @@ export async function testOfflineArtifact(root = process.cwd()) {
     fail("L1 credential rejection did not preserve safe HTTP status or exposed a provider body", "clob_auth_invalid");
   }
   for (const [scenario, httpStatus] of [
-    ["submit-ambiguous", 404], ["submit-ambiguous-429", 429], ["submit-ambiguous-503", 503],
+    ["submit-ambiguous", 404], ["submit-ambiguous-408", 408], ["submit-ambiguous-429", 429], ["submit-ambiguous-503", 503],
     ["submit-malformed-success", 200], ["submit-malformed-order-id", 200],
   ]) {
     const ambiguous = await callTool(artifact, submitTool, submitArgs, { fixtures: true, fixtureScenario: scenario });
@@ -1400,7 +1400,7 @@ export async function testOfflineArtifact(root = process.cwd()) {
       "discovery makes no network calls; successful order-read HTTP status is observed, not inferred",
       "BUY FAK preserves the SDK-generated signed amount", "lack of visible liquidity does not block SDK preparation", "no ExecutionApproval signature is required", "saved signed fields reach exactly one intercepted CLOB POST", "submit does not refresh Gamma, book, or fee metadata", "ClobAuth is delegated to the official SDK", "order timestamp is verified only for safe serialization", "SELL FAK preserves SDK-generated signed amounts", "informational quote fee estimate",
       "EOA Type 0 FAK BUY remains compatible through submit_order", "EOA Type 0 FOK SELL reaches one POST with its exact prepared type and amounts", "Deposit Wallet Type 3 FAK BUY uses the shared submit_order handler", "Deposit Wallet Type 3 FOK BUY preserves ERC-7739 wrapping and FOK", "insufficient visible depth does not locally reject FOK; the CLOB's rejection remains FOK", "mismatched FAK submission rejects a prepared FOK without a POST", "ambiguous FOK outcome remains UNKNOWN after one POST and one read-only reconciliation", "FAK partial fill and CLOB-canceled remainder are reflected by status read-back", "FOK full fill is reflected by authoritative status read-back",
-      "reject invalid Polymarket order signature", "reject real provider geoblock", "missing CLOB credentials handled", "Deposit Wallet TypedDataSign preparation", "local smart-wallet signer recovery is distinct from deferred CLOB acceptance", "Deposit Wallet ERC-7739 order reaches exactly one intercepted CLOB POST without Polygon RPC",
+      "reject invalid Polymarket order signature", "valid submission reaches one CLOB POST without a standalone website preflight", "missing CLOB credentials handled", "Deposit Wallet TypedDataSign preparation", "local smart-wallet signer recovery is distinct from deferred CLOB acceptance", "Deposit Wallet ERC-7739 order reaches exactly one intercepted CLOB POST without Polygon RPC",
       "SDK preparation and submission do not require a custom book-age gate", "provider minimum-size rejection is authoritative", "provider record order ID must match the requested order ID", "FAK/FOK prepared approval context cannot be changed", "restricted Gamma metadata does not gate submission", "market and quote responses omit removed eligibility metadata", "signature validation rejects changes to signed token, maker/taker amounts, side, maker, or metadata", "51s quote remains labeled stale", "ambiguous POST outcomes reconcile once and never repost", "HTTP 400/401/403 POST errors retain sanitized classifications and status", "cancel_order issues one DELETE and reconciles ambiguous outcomes at most once", "provider-invalid structured diagnostics", "reject unsafe CLOB salt precision", "reject wrong outcome asset",
       "all 11 MCP tools return machine-readable JSON content for text-only clients", "search-to-quote-to-PayBox-signing-to-internal-validation-to-submission workflow using content text only", "FOK text response preserves provider rejection without local depth guarantees",
       "PL/PD/SA/CL fixture mapping", "documented team-form filters with mixed-competition history filtering", "form counts and explanations for 5/5, 5/4, 5/0, and 0/0 histories",

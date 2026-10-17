@@ -16,10 +16,10 @@ let cancelDeletes = 0;
 const cancelCalls = [];
 const authAndOrderCalls = [];
 process.on("exit", () => {
-  if (["submit-exact-five-fak", "submit-exact-five-fok", "submit-valid", "existing-api-key", "submit-deposit-wallet", "submit-fok-eoa", "submit-fok-deposit-wallet", "submit-fok-insufficient-depth", "submit-fok-ambiguous-503", "submit-ambiguous"].includes(scenario) && authAndOrderCalls.join(",") !== (scenario === "existing-api-key" ? "create,derive,order" : "create,order")) process.exitCode = 95;
+  if (["submit-exact-five-fak", "submit-exact-five-fok", "submit-valid", "submit-without-standalone-preflight", "existing-api-key", "submit-deposit-wallet", "submit-fok-eoa", "submit-fok-deposit-wallet", "submit-fok-insufficient-depth", "submit-fok-ambiguous-503", "submit-ambiguous"].includes(scenario) && authAndOrderCalls.join(",") !== (scenario === "existing-api-key" ? "create,derive,order" : "create,order")) process.exitCode = 95;
   if (["submit-rejected-l1-auth", "missing-credentials", "l1-derive-401"].includes(scenario) && authAndOrderCalls.join(",") !== (scenario === "l1-derive-401" ? "create,derive" : "create")) process.exitCode = 97;
   if (scenario?.startsWith("order-status-") && authAndOrderCalls.join(",") !== "create") process.exitCode = 99;
-  if (["submit-exact-five-fak", "submit-exact-five-fok", "submit-valid", "existing-api-key", "submit-deposit-wallet", "submit-fok-eoa", "submit-fok-deposit-wallet", "submit-fok-insufficient-depth", "submit-fok-ambiguous-503", "submit-ambiguous", "submit-ambiguous-429", "submit-ambiguous-503", "submit-malformed-success", "submit-malformed-order-id", "submit-reconciled", "submit-l2-401", "submit-400", "submit-403"].includes(scenario)
+  if (["submit-exact-five-fak", "submit-exact-five-fok", "submit-valid", "submit-without-standalone-preflight", "existing-api-key", "submit-deposit-wallet", "submit-fok-eoa", "submit-fok-deposit-wallet", "submit-fok-insufficient-depth", "submit-fok-ambiguous-503", "submit-ambiguous", "submit-ambiguous-408", "submit-ambiguous-429", "submit-ambiguous-503", "submit-malformed-success", "submit-malformed-order-id", "submit-reconciled", "submit-l2-401", "submit-400", "submit-403"].includes(scenario)
     && (authAndOrderCalls.join(",") !== (scenario === "existing-api-key" ? "create,derive,order" : "create,order") || orderPosts !== 1)) process.exitCode = 101;
   if (scenario?.startsWith("submit-ambiguous") || scenario === "submit-fok-ambiguous-503" || scenario === "submit-malformed-success" || scenario === "submit-malformed-order-id" || scenario === "submit-reconciled") {
     if (orderPosts !== 1 || orderReadbacks !== 1) process.exitCode = 102;
@@ -106,6 +106,7 @@ globalThis.fetch = async (input, init = {}) => {
   const url = new URL(input instanceof URL ? input : typeof input === "string" ? input : input.url);
   if (scenario === "submit-no-refresh" && ((url.hostname === "gamma-api.polymarket.com" && url.pathname === "/markets/1")
     || (url.hostname === "clob.polymarket.com" && ["/book", `/clob-markets/${conditionId}`].includes(url.pathname)))) process.exit(116);
+  if (scenario === "submit-without-standalone-preflight" && url.hostname === "polymarket.com") process.exit(118);
   let body;
   if (url.hostname === "data-api.polymarket.com" && url.pathname === "/v2/approvals") {
     if (scenario === "chain-read-unavailable") return new Response("unavailable", { status: 503 });
@@ -234,7 +235,7 @@ globalThis.fetch = async (input, init = {}) => {
     orderPosts += 1;
     authAndOrderCalls.push("order");
     if (authAndOrderCalls.join(",") !== (scenario === "existing-api-key" ? "create,derive,order" : "create,order")) process.exit(95);
-    if (!["submit-exact-five-fak", "submit-exact-five-fok", "submit-valid", "submit-no-refresh", "submit-provider-minimum", "existing-api-key", "submit-deposit-wallet", "submit-fok-eoa", "submit-fok-deposit-wallet", "submit-fok-insufficient-depth", "submit-fok-ambiguous-503", "restricted-submit", "submit-stale-book", "submit-future-book", "missing-book-timestamp", "submit-ambiguous", "submit-ambiguous-429", "submit-ambiguous-503", "submit-malformed-success", "submit-malformed-order-id", "submit-reconciled", "submit-l2-401", "submit-400", "submit-403"].includes(scenario) || orderPosts !== 1) process.exit(89);
+    if (!["submit-exact-five-fak", "submit-exact-five-fok", "submit-valid", "submit-without-standalone-preflight", "submit-no-refresh", "submit-provider-minimum", "existing-api-key", "submit-deposit-wallet", "submit-fok-eoa", "submit-fok-deposit-wallet", "submit-fok-insufficient-depth", "submit-fok-ambiguous-503", "restricted-submit", "submit-stale-book", "submit-future-book", "missing-book-timestamp", "submit-ambiguous", "submit-ambiguous-408", "submit-ambiguous-429", "submit-ambiguous-503", "submit-malformed-success", "submit-malformed-order-id", "submit-reconciled", "submit-l2-401", "submit-400", "submit-403"].includes(scenario) || orderPosts !== 1) process.exit(89);
     const postedOrder = JSON.parse(init.body);
     const fokSell = scenario === "submit-fok-eoa" || scenario === "submit-fok-ambiguous-503";
     const expectedOrderType = scenario.startsWith("submit-fok") || scenario === "submit-exact-five-fok" ? "FOK" : "FAK";
@@ -252,6 +253,7 @@ globalThis.fetch = async (input, init = {}) => {
     if (expectedSignature && postedOrder.order.signature.toLowerCase() !== expectedSignature.toLowerCase()) process.exit(119);
     if (scenario === "submit-provider-minimum") return Response.json({ success: false, errorMsg: "Order size is below the provider minimum." }, { status: 400 });
     if (scenario === "submit-ambiguous") throw new Error("fixture connection reset after request body");
+    if (scenario === "submit-ambiguous-408") return new Response("fixture request timeout", { status: 408 });
     if (scenario === "submit-ambiguous-429") return new Response("signature=SECRET_SENTINEL; apiKey=SECRET_SENTINEL", { status: 429 });
     if (scenario === "submit-ambiguous-503") return new Response("signature=SECRET_SENTINEL; apiKey=SECRET_SENTINEL", { status: 503 });
     if (scenario === "submit-reconciled") return new Response("signature=SECRET_SENTINEL; apiKey=SECRET_SENTINEL", { status: 503 });
@@ -260,7 +262,7 @@ globalThis.fetch = async (input, init = {}) => {
     if (scenario === "submit-l2-401") return new Response("signature=SECRET_SENTINEL; apiKey=SECRET_SENTINEL", { status: 401 });
     if (scenario === "submit-400") return new Response("signature=SECRET_SENTINEL; apiKey=SECRET_SENTINEL", { status: 400 });
     if (scenario === "submit-403") return new Response("signature=SECRET_SENTINEL; apiKey=SECRET_SENTINEL", { status: 403 });
-    if (["submit-exact-five-fak", "submit-exact-five-fok", "submit-valid", "submit-no-refresh", "existing-api-key", "submit-deposit-wallet", "submit-fok-eoa", "submit-fok-deposit-wallet", "restricted-submit", "submit-stale-book", "submit-future-book", "missing-book-timestamp"].includes(scenario)) {
+    if (["submit-exact-five-fak", "submit-exact-five-fok", "submit-valid", "submit-without-standalone-preflight", "submit-no-refresh", "existing-api-key", "submit-deposit-wallet", "submit-fok-eoa", "submit-fok-deposit-wallet", "restricted-submit", "submit-stale-book", "submit-future-book", "missing-book-timestamp"].includes(scenario)) {
       return new Response(JSON.stringify({ success: true, errorMsg: "", makingAmount: "5", takingAmount: "10", orderID: `0x${"a".repeat(64)}`, status: "matched", tradeIDs: [] }), {
         status: 200, headers: { "content-type": "application/json" },
       });
@@ -270,8 +272,6 @@ globalThis.fetch = async (input, init = {}) => {
     return new Response(JSON.stringify({ success: false, errorMsg: "offline fixture blocks order submission; attempts=1" }), {
       status: 403, headers: { "content-type": "application/json" },
     });
-  } else if (url.hostname === "polymarket.com" && url.pathname === "/api/geoblock") {
-    body = { blocked: scenario === "geoblocked" };
   } else if (url.hostname === "polygon-rpc.com") {
     process.exit(91);
   } else if (url.hostname === "v3.football.api-sports.io" && url.pathname === "/fixtures") {

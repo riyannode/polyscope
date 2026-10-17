@@ -44,7 +44,6 @@ const PROTOCOL_VERSION = "2026-07-28";
 const GAMMA_API = "https://gamma-api.polymarket.com";
 const CLOB_API = "https://clob.polymarket.com";
 const DATA_API = "https://data-api.polymarket.com";
-const GEOBLOCK_API = "https://polymarket.com/api/geoblock";
 const FOOTBALL_DATA_API = "https://api.football-data.org/v4";
 const API_FOOTBALL_API = "https://v3.football.api-sports.io";
 const ZERO32 = `0x${"0".repeat(64)}` as const;
@@ -327,7 +326,6 @@ const tradingApprovalsSchema = z.object({
   observedAt: z.string().datetime(),
   source: z.literal("Polymarket SDK indexed trading approvals"),
 }).strict();
-const geoblockSchema = z.object({ blocked: z.boolean() }).passthrough();
 const positionsResponseSchema = z.array(z.object({
   condition_id: z.string(), title: z.string().optional(), outcome: z.string().optional(),
   current_size: z.number().finite(), avg_price: z.number().finite().optional(),
@@ -1313,10 +1311,6 @@ function clobPrivateHttpFailure(status: number): { code: string; message: string
   };
 }
 
-async function checkGeoblock(): Promise<boolean> {
-  return geoblockSchema.parse(await getJson(GEOBLOCK_API)).blocked;
-}
-
 function mapOrderStatus(status: string | undefined, matched: string | undefined, original: string | undefined) {
   const normalized = status?.toUpperCase();
   if (matched !== undefined && original !== undefined) {
@@ -2034,23 +2028,21 @@ async function createServer() {
       });
 
       const signedOrderSignature = orderValidation.signedSignature;
+      const sdkOrder = signedSdkOrder(prepared, signedOrderSignature);
+      try { assertSignedWireBinding(prepared, sdkOrder); }
+      catch {
+        return orderResult({
+          status: "REJECTED", orderId: null, orderType, requestedSize: prepared.order.size,
+          filledSize: null, remainingSize: prepared.order.size, tradeIds: [],
+          message: "The reconstructed SDK order differs from the exact PayBox-approved payload; no order was sent.",
+          errorCode: "PS_SIGNATURE_INVALID",
+        });
+      }
       let credentials: ClobCredentials;
       try {
-        const [derivedCredentials, geoblocked] = await Promise.all([
-          deriveClobCredentials(clobAuth, prepared.wallet.signingAddress, prepared.wallet.makerAddress),
-          checkGeoblock(),
-        ]);
-        credentials = derivedCredentials;
-        if (geoblocked) {
-          return orderResult({
-            status: "REJECTED", orderId: null, orderType, requestedSize: prepared.order.size,
-            filledSize: null, remainingSize: prepared.order.size, tradeIds: [],
-            message: "Polymarket geoblock reports this request as blocked; no order was sent.",
-            errorCode: "PS_GEOBLOCKED",
-          });
-        }
+        credentials = await deriveClobCredentials(clobAuth, prepared.wallet.signingAddress, prepared.wallet.makerAddress);
       } catch (error) {
-        const failure = clobRequestFailure(error, "PS_PREFLIGHT_FAILED", "Polymarket authentication or geoblock check could not be completed; no order was sent.");
+        const failure = clobRequestFailure(error, "PS_PREFLIGHT_FAILED", "Polymarket CLOB authentication could not be completed; no order was sent.");
         return orderResult({
           status: "FAILED", orderId: null, orderType, requestedSize: prepared.order.size,
           filledSize: null, remainingSize: prepared.order.size, tradeIds: [], message: failure.message,
@@ -2072,16 +2064,6 @@ async function createServer() {
           ...((httpStatus ?? reconciled?.status) === undefined ? {} : { httpStatus: httpStatus ?? reconciled?.status }),
         });
       };
-      const sdkOrder = signedSdkOrder(prepared, signedOrderSignature);
-      try { assertSignedWireBinding(prepared, sdkOrder); }
-      catch {
-        return orderResult({
-          status: "REJECTED", orderId: null, orderType, requestedSize: prepared.order.size,
-          filledSize: null, remainingSize: prepared.order.size, tradeIds: [],
-          message: "The reconstructed SDK order differs from the exact PayBox-approved payload; no order was sent.",
-          errorCode: "PS_SIGNATURE_INVALID",
-        });
-      }
       let posted: { status: number; data: unknown | null };
       try {
         posted = await sdkResponse(async () => {
@@ -2124,7 +2106,7 @@ async function createServer() {
     "submit_order",
     {
       title: "Submit FAK/FOK Order",
-      description: "Submit one prepared FAK/FOK order after verifying its signature and exact wire payload. State-changing; checks geoblock and never blindly retries an ambiguous POST.",
+      description: "Submit one prepared FAK/FOK order through the official SDK after verifying its signature and exact wire payload. State-changing; makes one submission and never blindly retries an ambiguous POST.",
       inputSchema: z.object({
         preparedOrder: preparedOrderSchema, orderSignature: z.string().regex(/^0x[0-9a-fA-F]{130}$/),
         clobAuth: clobAuthSchema, orderType: orderTypeSchema,
