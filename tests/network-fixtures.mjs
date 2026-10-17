@@ -177,7 +177,7 @@ globalThis.fetch = async (input, init = {}) => {
           ? history(teamId).slice(0, 4)
           : teamId === 779 || teamId === 780
             ? []
-        : allCompetitionHistory(teamId);
+            : allCompetitionHistory(teamId);
     body = { matches: matches.slice(0, Number(url.searchParams.get("limit") ?? "100")) };
   } else if (url.hostname === "www.espn.com" && url.pathname === "/espn/rss/soccer/news") {
     const publishedAt = new Date().toUTCString();
