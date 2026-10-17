@@ -6,13 +6,13 @@ Known order-preparation failures return `status: "REJECTED"`, `errorCode`, `reas
 |---|---|---|---|
 | `PS_PROVIDER_UNAVAILABLE` | Polymarket read failed or returned a non-success HTTP status. | Retry a read after checking host access; reconcile an ambiguous order before any new submission. | Polymarket data could not be read. |
 | `PS_PROVIDER_TIMEOUT` | Polymarket read exceeded its per-request timeout. | Reads may be retried; a timed-out order POST is `UNKNOWN` and must be reconciled. | Polymarket data did not respond in time. |
-| `PS_PROVIDER_INVALID` | Invalid JSON, market/book shape, book timestamp, or numeric market data. | Check provider status; do not prepare from malformed data. | Polymarket returned incomplete or unreadable data. |
+| `PS_PROVIDER_INVALID` | Invalid JSON, market/book shape, or numeric market data required to construct the request. | Check provider status; do not prepare from malformed market data. | Polymarket returned incomplete or unreadable data. |
 | `PS_RESPONSE_TOO_LARGE` | A Polymarket response exceeded 1 MiB. | Reduce the requested result size where possible. | The provider response was too large to process. |
 | `PS_MARKET_CLOSED` | Market is inactive or closed. | Refresh discovery later. | This market is not active. |
 | `PS_MARKET_UNSUPPORTED` | Required CLOB trading metadata is absent or the market is not accepting orders. | Use a supported market. | This market does not expose the supported single-market order path. |
 | `PS_MARKET_IDENTITY` | Market, outcome asset, condition, or CLOB book does not match. | Re-run discovery and prepare a new order. | The selected outcome could not be matched to the live order book. |
-| `PS_MARKET_VERSION` | Gamma and CLOB disagree on exchange version or risk mode. | Refresh market metadata before preparing. | Polymarket trading metadata conflicts. |
-| `PS_MARKET_CHANGED` | Tick, minimum size, exchange version, or risk mode changed after preparation. | Prepare again using current constraints. | Trading constraints changed after preparation. |
+| `PS_MARKET_VERSION` | Gamma and CLOB disagree on exchange version or risk mode. | Refresh market metadata before preparing or submitting. | Polymarket trading metadata conflicts. |
+| `PS_MARKET_CHANGED` | Exchange version or risk mode changed after preparation, so the signed exchange domain is no longer compatible. | Prepare and sign a new order for the current exchange domain. | The market's exchange signing domain changed. |
 | `PS_FEE_INVALID` | The current CLOB fee descriptor is invalid or exceeds supported precision. | Check provider status before proceeding. | Polymarket's current trading fee could not be read. |
 | `PS_PRICE_INVALID` | Price is outside 0–1 or does not match the current tick. | Correct the price. | Price does not meet Polymarket's current price increment. |
 | `PS_AMOUNT_INVALID` | Amount is not a supported nonnegative decimal string. | Correct the value without exponent notation. | Enter the amount as a nonnegative decimal. |
@@ -23,7 +23,6 @@ Known order-preparation failures return `status: "REJECTED"`, `errorCode`, `reas
 | `PS_ORDER_INVALID` | Prepared order fields, precision, timestamp, or fixed metadata do not validate. | Discard and prepare a new order. | The prepared order is invalid. |
 | `PS_SIGNATURE_INVALID` | Polymarket Order signature does not recover to the selected signer. | Select the matching PayBox wallet and sign the exact order payload again. | The order signature does not match the selected wallet. |
 | `PS_WALLET_BINDING` | Signer, maker, signature type, or order signer does not match the wallet type. | Select the matching existing PayBox wallet and prepare again. | The selected wallet does not match this order. |
-| `PS_WALLET_VALIDATION_UNAVAILABLE` | Polygon RPC could not validate an ERC-1271 wallet signature. | Retry after RPC access is restored; no order was sent. | Smart-wallet signature validation is unavailable. |
 | `PS_AUTH_SIGNATURE_INVALID` | ClobAuth signature cannot be recovered. | Prepare and sign a fresh ClobAuth payload. | Polymarket authentication signature is invalid. |
 | `PS_AUTH_NONCE_INVALID` | ClobAuth nonce exceeds uint256. | Prepare ClobAuth with an in-range nonce. | Authentication nonce is invalid. |
 | `PS_AUTH_WALLET_MISMATCH` | ClobAuth signer differs from the order's signing address. | Use the same wallet for ClobAuth and order signing. | Authentication and order use different wallets. |
@@ -40,7 +39,7 @@ Known order-preparation failures return `status: "REJECTED"`, `errorCode`, `reas
 
 ## Preparation and execution
 
-`prepare_order_signing` returns `status: "PREPARED"` with the Polymarket Order payload, one `requestWalletSignIntent`, `submitsOrder: false`, and `preparationFreshness: { bookAgeMs }`. The age value is informational; there is no 120-second preparation cutoff. `get_quote` continues to label books older than 30 seconds as `STALE`, but that label does not block preparation or submission. Invalid or future timestamps remain malformed provider data.
+`prepare_order_signing` returns `status: "PREPARED"` with the Polymarket Order payload, one `requestWalletSignIntent`, `submitsOrder: false`, and `preparationFreshness: { bookAgeMs }`. Book age is informational; there is no 120-second preparation cutoff. `get_quote` labels books older than 30 seconds as `STALE`, but that label does not block preparation or submission. A future, invalid, or unavailable book timestamp does not independently block a price-bounded FAK order.
 
 PayBox handles human approval and wallet signing through `request_wallet_sign` and `get_request`. The Polymarket Order signature signs the exact market token, side, price-derived amounts, size, wallet, exchange domain, and FAK request. ClobAuth is a separate Polymarket L1 operation used to derive L2 credentials; it is not a PolyScope execution approval. No custom ExecutionApproval payload, signature, or deadline is used.
 
@@ -50,13 +49,15 @@ The adapter has per-request network timeouts and no custom total execution budge
 
 ## Classification of local trading rejections
 
-Each local check below maps to one of the three requested classes. Transport and provider-shape failures are grouped with official protocol requirements only in the sense that the adapter cannot construct or validate the official request without the necessary current API data; they are operational failures, not extra eligibility policy.
+Each local trade rejection is assigned to one of the three requested classes. Provider, transport, and credential failures are operational failures that prevent request construction or completion; they are not eligibility decisions or trading-policy rejections.
 
 | Classification | Remaining codes and checks | Reason |
 |---|---|---|
-| Official Polymarket protocol requirement | `PS_MARKET_CLOSED`, `PS_MARKET_UNSUPPORTED`, `PS_MARKET_IDENTITY`, `PS_MARKET_VERSION`, `PS_MARKET_CHANGED`, `PS_AMOUNT_PRECISION`, `PS_PRICE_INVALID`, `PS_SIZE_BELOW_MINIMUM`, `PS_ORDER_INVALID`, `PS_SIGNATURE_INVALID`, `PS_WALLET_BINDING`, `PS_WALLET_VALIDATION_UNAVAILABLE`, `PS_AUTH_SIGNATURE_INVALID`, `PS_AUTH_NONCE_INVALID`, `PS_AUTH_WALLET_MISMATCH`, `PS_CLOB_AUTH_FAILED`, `PS_CLOB_AUTH_INVALID`, `PS_GEOBLOCKED`, `PS_CLOB_REJECTED`, `PS_PROVIDER_UNAVAILABLE`, `PS_PROVIDER_TIMEOUT`, `PS_PROVIDER_INVALID`, `PS_RESPONSE_TOO_LARGE`, `PS_PREFLIGHT_FAILED` | Current market/orderbook identity and status, exchange version and amount rules, exact EIP-712 authentication/order validation, official geoblock, CLOB response, and the provider data needed to construct/validate them. A provider/transport failure does not assert that a user is ineligible. |
-| Exact user-approved order constraint | `PS_AMOUNT_INVALID`, `PS_SIZE_INVALID`, `PS_FEE_INVALID`, `PS_SPENDING_CAP` | The requested decimal, positive size, or current fee-inclusive notional cannot be represented or would exceed the exact user-provided cap. The adapter does not resize the signed order. |
-| Redundant/custom PolyScope policy | None remain | The visible-liquidity hard rejection was removed. `get_quote` reports liquidity; preparation and submission preserve the selected price/size and FAK order behavior. The undocumented 300-second ClobAuth age cutoff and five-second future Order-timestamp cutoff were removed. |
+| Official Polymarket protocol requirement | `PS_MARKET_CLOSED`, `PS_MARKET_UNSUPPORTED`, `PS_MARKET_VERSION`, `PS_MARKET_CHANGED`, `PS_AMOUNT_PRECISION`, `PS_PRICE_INVALID`, `PS_SIZE_BELOW_MINIMUM`, `PS_ORDER_INVALID`, `PS_SIGNATURE_INVALID`, `PS_WALLET_BINDING`, `PS_AUTH_SIGNATURE_INVALID`, `PS_AUTH_NONCE_INVALID`, `PS_AUTH_WALLET_MISMATCH`, `PS_CLOB_REJECTED`, `PS_GEOBLOCKED` | The order must target an accepting market, use a compatible exchange domain and current tick/minimum, encode exact amounts, and carry an order signature and wallet binding that Polymarket accepts. Official geoblock responses are honored. For smart wallets, local signer recovery is checked; CLOB contract-wallet acceptance is not claimed locally. |
+| Exact user-approved order constraint | `PS_MARKET_IDENTITY`, `PS_AMOUNT_INVALID`, `PS_SIZE_INVALID`, `PS_SPENDING_CAP` | Keep the selected market/outcome and decimal inputs exact, and do not exceed the user-specified fee-inclusive cap. The adapter never resizes or silently re-signs an order. |
+| Redundant/custom PolyScope policy | None | No remaining local trade rejection is based solely on Gamma `restricted`, quote liquidity, book age/timestamp, changed-but-still-valid tick/minimum metadata, or a separate ERC-1271 RPC read. `get_quote` reports liquidity and freshness; CLOB remains authoritative for contract-wallet acceptance. |
+
+Operational failures, not policy classifications: `PS_FEE_INVALID`, `PS_CLOB_AUTH_FAILED`, `PS_CLOB_AUTH_INVALID`, `PS_PROVIDER_UNAVAILABLE`, `PS_PROVIDER_TIMEOUT`, `PS_PROVIDER_INVALID`, `PS_RESPONSE_TOO_LARGE`, and `PS_PREFLIGHT_FAILED` mean required metadata, authentication, or provider access failed. They do not claim the user or account is ineligible.
 
 `PS_SUBMISSION_UNKNOWN`, `PS_ORDER_STATUS_UNKNOWN`, and `PS_CANCEL_UNKNOWN` describe unresolved provider outcomes after a request, not pre-submission local gates. `PS_DATE_INVALID` and `PS_PORTFOLIO_INVALID` concern non-trading tools.
 
@@ -64,6 +65,14 @@ Each local check below maps to one of the three requested classes. Transport and
 
 Polymarket's official [API authentication guide](https://docs.polymarket.com/getting-started/api#authentication) requires the ClobAuth payload/header to contain the current Unix timestamp in seconds, but it does not document a 300-second maximum age. The official [wallets and authentication guide](https://docs.polymarket.com/trading/wallets-auth) likewise specifies the timestamp field without an accepted-age window. PolyScope therefore continues to verify the exact signed timestamp, signer, and nonce, but no longer applies its own `abs(now - timestamp) <= 300` rule; CLOB credential derivation remains the protocol authority and may reject timestamps it considers invalid. Generate and sign ClobAuth immediately before the authenticated operation.
 
-The official [Order format](https://docs.polymarket.com/trading/place-orders) includes a signed Unix-millisecond timestamp, but documents no five-second future tolerance or local freshness cutoff. PolyScope still requires a positive, safely representable integer for the signed/order JSON field, but leaves age acceptance to the CLOB.
+The official [Order format](https://docs.polymarket.com/trading/place-orders) includes a signed Unix-millisecond timestamp, but documents no five-second future tolerance or local freshness cutoff. PolyScope still requires a positive, safely representable integer for the signed/order JSON field, but leaves age acceptance to the CLOB. The documentation describes book timestamp as metadata; no local timestamp-age or clock-skew rejection is used.
+
+### Smart-wallet signature finding
+
+PolyScope recovers the supplied EIP-712 signature to the selected signing address and constructs the official Deposit Wallet ERC-7739 wrapper where required. It does not call `polygon-rpc.com` to preflight ERC-1271. `validate_order_signature` now returns `localSignerVerified` and `contractWalletAcceptance` (`NOT_APPLICABLE` for EOA, `DEFERRED_TO_CLOB` for contract wallets); it does not claim contract validation. Polymarket's order-placement response remains authoritative for contract-wallet acceptance. The [official order guide](https://docs.polymarket.com/trading/place-orders) documents wallet signature types, Deposit Wallet wrapping, and checking CLOB acceptance; the [wallet authentication guide](https://docs.polymarket.com/trading/wallets-auth) describes Polymarket's signer/auth flows.
+
+### Current constraint changes
+
+At submission, the adapter checks the exact signed price against the current book tick and exact signed share size against the current minimum. A changed value is not itself a rejection. If either exact value is now invalid, submission stops without modifying or re-signing the order. A changed exchange version or neg-risk mode remains a rejection because it changes the exchange signing domain.
 
 Soccer provider failures return `availability: "UNAVAILABLE"` with a provider reason and source timestamps. HTTP errors retain safe status-specific reasons. Response bodies and credentials are never included. PolyScope does not substitute incomplete form history or convert provider failure into coverage.

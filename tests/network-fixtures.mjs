@@ -8,6 +8,10 @@ if (scenario === "unexpected-failure") {
   Object.defineProperty(globalThis.crypto, "getRandomValues", { value: () => { throw new Error("fixture unexpected programming failure"); } });
 }
 let orderPosts = 0;
+process.on("exit", () => {
+  if (scenario?.startsWith("snapshot-") && !["snapshot-min-increase", "snapshot-min-zero", "snapshot-tick-invalid", "snapshot-risk-changed"].includes(scenario) && orderPosts !== 1) process.exitCode = 92;
+  if (["snapshot-min-increase", "snapshot-min-zero", "snapshot-tick-invalid", "snapshot-risk-changed"].includes(scenario) && orderPosts !== 0) process.exitCode = 93;
+});
 
 const conditionId = `0x${"1".repeat(64)}`;
 const market = {
@@ -86,9 +90,17 @@ globalThis.fetch = async (input, init = {}) => {
       bids: [{ price: "0.49", size: "100" }], asks: [{ price: "0.50", size: "100" }],
       min_order_size: "5", tick_size: "0.01", neg_risk: false, version: "v1",
     };
+    if (scenario === "snapshot-min-decrease") body.min_order_size = "1";
+    if (scenario === "snapshot-min-increase") body.min_order_size = "11";
+    if (scenario === "snapshot-min-zero") body.min_order_size = "0";
+    if (scenario === "snapshot-tick-valid") body.tick_size = "0.005";
+    if (scenario === "snapshot-tick-invalid") body.tick_size = "0.1";
+    if (scenario === "snapshot-risk-changed") body.neg_risk = true;
+    if (scenario === "submit-future-book") body.timestamp = String(Date.now() + 1);
+    if (scenario === "missing-book-timestamp") delete body.timestamp;
     if (scenario === "no-visible-liquidity") body.asks = [];
     if (scenario === "wrong-book") body.asset_id = "999";
-    if (scenario === "invalid-timestamp") body.timestamp = "0";
+    if (scenario === "invalid-timestamp") body.timestamp = "not-a-timestamp";
     if (scenario === "future-timestamp") body.timestamp = String(Date.now() + 1);
     if (scenario === "invalid-level") body.asks = [{ price: "NaN", size: "100" }];
     if (scenario === "price-bound") body.asks = [{ price: "0.51", size: "100" }];
@@ -101,13 +113,14 @@ globalThis.fetch = async (input, init = {}) => {
     return new Response("not found", { status: 404 });
   } else if (url.hostname === "clob.polymarket.com" && url.pathname === "/order" && init.method === "POST") {
     orderPosts += 1;
-    if (!["submit-valid", "restricted-submit", "submit-stale-book", "submit-stale-auth", "submit-ambiguous"].includes(scenario) || orderPosts !== 1) process.exit(89);
+    if (!["submit-valid", "submit-deposit-wallet", "restricted-submit", "submit-stale-book", "submit-stale-auth", "submit-future-book", "missing-book-timestamp", "submit-ambiguous", "snapshot-min-decrease", "snapshot-tick-valid"].includes(scenario) || orderPosts !== 1) process.exit(89);
     const postedOrder = JSON.parse(init.body);
     if (postedOrder.orderType !== "FAK" || postedOrder.order.side !== "BUY"
       || postedOrder.order.makerAmount !== "5000000" || postedOrder.order.takerAmount !== "10000000"
       || postedOrder.order.timestamp === undefined || !postedOrder.order.signature) process.exit(90);
+    if (scenario === "submit-deposit-wallet" && (postedOrder.order.signature.length <= 132 || postedOrder.order.signatureType !== 3)) process.exit(94);
     if (scenario === "submit-ambiguous") throw new Error("fixture connection reset after request body");
-    if (["submit-valid", "restricted-submit", "submit-stale-book", "submit-stale-auth"].includes(scenario)) {
+    if (["submit-valid", "submit-deposit-wallet", "restricted-submit", "submit-stale-book", "submit-stale-auth", "submit-future-book", "missing-book-timestamp", "snapshot-min-decrease", "snapshot-tick-valid"].includes(scenario)) {
       return new Response(JSON.stringify({ success: true, orderID: `0x${"a".repeat(64)}`, status: "MATCHED", tradeIDs: [] }), {
         status: 200, headers: { "content-type": "application/json" },
       });
@@ -117,6 +130,8 @@ globalThis.fetch = async (input, init = {}) => {
     });
   } else if (url.hostname === "polymarket.com" && url.pathname === "/api/geoblock") {
     body = { blocked: scenario === "geoblocked" };
+  } else if (url.hostname === "polygon-rpc.com") {
+    process.exit(91);
   } else if (url.hostname === "api.football-data.org" && url.pathname.startsWith("/v4/competitions/")) {
     const league = url.pathname.split("/")[3];
     if (url.searchParams.get("dateFrom") === "2026-11-01") return new Response("provider unavailable", { status: 403 });

@@ -22,7 +22,6 @@ const GAMMA_API = "https://gamma-api.polymarket.com";
 const CLOB_API = "https://clob.polymarket.com";
 const DATA_API = "https://data-api.polymarket.com";
 const GEOBLOCK_API = "https://polymarket.com/api/geoblock";
-const POLYGON_RPC = "https://polygon-rpc.com";
 const ESPN_SOCCER_FEED = "https://www.espn.com/espn/rss/soccer/news";
 const FOOTBALL_DATA_API = "https://api.football-data.org/v4";
 const NEWS_STALE_AFTER_MS = 24 * 60 * 60 * 1000;
@@ -125,7 +124,7 @@ const searchResponseSchema = z.object({ events: z.array(searchEventSchema) }).pa
 const bookSchema = z.object({
   asset_id: decimalIdSchema,
   market: z.string().regex(/^0x[0-9a-fA-F]{64}$/),
-  timestamp: z.string().regex(/^[0-9]+$/),
+  timestamp: z.string().nullable().optional(),
   bids: z.array(z.object({ price: z.string(), size: z.string() }).strip()).default([]),
   asks: z.array(z.object({ price: z.string(), size: z.string() }).strip()).default([]),
   last_trade_price: z.string().nullable().optional(),
@@ -157,7 +156,7 @@ const quoteResultSchema = z.object({
   requestedSize: z.string().nullable(), fillableSize: z.string().nullable(), unfilledSize: z.string().nullable(),
   worstPrice: z.string().nullable(), averagePrice: z.string().nullable(), grossAmountPusd: z.string().nullable(),
   feeRate: z.string().nullable(), feeExponent: z.number().int().min(0).max(6).nullable(), estimatedFeePusd: z.string().nullable(),
-  bookTimestamp: z.string(), bookAgeMs: z.number().int().nullable(), observedAt: z.string().datetime(),
+  bookTimestamp: z.string().nullable(), bookAgeMs: z.number().int().nullable(), observedAt: z.string().datetime(),
   source: z.literal("Polymarket CLOB"),
 }).strict();
 const providerAvailabilitySchema = z.enum(["AVAILABLE", "UNAVAILABLE"]);
@@ -213,7 +212,7 @@ const preparedOrderBaseSchema = z.object({
     id: z.string().regex(/^[0-9]{1,32}$/), conditionId: z.string().regex(/^0x[0-9a-fA-F]{64}$/), version: z.enum(["v1", "v2"]), outcome: z.string(), negRisk: z.boolean(),
     acceptingOrders: z.boolean().nullable(),
     tickSize: z.enum(TICK_SIZES),
-    minOrderSize: z.string(), bookTimestamp: z.string(),
+    minOrderSize: z.string(), bookTimestamp: z.string().nullable(),
   }).strict(),
   wallet: z.object({
     type: walletTypeSchema, makerAddress: addressSchema, signingAddress: addressSchema,
@@ -901,16 +900,11 @@ function marketFeeInfo(value: unknown): { rate: string; exponent: number } {
   return { rate, exponent: descriptor.e };
 }
 
-function bookAgeMs(timestamp: string, now = Date.now()): number | null {
+function bookAgeMs(timestamp: string | null | undefined, now = Date.now()): number | null {
+  if (timestamp == null) return null;
   const raw = Number(timestamp);
   const timestampMs = Number.isSafeInteger(raw) && raw > 0 ? raw >= 100_000_000_000 ? raw : raw * 1000 : Number.NaN;
   return Number.isSafeInteger(timestampMs) && timestampMs <= now ? now - timestampMs : null;
-}
-
-function typedDataDigest(prepared: PreparedOrderBase): Hex {
-  return prepared.wallet.type === "DEPOSIT_WALLET"
-    ? hashTypedData(depositOrderPayload(prepared))
-    : hashTypedData(standardOrderPayload(prepared));
 }
 
 async function validateWalletSignature(prepared: PreparedOrder, signature: Hex) {
@@ -922,28 +916,13 @@ async function validateWalletSignature(prepared: PreparedOrder, signature: Hex) 
       : await recoverTypedDataAddress({ ...standardOrderPayload(prepared), signature });
   } catch { recovered = null; }
   if (recovered?.toLowerCase() !== expected.toLowerCase()) {
-    return { valid: false, recovered, encoding: prepared.wallet.type === "DEPOSIT_WALLET" ? "ERC-7739" as const : "EIP-712" as const, walletValidation: "INVALID" as const, signedSignature: null };
+    return { valid: false, recovered, encoding: prepared.wallet.type === "DEPOSIT_WALLET" ? "ERC-7739" as const : "EIP-712" as const, contractWalletAcceptance: prepared.wallet.type === "EOA" ? "NOT_APPLICABLE" as const : "DEFERRED_TO_CLOB" as const, signedSignature: null };
   }
   const signedSignature = prepared.wallet.type === "DEPOSIT_WALLET" ? wrapDepositWalletSignature(prepared, signature) : signature;
   if (prepared.wallet.type === "EOA") {
-    return { valid: true, recovered, encoding: "EIP-712" as const, walletValidation: "NOT_REQUIRED" as const, signedSignature };
+    return { valid: true, recovered, encoding: "EIP-712" as const, contractWalletAcceptance: "NOT_APPLICABLE" as const, signedSignature };
   }
-  const digest = typedDataDigest(prepared);
-  const selector = keccak256(toHex("isValidSignature(bytes32,bytes)")).slice(0, 10) as Hex;
-  const encoded = encodeAbiParameters([{ type: "bytes32" }, { type: "bytes" }], [digest, signedSignature]);
-  try {
-    const response = await fetch(POLYGON_RPC, {
-      method: "POST", headers: { accept: "application/json", "content-type": "application/json" },
-      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "eth_call", params: [{ to: prepared.wallet.makerAddress, data: `${selector}${encoded.slice(2)}` }, "latest"] }),
-      redirect: "error", signal: AbortSignal.timeout(1_500),
-    });
-    if (!response.ok) return { valid: false, recovered, encoding: prepared.wallet.type === "DEPOSIT_WALLET" ? "ERC-7739" as const : "EIP-712" as const, walletValidation: "UNAVAILABLE" as const, signedSignature: null };
-    const result = z.object({ result: z.string().regex(/^0x[0-9a-fA-F]*$/) }).safeParse(JSON.parse(await boundedResponseText(response, 16_384)) as unknown);
-    const valid = result.success && result.data.result.toLowerCase().startsWith("0x1626ba7e");
-    return { valid, recovered, encoding: prepared.wallet.type === "DEPOSIT_WALLET" ? "ERC-7739" as const : "EIP-712" as const, walletValidation: valid ? "VALIDATED" as const : "INVALID" as const, signedSignature: valid ? signedSignature : null };
-  } catch (error) {
-    return { valid: false, recovered, encoding: prepared.wallet.type === "DEPOSIT_WALLET" ? "ERC-7739" as const : "EIP-712" as const, walletValidation: "UNAVAILABLE" as const, signedSignature: null };
-  }
+  return { valid: true, recovered, encoding: prepared.wallet.type === "DEPOSIT_WALLET" ? "ERC-7739" as const : "EIP-712" as const, contractWalletAcceptance: "DEFERRED_TO_CLOB" as const, signedSignature };
 }
 
 type ClobCredentials = z.infer<typeof clobCredentialSchema>;
@@ -1040,13 +1019,24 @@ async function validateExecutionSnapshot(prepared: PreparedOrder): Promise<{
     throw new Error("PS_MARKET_CLOSED: Refreshed market is not accepting this order.");
   }
   const currentVersion = book.version ?? "v1";
-  if (currentVersion !== approvedMarket.version || book.neg_risk !== approvedMarket.negRisk || book.tick_size !== approvedMarket.tickSize || book.min_order_size !== approvedMarket.minOrderSize) {
-    throw new Error("PS_MARKET_CHANGED: Trading constraints changed after the user approved the order.");
+  if (currentVersion !== approvedMarket.version || book.neg_risk !== approvedMarket.negRisk) {
+    throw new Error("PS_MARKET_CHANGED: Exchange version or risk mode changed after preparation.");
+  }
+  if (market.negRisk !== undefined && market.negRisk !== book.neg_risk) {
+    throw new Error("PS_MARKET_VERSION: Refreshed Gamma market and CLOB book disagree about the negative-risk exchange.");
   }
   if (market.version != null && book.version != null && market.version !== book.version) {
     throw new Error("PS_MARKET_VERSION: Refreshed Gamma market and CLOB book versions disagree.");
   }
-  if (bookAgeMs(book.timestamp) === null) throw new Error("PS_PROVIDER_INVALID: CLOB book timestamp is invalid or in the future.");
+  const currentPriceUnits = toUnits(order.price, 6);
+  if (currentPriceUnits <= 0n || currentPriceUnits >= MICRO || currentPriceUnits % toUnits(book.tick_size, 6) !== 0n) {
+    throw new Error("PS_PRICE_INVALID: Signed order price does not match the current tick size.");
+  }
+  const currentMinimumUnits = toUnits(book.min_order_size, 6);
+  if (currentMinimumUnits <= 0n) throw new Error("PS_PROVIDER_INVALID: CLOB returned a nonpositive current minimum order size.");
+  if (toUnits(order.size, 6, 2) < currentMinimumUnits) {
+    throw new Error("PS_SIZE_BELOW_MINIMUM: Signed order size is below the current market minimum.");
+  }
   const limitPriceUnits = toUnits(order.price, 6);
   const feePriceUnits = order.side === "BUY"
     ? limitPriceUnits < MICRO / 2n ? limitPriceUnits : MICRO / 2n
@@ -1332,7 +1322,7 @@ async function createServer() {
         feeRate: feeInfo.rate,
         feeExponent: feeInfo.exponent,
         estimatedFeePusd: requestedUnits === null ? null : formatUnits(estimatedFeeUnits, 6),
-        bookTimestamp: book.timestamp,
+        bookTimestamp: book.timestamp ?? null,
         bookAgeMs: ageMs,
         observedAt,
         source: "Polymarket CLOB",
@@ -1470,9 +1460,6 @@ async function createServer() {
           throw new Error("PS_MARKET_VERSION: Gamma and CLOB do not agree on the order-book protocol version.");
         }
         preparationFreshness.bookAgeMs = bookAgeMs(book.timestamp);
-        const age = preparationFreshness.bookAgeMs;
-        if (age === null) throw new Error("PS_PROVIDER_INVALID: CLOB book timestamp is invalid or in the future.");
-
         try {
           if (toUnits(book.min_order_size, 6) <= 0n) throw new Error();
           for (const level of [...book.bids, ...book.asks]) {
@@ -1525,7 +1512,7 @@ async function createServer() {
             id: marketId, conditionId: market.conditionId, version: protocolVersion, outcome: selectedOutcome.name,
             negRisk: book.neg_risk,
             acceptingOrders: market.acceptingOrders, tickSize: book.tick_size,
-            minOrderSize: book.min_order_size, bookTimestamp: book.timestamp,
+            minOrderSize: book.min_order_size, bookTimestamp: book.timestamp ?? null,
           },
           wallet: {
             type: walletType, makerAddress: maker, signingAddress: signing,
@@ -1593,12 +1580,12 @@ async function createServer() {
     "validate_order_signature",
     {
       title: "Validate a Polymarket order signature",
-      description: "Rebuilds the exact Polymarket EIP-712 order, checks its price, size, amount precision, fee-inclusive cap, and PayBox signer, then validates ERC-1271 wallets over Polygon RPC. Deposit Wallet output includes the ERC-7739 wrapper.",
+      description: "Rebuilds the exact Polymarket EIP-712 order and locally verifies that its signature recovers to the selected signer. Smart-wallet contract acceptance is left to Polymarket CLOB; Deposit Wallet output includes the ERC-7739 wrapper.",
       inputSchema: z.object({ preparedOrder: preparedOrderSchema, signature: z.string().regex(/^0x[0-9a-fA-F]{130}$/) }).strict(),
       outputSchema: z.object({
-        valid: z.boolean(), expectedSignerAddress: addressSchema, recoveredSignerAddress: addressSchema.nullable(),
+        localSignerVerified: z.boolean(), expectedSignerAddress: addressSchema, recoveredSignerAddress: addressSchema.nullable(),
         signatureEncoding: z.enum(["EIP-712", "ERC-7739"]), signedOrderSignature: z.string().nullable(),
-        onchainWalletValidation: z.enum(["NOT_REQUIRED", "VALIDATED", "UNAVAILABLE", "INVALID"]),
+        contractWalletAcceptance: z.enum(["NOT_APPLICABLE", "DEFERRED_TO_CLOB"]),
       }).strict(),
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     },
@@ -1608,16 +1595,16 @@ async function createServer() {
       validatePreparedOrder(prepared);
       const validation = await validateWalletSignature(prepared, signatureValue);
       const expected = address(prepared.wallet.signingAddress);
-      const valid = validation.valid && validation.walletValidation !== "UNAVAILABLE";
+      const valid = validation.valid;
       return {
-        content: [{ type: "text", text: valid ? "Order signature matches the expected PayBox signer; no order was submitted." : "Order signature is invalid, wallet validation is unavailable, or it belongs to a different signer." }],
+        content: [{ type: "text", text: valid ? "Order signature recovers to the selected signer locally; smart-wallet contract acceptance remains for Polymarket CLOB. No order was submitted." : "Order signature does not recover to the expected signer; no order was submitted." }],
         structuredContent: {
-          valid,
+          localSignerVerified: valid,
           expectedSignerAddress: expected,
           recoveredSignerAddress: validation.recovered,
           signatureEncoding: validation.encoding,
           signedOrderSignature: validation.signedSignature,
-          onchainWalletValidation: validation.walletValidation,
+          contractWalletAcceptance: validation.contractWalletAcceptance,
         },
       };
     },
@@ -1640,17 +1627,11 @@ async function createServer() {
       const prepared = preparedOrderSchema.parse(inputOrder);
       validatePreparedOrder(prepared);
       const orderValidation = await validateWalletSignature(prepared, signatureHex(orderSignature));
-      if (!orderValidation.valid || orderValidation.walletValidation === "INVALID") return tradeToolResult({
+      if (!orderValidation.valid) return tradeToolResult({
         status: "REJECTED", orderId: null, orderType: FAK, requestedSize: prepared.order.size,
         filledSize: null, remainingSize: prepared.order.size, tradeIds: [],
-        message: "The order signature does not validate for the approved PayBox wallet; no order was sent.",
+        message: "The order signature does not recover to the approved PayBox signer; no order was sent.",
         errorCode: "PS_SIGNATURE_INVALID",
-      });
-      if (orderValidation.walletValidation === "UNAVAILABLE") return tradeToolResult({
-        status: "FAILED", orderId: null, orderType: FAK, requestedSize: prepared.order.size,
-        filledSize: null, remainingSize: prepared.order.size, tradeIds: [],
-        message: "ERC-1271 wallet validation was unavailable; no order was sent.",
-        errorCode: "PS_WALLET_VALIDATION_UNAVAILABLE",
       });
 
       let credentials: ClobCredentials;

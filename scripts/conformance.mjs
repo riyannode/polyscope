@@ -183,7 +183,8 @@ export async function testOfflineArtifact(root = process.cwd()) {
   const validOrderSignature = await callTool(artifact, validateOrderTool, {
     preparedOrder: replayPrepared, signature: orderSignature,
   }, { fixtures: true });
-  if (validOrderSignature.structuredContent.valid !== true) {
+  if (validOrderSignature.structuredContent.localSignerVerified !== true
+    || validOrderSignature.structuredContent.contractWalletAcceptance !== "NOT_APPLICABLE") {
     fail("metadata-free prepared order did not validate its unchanged Polymarket EIP-712 signature", "signature_validation_invalid");
   }
   const futureOrderTimestamp = String(Date.now() + 60_000);
@@ -196,13 +197,13 @@ export async function testOfflineArtifact(root = process.cwd()) {
     preparedOrder: futureTimestampPrepared,
     signature: await replaySigner.signTypedData(futureTimestampPrepared.typedData),
   }, { fixtures: true });
-  if (futureTimestampValidation.structuredContent.valid !== true) {
+  if (futureTimestampValidation.structuredContent.localSignerVerified !== true) {
     fail("an undocumented order-timestamp freshness gate rejected a correctly signed order", "order_timestamp_invalid");
   }
   const metadataOnlyChange = await callTool(artifact, validateOrderTool, {
     preparedOrder: { ...replayPrepared, market: { ...replayPrepared.market, bookTimestamp: "1" } }, signature: orderSignature,
   }, { fixtures: true });
-  if (metadataOnlyChange.structuredContent.valid !== true) {
+  if (metadataOnlyChange.structuredContent.localSignerVerified !== true) {
     fail("changing unsigned book-age metadata changed Polymarket EIP-712 signature validation", "order_hash_invalid");
   }
   const clobAuthTool = tools.find((tool) => tool.name === "prepare_clob_auth");
@@ -229,12 +230,65 @@ export async function testOfflineArtifact(root = process.cwd()) {
   if (oldAuthSubmit.structuredContent.status !== "SUBMITTED") {
     fail("an undocumented 300-second ClobAuth cutoff blocked credential derivation", "clob_auth_freshness_invalid");
   }
-  for (const [scenario, age] of [["restricted-submit", 0], ["submit-stale-book", 51_000]]) {
+  for (const [scenario, age] of [["restricted-submit", 0], ["submit-stale-book", 51_000], ["submit-future-book", null], ["missing-book-timestamp", null]]) {
     const result = await callTool(artifact, submitTool, submitArgs, { fixtures: true, fixtureScenario: scenario });
     if (result.structuredContent.status !== "SUBMITTED") {
       fail(`${scenario} alone incorrectly blocked a signed limit-bounded FAK order`, "submit_preflight_invalid");
     }
     if (age > 0 && result.structuredContent.errorCode !== null) fail("stale informational book age created an execution error", "submit_preflight_invalid");
+  }
+  const depositSigner = privateKeyToAccount(generatePrivateKey());
+  const depositOrder = await callTool(artifact, prepareTool, {
+    ...base, makerAddress: "0x0000000000000000000000000000000000000002",
+    signingAddress: depositSigner.address, walletType: "DEPOSIT_WALLET", side: "BUY", priceLimit: "0.50",
+  }, { fixtures: true });
+  const depositPrepared = depositOrder.structuredContent.preparedOrder;
+  const depositOrderSignature = await depositSigner.signTypedData(depositPrepared.typedData);
+  const depositValidation = await callTool(artifact, validateOrderTool, {
+    preparedOrder: depositPrepared, signature: depositOrderSignature,
+  }, { fixtures: true });
+  if (depositValidation.structuredContent.localSignerVerified !== true
+    || depositValidation.structuredContent.contractWalletAcceptance !== "DEFERRED_TO_CLOB"
+    || (depositValidation.structuredContent.signedOrderSignature?.length ?? 0) <= depositOrderSignature.length) {
+    fail("Deposit Wallet signer recovery or ERC-7739 wrapping was not reported distinctly from CLOB contract acceptance", "deposit_wallet_signature_invalid");
+  }
+  const depositAuthResult = await callTool(artifact, clobAuthTool, { signerAddress: depositSigner.address, nonce: "0" }, { fixtures: true });
+  const depositClobAuth = {
+    timestamp: depositAuthResult.structuredContent.timestamp,
+    nonce: depositAuthResult.structuredContent.nonce,
+    signature: await depositSigner.signTypedData(depositAuthResult.structuredContent.typedData),
+  };
+  const depositSubmit = await callTool(artifact, submitTool, {
+    preparedOrder: depositPrepared, orderSignature: depositOrderSignature, clobAuth: depositClobAuth,
+  }, { fixtures: true, fixtureScenario: "submit-deposit-wallet" });
+  if (depositSubmit.structuredContent.status !== "SUBMITTED") {
+    fail("valid Deposit Wallet signing data did not reach its single intercepted CLOB POST without Polygon RPC", "deposit_wallet_submit_invalid");
+  }
+  for (const [scenario, expectedCode, prepared, signature] of [
+    ["snapshot-min-decrease", null, replayPrepared, orderSignature],
+    ["snapshot-min-increase", "PS_SIZE_BELOW_MINIMUM", replayPrepared, orderSignature],
+    ["snapshot-min-zero", "PS_PROVIDER_INVALID", replayPrepared, orderSignature],
+    ["snapshot-tick-valid", null, replayPrepared, orderSignature],
+    ["snapshot-risk-changed", "PS_MARKET_CHANGED", replayPrepared, orderSignature],
+  ]) {
+    const result = await callTool(artifact, submitTool, { preparedOrder: prepared, orderSignature: signature, clobAuth }, {
+      fixtures: true, fixtureScenario: scenario,
+    });
+    if (expectedCode === null ? result.structuredContent.status !== "SUBMITTED" : result.structuredContent.errorCode !== expectedCode) {
+      fail(`${scenario} did not apply current market constraints to the exact signed order`, "execution_snapshot_invalid");
+    }
+  }
+  const offTickPreparedResponse = await callTool(artifact, prepareTool, {
+    ...base, makerAddress: replaySigner.address, signingAddress: replaySigner.address,
+    side: "BUY", priceLimit: "0.51", maxNominalPusd: "5.23",
+  }, { fixtures: true });
+  const offTickPrepared = offTickPreparedResponse.structuredContent.preparedOrder;
+  const offTickSignature = await replaySigner.signTypedData(offTickPrepared.typedData);
+  const offTickResult = await callTool(artifact, submitTool, {
+    preparedOrder: offTickPrepared, orderSignature: offTickSignature, clobAuth,
+  }, { fixtures: true, fixtureScenario: "snapshot-tick-invalid" });
+  if (offTickResult.structuredContent.errorCode !== "PS_PRICE_INVALID") {
+    fail(`signed price that violates the current tick size returned ${offTickResult.structuredContent.errorCode ?? offTickResult.structuredContent.status}`, "execution_snapshot_invalid");
   }
   const invalidOrderSignature = await callTool(artifact, submitTool, {
     ...submitArgs, orderSignature: `0x${"0".repeat(130)}`,
@@ -289,13 +343,20 @@ export async function testOfflineArtifact(root = process.cwd()) {
   for (const [scenario, errorCode] of [
     ["wrong-market", "PS_MARKET_IDENTITY"], ["wrong-book", "PS_MARKET_IDENTITY"],
     ["provider-invalid", "PS_PROVIDER_INVALID"], ["provider-invalid-json", "PS_PROVIDER_INVALID"],
-    ["invalid-level", "PS_PROVIDER_INVALID"], ["invalid-timestamp", "PS_PROVIDER_INVALID"],
-    ["future-timestamp", "PS_PROVIDER_INVALID"], ["provider-unavailable", "PS_PROVIDER_UNAVAILABLE"],
+    ["invalid-level", "PS_PROVIDER_INVALID"], ["provider-unavailable", "PS_PROVIDER_UNAVAILABLE"],
   ]) {
     const result = await callTool(artifact, prepareTool, { ...base, side: "BUY", priceLimit: "0.50" }, { fixtures: true, fixtureScenario: scenario });
     if (result.structuredContent.status !== "REJECTED" || result.structuredContent.errorCode !== errorCode
       || !result.structuredContent.reason || "preparedOrder" in result.structuredContent) {
       fail("known preparation failure did not return a distinguishable structured rejection", "preparation_rejection_invalid");
+    }
+  }
+  for (const scenario of ["invalid-timestamp", "future-timestamp", "missing-book-timestamp"]) {
+    const result = await callTool(artifact, prepareTool, { ...base, side: "BUY", priceLimit: "0.50" }, {
+      fixtures: true, fixtureScenario: scenario,
+    });
+    if (result.structuredContent.status !== "PREPARED" || result.structuredContent.preparationFreshness.bookAgeMs !== null) {
+      fail(`${scenario} book timestamp affected preparation instead of remaining informational`, "book_timestamp_invalid");
     }
   }
   const unexpected = await runOperation(artifact, {
@@ -412,8 +473,8 @@ export async function testOfflineArtifact(root = process.cwd()) {
     status: "passed",
     deterministicCases: [
       "BUY FAK preserves exact signed limit, size, precision, and fee-inclusive cap", "lack of visible liquidity does not block bounded FAK preparation", "no ExecutionApproval signature is required", "signed order is accepted for exactly one intercepted CLOB POST", "undocumented 300-second ClobAuth cutoff removed", "undocumented order-timestamp freshness cutoff removed", "SELL FAK preserves exact signed minimum price and size", "market fee descriptor and exact fee calculation",
-      "reject invalid Polymarket order signature", "reject real provider geoblock", "missing CLOB credentials handled", "Deposit Wallet TypedDataSign preparation",
-      "121s book age is informational for preparation", "restricted Gamma metadata omitted and does not reject preparation/submission", "market and quote responses omit removed eligibility metadata", "unsigned book metadata does not change EIP-712 signature validation", "51s quote remains labeled stale", "51s book age alone does not block bounded FAK execution", "ambiguous submission is reconciled once and never reposted", "provider-invalid structured diagnostics", "reject unsafe CLOB salt precision", "reject fee-inclusive cap overrun", "reject wrong outcome asset",
+      "reject invalid Polymarket order signature", "reject real provider geoblock", "missing CLOB credentials handled", "Deposit Wallet TypedDataSign preparation", "local smart-wallet signer recovery is distinct from deferred CLOB acceptance", "Deposit Wallet ERC-7739 order reaches exactly one intercepted CLOB POST without Polygon RPC",
+      "121s book age is informational for preparation", "future, invalid, missing, and stale book timestamps do not block bounded FAK execution", "changed minimum decrease and still-valid tick are accepted", "increased minimum and invalid current tick reject the exact signed order", "zero current minimum is rejected as invalid provider data", "changed risk mode rejects an incompatible exchange domain", "restricted Gamma metadata omitted and does not reject preparation/submission", "market and quote responses omit removed eligibility metadata", "unsigned book metadata does not change EIP-712 signature validation", "51s quote remains labeled stale", "51s book age alone does not block bounded FAK execution", "ambiguous submission is reconciled once and never reposted", "provider-invalid structured diagnostics", "reject unsafe CLOB salt precision", "reject fee-inclusive cap overrun", "reject wrong outcome asset",
       "team-attributed news", "PL/PD/SA/CL fixture mapping", "documented team-form filters with mixed-competition history filtering", "independent Brentford/Liverpool form status",
       "safe team-form HTTP 403 permission and 429 rate-limit diagnostics", "complete and unavailable form handling", "provider failure remains unavailable", "official v2 portfolio rows and cursor pagination completeness", "public portfolio address is not wallet proof", "trade tools registered without submission",
     ],
