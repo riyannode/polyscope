@@ -473,6 +473,23 @@ export async function testOfflineArtifact(root = process.cwd()) {
     || crossSeasonEnrichmentUrl.searchParams.get("date") !== "2026-01-17") {
     fail("API-Football enrichment did not reuse the upstream season spanning a calendar-year boundary", "soccer_provider_invalid");
   }
+  const missingSeason = await callTool(artifact, researchTool, {
+    league: "PL", fixtureId: "1001", date: "2026-10-17", includeApiFootball: true,
+  }, { fixtures: true, fixtureScenario: "api-football-season-missing" });
+  const missingSeasonApi = missingSeason.structuredContent.fixtures[0]?.apiFootball;
+  if (missingSeasonApi?.availability !== "AVAILABLE"
+    || new URL(missingSeasonApi.sourceUrl).searchParams.get("season") !== "2026") {
+    fail("missing upstream season dates did not use the unambiguous competition calendar", "soccer_provider_invalid");
+  }
+  const partialSeason = await callTool(artifact, researchTool, {
+    league: "PL", fixtureId: "1001", date: "2026-01-17", includeApiFootball: true,
+  }, { fixtures: true, fixtureScenario: "api-football-season-partial" });
+  const partialSeasonApi = partialSeason.structuredContent.fixtures[0]?.apiFootball;
+  if (partialSeasonApi?.availability !== "AVAILABLE"
+    || partialSeasonApi.matchIdentity?.providerSeason !== 2025
+    || new URL(partialSeasonApi.sourceUrl).searchParams.get("season") !== "2025") {
+    fail("incomplete upstream season metadata did not use the consistent cross-year calendar season", "soccer_provider_invalid");
+  }
   const quoteToolForAnalysis = tools.find((tool) => tool.name === "get_quote");
   const analysisQuote = await callTool(artifact, quoteToolForAnalysis, { marketId: "1", assetId: "123", side: "BUY", size: "10", depth: 10 }, { fixtures: true });
   const resolutionRules = "The market resolves to the named team winning the scheduled 90 minutes; extra time and penalties do not count.";
@@ -594,8 +611,22 @@ export async function testOfflineArtifact(root = process.cwd()) {
     league: "PL", fixtureId: "1001", date: "2026-10-17", includeApiFootball: true,
   }, { fixtures: true, fixtureScenario: "api-football-season-conflict" });
   if (conflictingSeason.structuredContent.fixtures[0]?.apiFootball?.availability !== "UNAVAILABLE"
-    || !conflictingSeason.structuredContent.fixtures[0]?.apiFootball?.reason?.includes("could not be established safely")) {
+    || !conflictingSeason.structuredContent.fixtures[0]?.apiFootball?.reason?.includes("invalid or conflicting")) {
     fail("conflicting upstream season metadata was guessed for API-Football enrichment", "soccer_provider_invalid");
+  }
+  const invalidSeason = await callTool(artifact, researchTool, {
+    league: "PL", fixtureId: "1001", date: "2026-10-17", includeApiFootball: true,
+  }, { fixtures: true, fixtureScenario: "api-football-season-invalid" });
+  if (invalidSeason.structuredContent.fixtures[0]?.apiFootball?.availability !== "UNAVAILABLE"
+    || !invalidSeason.structuredContent.fixtures[0]?.apiFootball?.reason?.includes("invalid or conflicting")) {
+    fail("invalid upstream season metadata was guessed for API-Football enrichment", "soccer_provider_invalid");
+  }
+  const ambiguousSeason = await callTool(artifact, researchTool, {
+    league: "PL", fixtureId: "1001", date: "2026-06-17", includeApiFootball: true,
+  }, { fixtures: true, fixtureScenario: "api-football-season-ambiguous" });
+  if (ambiguousSeason.structuredContent.fixtures[0]?.apiFootball?.availability !== "UNAVAILABLE"
+    || !ambiguousSeason.structuredContent.fixtures[0]?.apiFootball?.reason?.includes("fixture date is ambiguous")) {
+    fail("ambiguous competition calendar date was guessed for API-Football enrichment", "soccer_provider_invalid");
   }
   const fallbackIdentity = { homeTeam: "Arsenal", awayTeam: "Chelsea", kickoffUtc: "2026-10-17T19:00:00.000Z" };
   for (const [scenario, status] of [["fallback-http-401", 401], ["fallback-http-403", 403], ["fallback-http-429", 429], ["fallback-http-503", 503]]) {

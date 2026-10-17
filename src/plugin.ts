@@ -689,18 +689,21 @@ function providerCompetitionMatches(league: SoccerLeague, providerName: string):
 }
 
 function resolveApiFootballSeason(league: SoccerLeague, date: string, evidence?: { startDate?: string | null; endDate?: string | null }): number | null {
-  if (evidence !== undefined) {
-    const { startDate, endDate } = evidence;
-    return startDate && endDate && validDate(startDate) && validDate(endDate) && startDate <= date && date <= endDate
-      ? Number(startDate.slice(0, 4)) : null;
-  }
   if (!validDate(date)) return null;
   const month = Number(date.slice(5, 7));
   const year = Number(date.slice(0, 4));
   const seasonStartMonth = league === "CL" ? 7 : 8;
-  if (month >= seasonStartMonth) return year;
-  if (month <= 5) return year - 1;
-  return null;
+  const calendarSeason = month >= seasonStartMonth ? year : month <= 5 ? year - 1 : null;
+  const startDate = evidence?.startDate ?? undefined;
+  const endDate = evidence?.endDate ?? undefined;
+  if ((startDate !== undefined && !validDate(startDate)) || (endDate !== undefined && !validDate(endDate))) return null;
+  if (startDate !== undefined && endDate !== undefined) {
+    return startDate <= endDate && startDate <= date && date <= endDate ? Number(startDate.slice(0, 4)) : null;
+  }
+  if (calendarSeason === null) return null;
+  if (startDate !== undefined && (startDate > date || Number(startDate.slice(0, 4)) !== calendarSeason)) return null;
+  if (endDate !== undefined && (date > endDate || Number(endDate.slice(0, 4)) !== calendarSeason + 1)) return null;
+  return calendarSeason;
 }
 
 function apiFootballFixtureUrl(league: SoccerLeague, season: number | null, date: string): string {
@@ -781,7 +784,7 @@ async function getApiFootballEnrichment(fixture: z.infer<typeof soccerFixtureSch
     matchIdentity: null, homeStats: null, awayStats: null,
     sources: [{ provider: "API-Football" as const, purpose: "MATCH_ENRICHMENT" as const, url: fixturesUrl, observedAt, availability: "UNAVAILABLE" as const, reason }],
   });
-  if (season === null) return unavailable("API-Football enrichment was not requested because the competition season could not be established safely from the fixture date and football-data.org season metadata.");
+  if (season === null) return unavailable("API-Football enrichment was not requested because football-data.org season metadata was invalid or conflicting, or the fixture date is ambiguous under the competition calendar.");
   const listing = await getApiFootballJson(fixturesUrl);
   if (!listing.ok) return unavailable(listing.reason);
   const parsedListing = apiFootballFixturesResponseSchema.safeParse(listing.data);

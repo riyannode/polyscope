@@ -139,7 +139,7 @@ globalThis.fetch = async (input, init = {}) => {
     process.exit(91);
   } else if (url.hostname === "v3.football.api-sports.io" && url.pathname === "/fixtures") {
     if (scenario === "no-unneeded-api") process.exit(97);
-    if (scenario === "api-football-season-conflict") process.exit(99);
+    if (["api-football-season-conflict", "api-football-season-invalid", "api-football-season-ambiguous"].includes(scenario)) process.exit(99);
     if (scenario === "api-football-403") return new Response("forbidden", { status: 403 });
     if (scenario === "api-football-204") return new Response(null, { status: 204 });
     if (scenario === "fallback-api-403") return new Response("forbidden", { status: 403 });
@@ -156,7 +156,7 @@ globalThis.fetch = async (input, init = {}) => {
       fixture: { id: 90001, date: `${url.searchParams.get("date")}T19:00:00+00:00` }, league: { id: 39, name: "Premier League", season: 2025 },
       teams: { home: { id: 501, name: "Arsenal FC" }, away: { id: 502, name: "Chelsea" } },
     }] });
-    if (scenario === "api-football-enrichment-cross-season") return Response.json({ errors: [], response: [{
+    if (scenario === "api-football-enrichment-cross-season" || scenario === "api-football-season-partial") return Response.json({ errors: [], response: [{
       fixture: { id: 90012, date: "2026-01-17T19:00:00+00:00" }, league: { id: 39, name: "Premier League", season: 2025 },
       teams: { home: { id: 501, name: "Arsenal FC" }, away: { id: 502, name: "Chelsea" } },
     }] });
@@ -247,9 +247,13 @@ globalThis.fetch = async (input, init = {}) => {
     if (scenario === "fallback-timeout") throw new DOMException("fixture timed out", "TimeoutError");
     const id = Number(url.pathname.split("/").at(-1));
     const league = ({ 1001: "PL", 2001: "PD", 3001: "SA", 4001: "CL" })[id];
-    body = scenario === "api-football-enrichment-cross-season"
-      ? match(id, league, "2026-01-17") : match(id, league, "2026-10-17");
+    body = ["api-football-enrichment-cross-season", "api-football-season-partial"].includes(scenario)
+      ? match(id, league, "2026-01-17") : scenario === "api-football-season-ambiguous" ? match(id, league, "2026-06-17") : match(id, league, "2026-10-17");
     if (scenario === "api-football-season-conflict") body.season = { startDate: "2025-08-01", endDate: "2026-05-31" };
+    if (scenario === "api-football-season-missing") body.season = { startDate: null, endDate: null };
+    if (scenario === "api-football-season-partial") body.season = { startDate: "2025-08-01", endDate: null };
+    if (scenario === "api-football-season-invalid") body.season = { startDate: "not-a-date", endDate: null };
+    if (scenario === "api-football-season-ambiguous") body.season = { startDate: null, endDate: null };
     if (scenario === "api-football-enrichment-cross-season") body.season = { startDate: "2025-08-01", endDate: "2026-05-31" };
   } else if (url.hostname === "api.football-data.org" && url.pathname.startsWith("/v4/teams/")) {
     const teamId = Number(url.pathname.split("/")[3]);
