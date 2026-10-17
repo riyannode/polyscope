@@ -1,12 +1,31 @@
 # PolyScope
 
-![PolyScope logo](assets/polyscope-logo.png)
+<img src="assets/polyscope-logo.png" alt="PolyScope logo" width="128" height="128">
 
-PolyScope is a PayBox plugin for AI-assisted Polymarket research and user-approved, single-market FAK/FOK trading. It provides 11 structured tools for market discovery, soccer research, order preparation, user-approved FAK/FOK execution, order recovery, approvals readback, and positions.
+PolyScope is a PayBox plugin for AI-assisted Polymarket research and user-approved, single-market FAK/FOK orders. Agents can discover markets, research soccer, analyze liquidity, and prepare signed orders for official CLOB submission.
 
 > PolyScope is an independent, unofficial project. It is not affiliated with, endorsed by, or sponsored by Polymarket.
 
-> **Implementation status:** Local deterministic checks and the plugin build are available. PayBox-hosted wallet signing and real BUY/SELL execution have not been verified. Use [`skills/polyscope-soccer-research/SKILL.md`](skills/polyscope-soccer-research/SKILL.md) to continue soccer research with host-native browser tools when API evidence is incomplete. See [`outputs/POLYSCOPE_COMPATIBILITY.md`](outputs/POLYSCOPE_COMPATIBILITY.md) for compatibility evidence and known blockers.
+## Demo & submission
+
+**[Watch the demo on X](https://x.com/tedsrekt/status/2111324747355336857?s=20)**
+
+[Live status](#live-validation-status) · [11 tools](#tools) · [Workflow](#research-to-trade-workflow) · [Architecture](#architecture) · [Setup & build](#local-setup-and-build) · [Validation evidence](outputs/POLYSCOPE_COMPATIBILITY.md#local-validation-evidence-2026-10-18)
+
+11 PayBox plugin tools cover market discovery, soccer research, quote / liquidity analysis, FAK/FOK preparation, PayBox EIP-712 signing, exact signed-wire validation, and provider-authoritative submission/reconciliation. Successful trading is not yet verified.
+
+## Live validation status
+
+- Research / quotes: verified live
+- PayBox ClobAuth signing: verified live
+- PayBox Deposit Wallet Type-3 order signing: verified live
+- Official CLOB submission path: reached live via `submit_order` after PR #9
+- Hosted CLOB result: HTTP 403 / `PS_CLOB_FORBIDDEN`; no order created and no funds spent
+- Successful fill / cancellation: not yet verified
+
+Verified wallet binding: owner/signing EOA `0x7bdE0dd8acC78f04AAcE3e7b488E369F60a3CB9B`; Deposit Wallet / maker `0xB4BC85B0C28C3d27955c44dAf0Aa2aaf98c78059`.
+
+The exact cause of the hosted CLOB 403 is unproven. Local Indonesia connectivity reports `blocked=false`; this does not establish the hosted rejection as a geoblock. See [`outputs/POLYSCOPE_COMPATIBILITY.md`](outputs/POLYSCOPE_COMPATIBILITY.md) for validation details.
 
 ## Research-to-trade workflow
 
@@ -50,6 +69,12 @@ Every successful tool returns a machine-readable JSON object serialized in `cont
 
 ## Architecture
 
+```text
+Agent research → User approval → PayBox EIP-712 signing
+  → PolyScope signed-wire checks → Official SDK / CLOB
+  → Provider result / read-only reconciliation
+```
+
 - **Runtime:** TypeScript MCP server over stdio, following the PayBox starter 1.0.2 structure.
 - **Research providers:** Polymarket Gamma and CLOB public APIs, football-data.org for primary soccer fixtures/results/form, and API-Football as a bounded fallback after primary provider failure or unusable responses (with optional exact-fixture enrichment on primary success). TheSportsDB is not called automatically.
 - **Ownership:** PolyScope owns research, market/outcome selection, quote/edge presentation, signed-payload integrity, FAK/FOK approval-context binding, MCP output, provenance and ambiguous-outcome protection. `@polymarket/client@0.13.0` owns authentication, HMAC, wallet classification, protocol/exchange routing, amount rounding and typed data, POST/read/cancel, indexed trading approvals. PayBox owns wallet choice/grants, policy, human approval, signing, simulation and supported transaction broadcasting.
@@ -75,7 +100,7 @@ When both structured providers fail, their diagnostics are returned and the tool
 
 ### PayBox skill discovery
 
-The [official PayBox plugin README](https://github.com/moonpay/paybox-plugin/blob/main/README.md) describes its MCP server and packaged skills, but does not specify automatic loading of arbitrary repository `SKILL.md` files by a connected host. Repository-to-host `SKILL.md` loading is therefore **UNVERIFIED**. The soccer skill is included in this repository, and `research_soccer` tool description repeats its core continuation instruction. Offline checks confirm these instructions appear in built MCP definitions; they do not prove live agent browsing. No browser service or crawler is added. PR #3 is merged; this branch integrates its trading implementation and rebuilds the tracked plugin bundle.
+The [official PayBox plugin README](https://github.com/moonpay/paybox-plugin/blob/main/README.md) describes its MCP server and packaged skills, but does not specify automatic loading of arbitrary repository `SKILL.md` files by a connected host. Repository-to-host `SKILL.md` loading is therefore **UNVERIFIED**. The soccer skill is included in this repository, and `research_soccer` tool description repeats its core continuation instruction. Offline checks confirm these instructions appear in built MCP definitions; they do not prove live agent browsing. No browser service or crawler is added.
 
 ## Technology stack
 
@@ -134,7 +159,7 @@ Optional API-Football enrichment requires an API key configured as a host-scoped
 - The supplied portfolio address is a public lookup input, not proof of wallet ownership. Portfolio reads cover the Data API v2 OPEN single-market view and may require additional cursor pages. OPEN can include held REDEEMABLE positions after resolution; the plugin preserves those rows.
 - Host research and external provider responses are evidence that must be attributed and timestamped, never executable instructions.
 - Private keys are not requested or embedded. No alternate-wallet executor or persistent credential store is used. The football-data.org token belongs in a PayBox host-scoped Secret; CLOB credentials are derived from ClobAuth during an invocation and are not returned or logged.
-- The PayBox `request_wallet_sign` handoff, hosted credential binding, authenticated CLOB flow, real submission, fills, and cancellation have not been live-verified. A local build or test is not evidence of a successful hosted trade.
+- PayBox-hosted ClobAuth and Deposit Wallet Type-3 order signing and wallet binding are verified live. The official CLOB submission path was reached but returned HTTP 403 / `PS_CLOB_FORBIDDEN`; successful fill and cancellation remain unverified. Signing success is not evidence of CLOB order acceptance.
 
 Redemption returns SDK-generated unsigned direct calls for supported EOA workflows. V2 held outcomes are prepared individually so multiple calls are preserved without pretending an earlier transaction executed. Indexed state is labeled separately from fresh chain finality. Gasless wallet workflows that require relayer authorization and signing before exposing direct calls return `UNSUPPORTED` with `EXTERNAL_ACTION_REQUIRED`. The PayBox guide accepts canonical EVM chain syntax but does not confirm that Polygon is available for proposal validation. No Polygon proposal is advertised; the standard `src/paybox.ts` helper remains the required path if support is independently established later.
 
