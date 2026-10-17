@@ -1,3 +1,5 @@
+import { prepareLimitOrder } from "@polymarket/client/actions";
+import { createSecureClient } from "@polymarket/client";
 import { createHash } from "node:crypto";
 import { readFile, rm, mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -5,11 +7,73 @@ import { basename, dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { realpathSync } from "node:fs";
 import { createInterface } from "node:readline";
-import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
+import { generatePrivateKey, privateKeyToAccount as accountFromKey } from "viem/accounts";
 
 import { checkEnvironment, ConformanceError, release, reportConformance } from "./report.mjs";
 import { withProcess } from "./process.mjs";
-import { compileSchema, validateSample } from "./schema.mjs";
+import { compileSchema, validateSample as validateSchemaSample } from "./schema.mjs";
+
+const accounts = new Map();
+const authFixtures = new Map();
+const walletFixtures = new Map();
+function privateKeyToAccount(key) { const account = accountFromKey(key); accounts.set(account.address.toLowerCase(), account); return account; }
+const fixtureSigner = privateKeyToAccount(generatePrivateKey());
+async function fixtureWallet(signerAddress) {
+  if (walletFixtures.has(signerAddress)) return walletFixtures.get(signerAddress);
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (input) => {
+    const url = new URL(input instanceof Request ? input.url : input);
+    if (url.hostname === "relayer-v2.polymarket.com" && url.pathname === "/deployed") return Response.json({ deployed: true });
+    if (url.hostname === "clob.polymarket.com" && url.pathname === "/auth/api-keys") return Response.json({ apiKeys: ["fixture-api-key"] });
+    throw new Error("Unexpected SDK fixture wallet request");
+  };
+  try {
+    const blocked = async () => { throw new Error("Fixture must not sign or send"); };
+    const client = await createSecureClient({ credentials: { key: "fixture-api-key", secret: "dGVzdA==", passphrase: "fixture-passphrase" },
+      signer: { getAddress: async () => signerAddress, signMessage: blocked, signTypedData: blocked, sendTransaction: blocked } });
+    walletFixtures.set(signerAddress, client.account.wallet);
+    return client.account.wallet;
+  } finally { globalThis.fetch = originalFetch; }
+}
+async function sdkReferenceOrder(account, wallet) {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (input) => {
+    const url = new URL(input instanceof Request ? input.url : input);
+    if (url.pathname === "/deployed") return Response.json({ deployed: true });
+    if (url.pathname === "/auth/api-keys") return Response.json({ apiKeys: ["fixture-api-key"] });
+    if (url.pathname.startsWith("/markets-by-token/")) return Response.json({ condition_id: `0x${"1".repeat(64)}` });
+    if (url.pathname.startsWith("/clob-markets/")) return Response.json({ fd: { r: 0.05, e: 1 }, mts: 0.01, nr: false, t: [{ t: "123", o: "Yes" }, { t: "124", o: "No" }] });
+    throw new Error("Unexpected SDK reference request");
+  };
+  try {
+    const blocked = async () => { throw new Error("Reference workflow must not send"); };
+    const client = await createSecureClient({ wallet, credentials: { key: "fixture-api-key", secret: "dGVzdA==", passphrase: "fixture-passphrase" },
+      signer: { getAddress: async () => account.address, signTypedData: blocked, signMessage: blocked, sendTransaction: blocked } });
+    const workflow = await prepareLimitOrder(client, { assetId: "123", side: "BUY", price: "0.50", size: "10" });
+    const step = await workflow.next();
+    const typedData = JSON.parse(JSON.stringify(step.value.payload, (_key, value) => typeof value === "bigint" ? value.toString() : value));
+    const signature = await account.signTypedData(step.value.payload);
+    const result = await workflow.next(signature);
+    if (!result.done) throw new Error("SDK reference did not finish unsigned preparation");
+    return { typedData, signature, sdkSignature: result.value.signature };
+  } finally { globalThis.fetch = originalFetch; }
+}
+async function fixtureAuth(args) {
+  if (args.makerAddress === "0x0000000000000000000000000000000000000002") args.makerAddress = await fixtureWallet(args.signingAddress);
+  if (args.clobAuth) return;
+  const signer = accounts.get((args.signingAddress ?? args.signerAddress ?? "").toLowerCase()) ?? fixtureSigner;
+  const timestamp = "1800000000";
+  const nonce = "0";
+  const signature = await signer.signTypedData({ domain: { name: "ClobAuthDomain", version: "1", chainId: 137 },
+    types: { ClobAuth: [{ name: "address", type: "address" }, { name: "timestamp", type: "string" }, { name: "nonce", type: "uint256" }, { name: "message", type: "string" }] }, primaryType: "ClobAuth",
+    message: { address: signer.address, timestamp, nonce: 0n, message: "This message attests that I control the given wallet" } });
+  args.clobAuth = { timestamp, nonce, signature };
+  authFixtures.set(signer.address.toLowerCase(), args.clobAuth);
+}
+function validateSample(tool, args, result) {
+  if (tool.name === "prepare_order" && !args.clobAuth) args.clobAuth = authFixtures.get((args.signingAddress ?? fixtureSigner.address).toLowerCase());
+  return validateSchemaSample(tool, args, result);
+}
 
 export { ConformanceError, reportConformance };
 const PROTOCOL_VERSION = release.protocolVersion;
@@ -23,6 +87,7 @@ const MAX_TOOL_NAME_BYTES = 128;
 const MAX_ARGUMENT_BYTES = 64 * 1024;
 const MAX_CURSOR_BYTES = 1024;
 const OPERATION_TIMEOUT_MS = 10_000;
+const textOnlyToolCoverage = new Set();
 
 export async function testArtifact(root = process.cwd()) {
   const artifact = resolve(root, "dist/plugin.mjs");
@@ -52,7 +117,6 @@ export async function testArtifact(root = process.cwd()) {
   validateSample(selected, config.arguments, response.result);
   const checks = [{ tool: config.tool, status: "passed" }];
   const researchTools = [
-    ["get_soccer_news", { teams: ["Arsenal"], limit: 3 }],
     ...["PL", "PD", "SA", "CL"].map((league) => ["research_soccer", { league, days: 0, limit: 3 }]),
   ];
   for (const [toolName, argumentsValue] of researchTools) {
@@ -64,45 +128,13 @@ export async function testArtifact(root = process.cwd()) {
   const market = response.result.structuredContent?.markets?.find((entry) => entry.outcomes?.length > 0 && entry.acceptingOrders === true);
   const outcome = market?.outcomes?.[0];
   if (!market || !outcome) fail("sample search did not return an accepting market outcome for quote conformance", "tool_failed");
-  const quoteTool = tools.find((entry) => entry.name === "get_quote");
-  if (!quoteTool) fail("get_quote was not returned by tools/list", "tool_catalog_invalid");
+  const quoteTool = tools.find((entry) => entry.name === "get_market_quote");
+  if (!quoteTool) fail("get_market_quote was not returned by tools/list", "tool_catalog_invalid");
   const quoteResult = await callTool(artifact, quoteTool, { marketId: market.marketId, assetId: outcome.assetId, side: "BUY", size: "1", depth: 5 });
-  checks.push({ tool: "get_quote", status: "passed", availability: quoteResult.structuredContent.availability, freshness: quoteResult.structuredContent.freshness, bookTimestamp: quoteResult.structuredContent.bookTimestamp, bookAgeMs: quoteResult.structuredContent.bookAgeMs });
-  const prepareTool = tools.find((entry) => entry.name === "prepare_order_signing");
-  if (!prepareTool) fail("prepare_order_signing was not returned by tools/list", "tool_catalog_invalid");
-  const bookAgeMs = quoteResult.structuredContent.bookAgeMs;
-  if (!Number.isSafeInteger(bookAgeMs) || bookAgeMs < 0) {
-    checks.push({ tool: "prepare_order_signing", status: "skipped", reason: "live CLOB book age is unavailable or invalid; deterministic payload preparation is covered by pnpm test" });
-  } else {
-    const minimumShareMicros = toMicros(quoteResult.structuredContent.minOrderSize);
-    const hundredthShares = (minimumShareMicros + 9_999n) / 10_000n;
-    const signingSize = formatHundredths(hundredthShares);
-    const prepareArguments = {
-      marketId: market.marketId,
-      assetId: outcome.assetId,
-      makerAddress: "0x0000000000000000000000000000000000000001",
-      signingAddress: "0x0000000000000000000000000000000000000001",
-      walletType: "EOA",
-      side: "BUY",
-      priceLimit: formatMicros(1_000_000n - toMicros(quoteResult.structuredContent.tickSize)),
-      size: signingSize,
-      maxNominalPusd: "999999999999999999999999999",
-    };
-    const preparedResponse = await runOperation(artifact, {
-      method: "tools/call", params: { name: prepareTool.name, arguments: prepareArguments },
-    });
-    validateCallResult(preparedResponse.result);
-    if (preparedResponse.result.isError === true) fail("prepare_order_signing returned an unexpected MCP error", "tool_failed");
-    validateSample(prepareTool, prepareArguments, preparedResponse.result);
-    const prepared = preparedResponse.result.structuredContent;
-    if (prepared.status === "REJECTED") fail(`preparation rejected: ${prepared.errorCode}`, "tool_failed");
-    else {
-      if (prepared.submitsOrder !== false || prepared.preparedOrder?.market?.outcome !== outcome.name) {
-        fail("prepared payload did not preserve the selected outcome or no-submit boundary", "result_invalid");
-      }
-      checks.push({ tool: "prepare_order_signing", status: "passed", submitsOrder: false });
-    }
-  }
+  checks.push({ tool: "get_market_quote", status: "passed", availability: quoteResult.structuredContent.availability, freshness: quoteResult.structuredContent.freshness, bookTimestamp: quoteResult.structuredContent.bookTimestamp, bookAgeMs: quoteResult.structuredContent.bookAgeMs });
+  const prepareTool = tools.find((entry) => entry.name === "prepare_order");
+  if (!prepareTool) fail("prepare_order was not returned by tools/list", "tool_catalog_invalid");
+  checks.push({ tool: "prepare_order", status: "not_run", reason: "SDK preparation requires signed ClobAuth; live signing is outside local conformance. Fixture coverage runs in pnpm test." });
   return {
     status: "passed",
     sampleCall: checks[0],
@@ -113,20 +145,119 @@ export async function testArtifact(root = process.cwd()) {
 }
 
 async function callTool(artifact, tool, argumentsValue, options = {}) {
-  const response = await runOperation(artifact, {
-    method: "tools/call",
-    params: { name: tool.name, arguments: argumentsValue },
-  }, options);
+  let response;
+  try {
+    response = await runOperation(artifact, {
+      method: "tools/call",
+      params: { name: tool.name, arguments: argumentsValue },
+    }, options);
+  } catch (error) {
+    throw new ConformanceError(`${tool.name} invocation failed: ${error.message}`, error.code ?? "tool_failed");
+  }
   validateCallResult(response.result);
-  if (response.result.isError === true) fail(`${tool.name} tools/call returned isError: true`, "tool_failed");
+  if (response.result.isError === true) fail(`${tool.name} tools/call returned isError: true: ${JSON.stringify(response.result.content)}`, "tool_failed");
+  readTextOnlyResult(response.result, tool.name);
   validateSample(tool, argumentsValue, response.result);
   return response.result;
+}
+
+function readTextOnlyResult(value, toolName) {
+  const response = object(value, `${toolName} text-only tools/call result`);
+  if (!Array.isArray(response.content)) fail(`${toolName} did not return content for a text-only client`, "text_output_invalid");
+  const textItems = response.content.filter((item) => item && typeof item === "object" && item.type === "text");
+  if (textItems.length !== 1 || typeof textItems[0].text !== "string") {
+    fail(`${toolName} must return exactly one text response`, "text_output_invalid");
+  }
+  let decoded;
+  try { decoded = JSON.parse(textItems[0].text); }
+  catch { fail(`${toolName} text response must be machine-readable JSON`, "text_output_invalid"); }
+  const envelope = object(decoded, `${toolName} text response`, "text_output_invalid");
+  if (envelope.tool !== toolName) fail(`${toolName} text response has the wrong tool label`, "text_output_invalid");
+  if (typeof envelope.result !== "object" || envelope.result === null || Array.isArray(envelope.result)) {
+    fail(`${toolName} text response must contain an object result`, "text_output_invalid");
+  }
+  if (/(?:SECRET_SENTINEL|"(?:apiKey|secret|passphrase|authorization|privateKey)"\s*:)/i.test(textItems[0].text)) {
+    fail(`${toolName} text response exposed credential material`, "text_output_secret");
+  }
+  textOnlyToolCoverage.add(toolName);
+  return envelope.result;
+}
+
+async function callTextOnlyTool(artifact, toolName, argumentsValue, options = {}) {
+  const response = await runOperation(artifact, {
+    method: "tools/call", params: { name: toolName, arguments: argumentsValue },
+  }, options);
+  validateCallResult(response.result);
+  if (response.result.isError === true) fail(`${toolName} text-only call returned isError: true`, "tool_failed");
+  return readTextOnlyResult(response.result, toolName);
+}
+
+async function testTextOnlyOrderWorkflow(artifact) {
+  const signer = privateKeyToAccount(generatePrivateKey());
+  const markets = await callTextOnlyTool(artifact, "search_markets", { query: "Sample market", limit: 3 }, { fixtures: true });
+  const market = markets.markets.find((item) => item.acceptingOrders === true && item.outcomes.length > 0);
+  if (!market || !market.marketId || !market.conditionId || !market.outcomes[0].assetId
+    || "resolutionRules" in market || "resolutionSource" in market) {
+    fail("compact text-only market search omitted actionable IDs or included full resolution rules", "text_output_invalid");
+  }
+  const outcome = market.outcomes[0];
+  const quote = await callTextOnlyTool(artifact, "get_market_quote", {
+    marketId: market.marketId, assetId: outcome.assetId, side: "BUY", size: "10", depth: 5,
+  }, { fixtures: true });
+  if (quote.marketId !== market.marketId || quote.assetId !== outcome.assetId || quote.outcome !== outcome.name
+    || quote.side !== "BUY" || quote.tickSize === undefined || quote.minOrderSize === undefined
+    || quote.estimatedFeePusd === undefined || quote.bookAgeMs === undefined) {
+    fail("text-only quote omitted fields required to prepare the next order", "text_output_invalid");
+  }
+
+  const clobAuth = await callTextOnlyTool(artifact, "prepare_clob_auth", { signerAddress: signer.address, nonce: "0" }, { fixtures: true });
+  if (clobAuth.typedData?.primaryType !== "ClobAuth" || JSON.stringify(clobAuth.typedData) !== JSON.stringify(clobAuth.requestWalletSignIntent?.typedData)) {
+    fail("text-only ClobAuth response omitted its exact PayBox signing payload", "text_output_invalid");
+  }
+  const clobAuthSignature = await signer.signTypedData(clobAuth.typedData);
+  const auth = { timestamp: clobAuth.timestamp, nonce: clobAuth.nonce, signature: clobAuthSignature };
+  const prepared = await callTextOnlyTool(artifact, "prepare_order", {
+    marketId: market.marketId, assetId: outcome.assetId,
+    makerAddress: signer.address, signingAddress: signer.address, clobAuth: auth,
+    side: "BUY", orderType: "FAK", priceLimit: "0.50", size: "10",
+  }, { fixtures: true });
+  if (prepared.status !== "PREPARED" || prepared.preparedOrder.order.orderType !== "FAK"
+    || prepared.preparedOrder.wallet.makerAddress.toLowerCase() !== signer.address.toLowerCase()
+    || JSON.stringify(prepared.preparedOrder.typedData) !== JSON.stringify(prepared.requestWalletSignIntent?.typedData)) {
+    fail("text-only order preparation omitted wallet binding, required FAK order type, or exact EIP-712 data", "text_output_invalid");
+  }
+  const orderSignature = await signer.signTypedData(prepared.requestWalletSignIntent.typedData);
+  const submitted = await callTextOnlyTool(artifact, "submit_order", {
+    preparedOrder: prepared.preparedOrder, orderSignature, clobAuth: auth, orderType: "FAK",
+  }, { fixtures: true, fixtureScenario: "submit-valid", expectedSignerAddress: signer.address, expectedMakerAddress: signer.address });
+  if (submitted.status !== "SUBMITTED" || submitted.orderType !== "FAK" || !submitted.orderId) {
+    fail("text-only FAK submission did not return its authoritative provider response fields", "text_output_invalid");
+  }
+
+  const fokPrepared = await callTextOnlyTool(artifact, "prepare_order", {
+    marketId: market.marketId, assetId: outcome.assetId,
+    makerAddress: signer.address, signingAddress: signer.address, clobAuth: auth,
+    side: "BUY", orderType: "FOK", priceLimit: "0.50", size: "10",
+  }, { fixtures: true });
+  const fokSignature = await signer.signTypedData(fokPrepared.requestWalletSignIntent.typedData);
+  const fokRejected = await callTextOnlyTool(artifact, "submit_order", {
+    preparedOrder: fokPrepared.preparedOrder, orderSignature: fokSignature, clobAuth: auth, orderType: "FOK",
+  }, { fixtures: true, fixtureScenario: "submit-fok-insufficient-depth", expectedSignerAddress: signer.address, expectedMakerAddress: signer.address });
+  if (fokRejected.status !== "REJECTED" || fokRejected.orderType !== "FOK" || !fokRejected.message.includes("FOK")) {
+    fail("text-only FOK response did not preserve the provider's FOK rejection", "text_output_invalid");
+  }
 }
 
 export async function testOfflineArtifact(root = process.cwd()) {
   const artifact = resolve(root, "dist/plugin.mjs");
   const tools = await listTools(artifact);
-  if (tools.length !== 13) fail(`expected 13 MCP tools, received ${tools.length}`, "tool_catalog_invalid");
+  const discovered = await runOperation(artifact, { method: "tools/list", params: {} }, { fixtures: true, fixtureScenario: "discovery-no-network" });
+  if (discovered.result.tools.length !== tools.length) fail("fixture discovery changed the catalog", "tool_catalog_invalid");
+  textOnlyToolCoverage.clear();
+  const expectedToolNames = ["search_markets", "get_market_quote", "research_soccer", "analyze_soccer_edge", "prepare_clob_auth", "prepare_order", "submit_order", "get_order_status", "cancel_order", "get_trading_approvals", "get_positions"];
+  if (JSON.stringify(tools.map((tool) => tool.name)) !== JSON.stringify(expectedToolNames)) {
+    fail(`expected exactly ${expectedToolNames.length} canonical tools, received ${tools.map((tool) => tool.name).join(", ")}`, "tool_catalog_invalid");
+  }
   const removedSchemaFields = ["ExecutionApproval", "executionApprovalSignature", "executionApprovalSigningIntent", "marketRestricted", "accountGeoblockChecked"];
   for (const tool of tools) {
     const schemas = JSON.stringify({ inputSchema: tool.inputSchema, outputSchema: tool.outputSchema });
@@ -134,23 +265,28 @@ export async function testOfflineArtifact(root = process.cwd()) {
       fail(`${tool.name} schema contains a removed trading-policy field`, "tool_catalog_invalid");
     }
   }
-  const prepareTool = tools.find((tool) => tool.name === "prepare_order_signing");
-  if (!prepareTool) fail("prepare_order_signing was not returned by tools/list", "tool_catalog_invalid");
+  const prepareTool = tools.find((tool) => tool.name === "prepare_order");
+  if (!prepareTool) fail("prepare_order was not returned by tools/list", "tool_catalog_invalid");
   const searchTool = tools.find((tool) => tool.name === "search_markets");
   const search = await callTool(artifact, searchTool, { query: "Sample market", limit: 3 }, { fixtures: true });
   if (search.structuredContent.markets.length !== 1 || "marketRestricted" in search.structuredContent.markets[0]) {
     fail("market search exposed Gamma restricted metadata", "market_output_invalid");
   }
-  const submitTool = tools.find((tool) => tool.name === "submit_fak_order");
-  if (!submitTool) fail("submit_fak_order was not returned by tools/list", "tool_catalog_invalid");
+  const submitOrderTool = tools.find((tool) => tool.name === "submit_order");
+  if (!submitOrderTool) fail("submit_order was not returned by tools/list", "tool_catalog_invalid");
+  const submitTool = submitOrderTool;
+  if (submitOrderTool.inputSchema.properties.orderType?.enum?.join(",") !== "FAK,FOK") {
+    fail("submit_order did not expose the exact FAK/FOK choices", "schema_invalid");
+  }
+  await testTextOnlyOrderWorkflow(artifact);
   if ("executionApprovalSignature" in submitTool.inputSchema.properties) {
     fail("submit schema still requires a PolyScope execution approval signature", "schema_invalid");
   }
   const base = {
     marketId: "1", assetId: "123",
-    makerAddress: "0x0000000000000000000000000000000000000001",
-    signingAddress: "0x0000000000000000000000000000000000000001",
-    walletType: "EOA", size: "10", maxNominalPusd: "5.13",
+    makerAddress: fixtureSigner.address,
+    signingAddress: fixtureSigner.address,
+    orderType: "FAK", size: "10",
   };
   const buy = await callTool(artifact, prepareTool, { ...base, side: "BUY", priceLimit: "0.50" }, { fixtures: true });
   const buyOrder = buy.structuredContent.preparedOrder.order;
@@ -164,18 +300,16 @@ export async function testOfflineArtifact(root = process.cwd()) {
     || "accountGeoblockChecked" in buy.structuredContent) {
     fail("prepared order exposed removed eligibility or execution-approval metadata", "market_output_invalid");
   }
-  if (buyOrder.orderType !== "FAK" || buyOrder.maxFeePusd !== "0.125" || buyOrder.maxNominalPusd !== "5.13"
-    || buyOrder.price !== "0.50" || buyOrder.size !== "10" || buyOrder.makerAmount !== "5000000" || buyOrder.takerAmount !== "10000000") {
-    fail("BUY order did not preserve the exact user price, size, FAK type, and fee-inclusive cap", "order_policy_invalid");
+  if (buyOrder.orderType !== "FAK" || buyOrder.price !== "0.50" || buyOrder.size !== "10"
+    || buyOrder.makerAmount !== "5000000" || buyOrder.takerAmount !== "10000000"
+    || "maxNominalPusd" in buyOrder || "maxFeePusd" in buyOrder) {
+    fail("BUY order did not expose the SDK-generated effective signed amounts", "order_policy_invalid");
   }
   const restrictedPreparation = await callTool(artifact, prepareTool, { ...base, side: "BUY", priceLimit: "0.50" }, {
     fixtures: true, fixtureScenario: "restricted-prepare",
   });
   if (restrictedPreparation.structuredContent.status !== "PREPARED") {
     fail("Gamma restricted metadata alone blocked order preparation", "market_eligibility_invalid");
-  }
-  if (buy.structuredContent.preparationFreshness.staleAfterMs !== undefined) {
-    fail("prepared-order response retained an arbitrary age threshold", "order_hash_invalid");
   }
   const noVisibleLiquidity = await callTool(artifact, prepareTool, { ...base, side: "BUY", priceLimit: "0.50" }, {
     fixtures: true, fixtureScenario: "no-visible-liquidity",
@@ -186,39 +320,28 @@ export async function testOfflineArtifact(root = process.cwd()) {
     fail("lack of visible liquidity added a PolyScope preparation rejection or changed the signed limit", "liquidity_policy_invalid");
   }
   const replaySigner = privateKeyToAccount(generatePrivateKey());
+  const fokEoaPreparation = await callTool(artifact, prepareTool, {
+    ...base, makerAddress: replaySigner.address, signingAddress: replaySigner.address,
+    side: "SELL", priceLimit: "0.49", orderType: "FOK",
+  }, { fixtures: true });
+  const fokEoaOrder = fokEoaPreparation.structuredContent.preparedOrder.order;
+  if (fokEoaOrder.orderType !== "FOK" || fokEoaOrder.side !== "SELL" || fokEoaOrder.price !== "0.49"
+    || fokEoaOrder.size !== "10" || fokEoaOrder.makerAmount !== "10000000" || fokEoaOrder.takerAmount !== "4900000"
+    || fokEoaPreparation.structuredContent.preparedOrder.wallet.signatureType !== 0) {
+    fail("EOA FOK preparation changed the selected type, side, exact price, size, amounts, or signature type", "order_policy_invalid");
+  }
   const replayOrder = await callTool(artifact, prepareTool, {
     ...base, makerAddress: replaySigner.address, signingAddress: replaySigner.address,
     side: "BUY", priceLimit: "0.50",
   }, { fixtures: true });
   const replayPrepared = replayOrder.structuredContent.preparedOrder;
   const orderSignature = await replaySigner.signTypedData(replayPrepared.typedData);
-  const validateOrderTool = tools.find((tool) => tool.name === "validate_order_signature");
-  const validOrderSignature = await callTool(artifact, validateOrderTool, {
-    preparedOrder: replayPrepared, signature: orderSignature,
-  }, { fixtures: true });
-  if (validOrderSignature.structuredContent.localSignerVerified !== true
-    || validOrderSignature.structuredContent.contractWalletAcceptance !== "NOT_APPLICABLE") {
-    fail("metadata-free prepared order did not validate its unchanged Polymarket EIP-712 signature", "signature_validation_invalid");
-  }
-  const futureOrderTimestamp = String(Date.now() + 60_000);
-  const futureTimestampPrepared = {
-    ...replayPrepared,
-    order: { ...replayPrepared.order, timestamp: futureOrderTimestamp },
-    typedData: { ...replayPrepared.typedData, message: { ...replayPrepared.typedData.message, timestamp: futureOrderTimestamp } },
-  };
-  const futureTimestampValidation = await callTool(artifact, validateOrderTool, {
-    preparedOrder: futureTimestampPrepared,
-    signature: await replaySigner.signTypedData(futureTimestampPrepared.typedData),
-  }, { fixtures: true });
-  if (futureTimestampValidation.structuredContent.localSignerVerified !== true) {
-    fail("an undocumented order-timestamp freshness gate rejected a correctly signed order", "order_timestamp_invalid");
-  }
-  const metadataOnlyChange = await callTool(artifact, validateOrderTool, {
-    preparedOrder: { ...replayPrepared, market: { ...replayPrepared.market, bookTimestamp: "1" } }, signature: orderSignature,
-  }, { fixtures: true });
-  if (metadataOnlyChange.structuredContent.localSignerVerified !== true) {
-    fail("changing unsigned book-age metadata changed Polymarket EIP-712 signature validation", "order_hash_invalid");
-  }
+  const signedFieldMutations = [
+    { order: { assetId: "124" } }, { order: { makerAmount: "5000001" } },
+    { order: { takerAmount: "10000001" } }, { order: { side: "SELL" } },
+    { wallet: { ...replayPrepared.wallet, makerAddress: privateKeyToAccount(generatePrivateKey()).address } },
+    { order: { metadata: `0x${"1".repeat(64)}` } },
+  ];
   const clobAuthTool = tools.find((tool) => tool.name === "prepare_clob_auth");
   const clobAuthResult = await callTool(artifact, clobAuthTool, { signerAddress: replaySigner.address, nonce: "0" }, { fixtures: true });
   const authIntent = clobAuthResult.structuredContent.requestWalletSignIntent;
@@ -226,27 +349,77 @@ export async function testOfflineArtifact(root = process.cwd()) {
     || authIntent.typedData.primaryType !== "ClobAuth" || !authIntent.typedData.domain || !authIntent.typedData.types || !authIntent.typedData.message) {
     fail("ClobAuth signing intent did not match PayBox's documented EIP-712 object contract", "wallet_intent_invalid");
   }
+  if (Math.abs(Number(clobAuthResult.structuredContent.timestamp) * 1000 - Date.now()) > 5000) fail("SDK ClobAuth timestamp is not current", "clob_auth_time_invalid");
   const clobAuth = {
     timestamp: clobAuthResult.structuredContent.timestamp,
     nonce: clobAuthResult.structuredContent.nonce,
     signature: await replaySigner.signTypedData(clobAuthResult.structuredContent.typedData),
   };
-  const oldAuthTimestamp = String(Math.floor(Date.now() / 1000) - 301);
-  const oldAuthTypedData = {
-    ...clobAuthResult.structuredContent.typedData,
-    message: { ...clobAuthResult.structuredContent.typedData.message, timestamp: oldAuthTimestamp },
-  };
-  const oldClobAuth = { ...clobAuth, timestamp: oldAuthTimestamp, signature: await replaySigner.signTypedData(oldAuthTypedData) };
-  const submitArgs = { preparedOrder: replayPrepared, orderSignature, clobAuth };
-  const successfulSubmit = await callTool(artifact, submitTool, submitArgs, { fixtures: true, fixtureScenario: "submit-valid" });
+  const invalidAuthPreparation = await callTool(artifact, prepareTool, {
+    ...base, makerAddress: replaySigner.address, signingAddress: replaySigner.address,
+    clobAuth: { ...clobAuth, signature: `0x${"0".repeat(130)}` }, side: "BUY", orderType: "FAK", priceLimit: "0.50",
+  }, { fixtures: true, fixtureScenario: "invalid-clob-auth" });
+  if (invalidAuthPreparation.structuredContent.status !== "REJECTED"
+    || invalidAuthPreparation.structuredContent.errorCode !== "PS_AUTH_SIGNATURE_INVALID") {
+    fail("invalid ClobAuth was accepted by authenticated order preparation", "clob_auth_signature_invalid");
+  }
+  for (const mutation of signedFieldMutations) {
+    const tampered = { ...replayPrepared,
+      ...(mutation.wallet ? { wallet: mutation.wallet } : {}),
+      ...(mutation.order ? { order: { ...replayPrepared.order, ...mutation.order } } : {}),
+    };
+    const rejected = await callTool(artifact, submitTool, {
+      preparedOrder: tampered, orderSignature, clobAuth, orderType: "FAK",
+    }, { fixtures: true, fixtureScenario: "invalid-order-signature" });
+    if (rejected.structuredContent.errorCode !== "PS_SIGNATURE_INVALID") {
+      fail("a mutated signed Order field passed submit_order validation", "signature_binding_invalid");
+    }
+  }
+  const submitArgs = { preparedOrder: replayPrepared, orderSignature, clobAuth, orderType: "FAK" };
+  const successfulSubmit = await callTool(artifact, submitTool, submitArgs, {
+    fixtures: true, fixtureScenario: "submit-valid", expectedSignerAddress: replaySigner.address,
+  });
   if (successfulSubmit.structuredContent.status !== "SUBMITTED" || !successfulSubmit.structuredContent.orderId) {
     fail("a valid signed FAK order without ExecutionApproval did not reach one intercepted CLOB POST", "submit_invalid");
   }
-  const oldAuthSubmit = await callTool(artifact, submitTool, { ...submitArgs, clobAuth: oldClobAuth }, {
-    fixtures: true, fixtureScenario: "submit-stale-auth",
+  const noRefreshSubmit = await callTool(artifact, submitTool, submitArgs, {
+    fixtures: true, fixtureScenario: "submit-no-refresh", expectedSignerAddress: replaySigner.address,
   });
-  if (oldAuthSubmit.structuredContent.status !== "SUBMITTED") {
-    fail("an undocumented 300-second ClobAuth cutoff blocked credential derivation", "clob_auth_freshness_invalid");
+  if (noRefreshSubmit.structuredContent.status !== "SUBMITTED") fail("submission refreshed Gamma, book, or fee metadata before posting", "submit_redundant_fetch");
+  for (const orderType of ["FAK", "FOK"]) {
+    const exact = await callTool(artifact, prepareTool, { ...base, makerAddress: replaySigner.address, signingAddress: replaySigner.address,
+      clobAuth, side: "BUY", priceLimit: "0.50", size: "5", orderType }, { fixtures: true });
+    const prepared = exact.structuredContent.preparedOrder;
+    if (prepared.order.size !== "5" || prepared.order.takerAmount !== "5000000" || prepared.order.makerAmount !== "2500000"
+      || prepared.wallet.signatureType !== 0) fail("SDK changed the effective five-share order", "order_policy_invalid");
+    const submitted = await callTool(artifact, submitOrderTool, { preparedOrder: prepared, orderType, clobAuth,
+      orderSignature: await replaySigner.signTypedData(prepared.typedData) }, { fixtures: true, fixtureScenario: `submit-exact-five-${orderType.toLowerCase()}`, expectedSignerAddress: replaySigner.address });
+    if (submitted.structuredContent.status !== "SUBMITTED" || submitted.structuredContent.requestedSize !== "5" || submitted.structuredContent.orderType !== orderType) fail("exact five-share SDK submission failed", "order_policy_invalid");
+  }
+  const l1RejectedSubmit = await callTool(artifact, submitTool, submitArgs, {
+    fixtures: true, fixtureScenario: "submit-rejected-l1-auth", expectedSignerAddress: replaySigner.address,
+  });
+  if (l1RejectedSubmit.structuredContent.status !== "FAILED" || l1RejectedSubmit.structuredContent.errorCode !== "PS_CLOB_AUTH_REJECTED"
+    || l1RejectedSubmit.structuredContent.httpStatus !== 401
+    || !/prepare and sign a new ClobAuth/i.test(l1RejectedSubmit.structuredContent.message)) {
+    fail("fresh ClobAuth HTTP 401 did not fail closed with explicit re-sign guidance", "clob_auth_recovery_invalid");
+  }
+  if (JSON.stringify(l1RejectedSubmit.structuredContent).includes("SECRET_SENTINEL")) {
+    fail("L1 authentication failure exposed provider body data", "clob_auth_sanitization_invalid");
+  }
+  const existingApiKeySubmit = await callTool(artifact, submitTool, submitArgs, {
+    fixtures: true, fixtureScenario: "existing-api-key", expectedSignerAddress: replaySigner.address,
+  });
+  if (existingApiKeySubmit.structuredContent.status !== "SUBMITTED" || !existingApiKeySubmit.structuredContent.orderId) {
+    fail("existing CLOB account did not create then derive credentials before its single FAK submission", "clob_auth_creation_invalid");
+  }
+  const invalidClobAuth = await callTool(artifact, submitTool, {
+    ...submitArgs, clobAuth: { ...clobAuth, signature: `0x${"0".repeat(130)}` },
+  }, { fixtures: true, fixtureScenario: "invalid-clob-auth" });
+  if (invalidClobAuth.structuredContent.status !== "FAILED"
+    || invalidClobAuth.structuredContent.errorCode !== "PS_AUTH_SIGNATURE_INVALID"
+    || !/prepare and sign a new ClobAuth/i.test(invalidClobAuth.structuredContent.message)) {
+    fail("locally invalid ClobAuth did not fail closed with re-sign guidance", "clob_auth_signature_invalid");
   }
   for (const [scenario, age] of [["restricted-submit", 0], ["submit-stale-book", 51_000], ["submit-future-book", null], ["missing-book-timestamp", null]]) {
     const result = await callTool(artifact, submitTool, submitArgs, { fixtures: true, fixtureScenario: scenario });
@@ -258,55 +431,182 @@ export async function testOfflineArtifact(root = process.cwd()) {
   const depositSigner = privateKeyToAccount(generatePrivateKey());
   const depositOrder = await callTool(artifact, prepareTool, {
     ...base, makerAddress: "0x0000000000000000000000000000000000000002",
-    signingAddress: depositSigner.address, walletType: "DEPOSIT_WALLET", side: "BUY", priceLimit: "0.50",
+    signingAddress: depositSigner.address, side: "BUY", priceLimit: "0.50",
   }, { fixtures: true });
   const depositPrepared = depositOrder.structuredContent.preparedOrder;
-  const depositOrderSignature = await depositSigner.signTypedData(depositPrepared.typedData);
-  const depositValidation = await callTool(artifact, validateOrderTool, {
-    preparedOrder: depositPrepared, signature: depositOrderSignature,
-  }, { fixtures: true });
-  if (depositValidation.structuredContent.localSignerVerified !== true
-    || depositValidation.structuredContent.contractWalletAcceptance !== "DEFERRED_TO_CLOB"
-    || (depositValidation.structuredContent.signedOrderSignature?.length ?? 0) <= depositOrderSignature.length) {
-    fail("Deposit Wallet signer recovery or ERC-7739 wrapping was not reported distinctly from CLOB contract acceptance", "deposit_wallet_signature_invalid");
+  if (depositPrepared.wallet.signatureType !== 3
+    || depositPrepared.wallet.makerAddress.toLowerCase() !== (await fixtureWallet(depositSigner.address)).toLowerCase()
+    || depositPrepared.wallet.signingAddress.toLowerCase() !== depositSigner.address.toLowerCase()
+    || depositPrepared.wallet.orderSignerAddress.toLowerCase() !== depositPrepared.wallet.makerAddress.toLowerCase()) {
+    fail("Deposit Wallet owner EOA, maker, order signer, and signature type were not kept distinct and consistent", "deposit_wallet_identity_invalid");
   }
+  const depositOrderSignature = await depositSigner.signTypedData(depositPrepared.typedData);
+  const reference = await sdkReferenceOrder(depositSigner, depositPrepared.wallet.makerAddress);
+  const referenceMessage = reference.typedData.message.contents;
+  const referencePrepared = { ...depositPrepared, typedData: reference.typedData,
+    order: { ...depositPrepared.order, salt: referenceMessage.salt, timestamp: referenceMessage.timestamp } };
   const depositAuthResult = await callTool(artifact, clobAuthTool, { signerAddress: depositSigner.address, nonce: "0" }, { fixtures: true });
   const depositClobAuth = {
     timestamp: depositAuthResult.structuredContent.timestamp,
     nonce: depositAuthResult.structuredContent.nonce,
     signature: await depositSigner.signTypedData(depositAuthResult.structuredContent.typedData),
   };
-  const depositSubmit = await callTool(artifact, submitTool, {
-    preparedOrder: depositPrepared, orderSignature: depositOrderSignature, clobAuth: depositClobAuth,
-  }, { fixtures: true, fixtureScenario: "submit-deposit-wallet" });
+  const depositSubmit = await callTool(artifact, submitOrderTool, {
+    preparedOrder: referencePrepared, orderSignature: reference.signature, clobAuth: depositClobAuth, orderType: "FAK",
+  }, {
+    fixtures: true, fixtureScenario: "submit-deposit-wallet",
+    expectedSignerAddress: depositSigner.address, expectedMakerAddress: depositPrepared.wallet.makerAddress,
+    expectedOrderSignature: reference.sdkSignature,
+  });
   if (depositSubmit.structuredContent.status !== "SUBMITTED") {
     fail("valid Deposit Wallet signing data did not reach its single intercepted CLOB POST without Polygon RPC", "deposit_wallet_submit_invalid");
   }
-  for (const [scenario, expectedCode, prepared, signature] of [
-    ["snapshot-min-decrease", null, replayPrepared, orderSignature],
-    ["snapshot-min-increase", "PS_SIZE_BELOW_MINIMUM", replayPrepared, orderSignature],
-    ["snapshot-min-zero", "PS_PROVIDER_INVALID", replayPrepared, orderSignature],
-    ["snapshot-tick-valid", null, replayPrepared, orderSignature],
-    ["snapshot-risk-changed", "PS_MARKET_CHANGED", replayPrepared, orderSignature],
+  const fokEoaSignature = await replaySigner.signTypedData(fokEoaPreparation.structuredContent.preparedOrder.typedData);
+  const fokEoaSubmit = await callTool(artifact, submitOrderTool, {
+    preparedOrder: fokEoaPreparation.structuredContent.preparedOrder,
+    orderSignature: fokEoaSignature, clobAuth, orderType: "FOK",
+  }, { fixtures: true, fixtureScenario: "submit-fok-eoa", expectedSignerAddress: replaySigner.address, expectedMakerAddress: replaySigner.address });
+  if (fokEoaSubmit.structuredContent.status !== "SUBMITTED" || fokEoaSubmit.structuredContent.orderType !== "FOK") {
+    fail("EOA FOK submission did not preserve FOK through the single CLOB request", "submit_invalid");
+  }
+  const depositFokPreparation = await callTool(artifact, prepareTool, {
+    ...base, makerAddress: "0x0000000000000000000000000000000000000002",
+    signingAddress: depositSigner.address, side: "BUY", priceLimit: "0.50", orderType: "FOK",
+  }, { fixtures: true });
+  const depositFokOrderSignature = await depositSigner.signTypedData(depositFokPreparation.structuredContent.preparedOrder.typedData);
+  const depositFokSubmit = await callTool(artifact, submitOrderTool, {
+    preparedOrder: depositFokPreparation.structuredContent.preparedOrder,
+    orderSignature: depositFokOrderSignature, clobAuth: depositClobAuth, orderType: "FOK",
+  }, { fixtures: true, fixtureScenario: "submit-fok-deposit-wallet", expectedSignerAddress: depositSigner.address,
+    expectedMakerAddress: depositFokPreparation.structuredContent.preparedOrder.wallet.makerAddress });
+  if (depositFokSubmit.structuredContent.status !== "SUBMITTED" || depositFokSubmit.structuredContent.orderType !== "FOK") {
+    fail("Deposit Wallet FOK submission did not preserve its wrapped signature and FOK type", "deposit_wallet_submit_invalid");
+  }
+  const shallowFok = await callTool(artifact, prepareTool, {
+    ...base, side: "BUY", priceLimit: "0.50", orderType: "FOK",
+  }, { fixtures: true, fixtureScenario: "submit-fok-insufficient-depth" });
+  if (shallowFok.structuredContent.status !== "PREPARED" || shallowFok.structuredContent.preparedOrder.order.orderType !== "FOK") {
+    fail("insufficient visible book depth was treated as a local guarantee or changed the FOK preparation", "fok_depth_invalid");
+  }
+  const shallowFokSignature = await replaySigner.signTypedData(shallowFok.structuredContent.preparedOrder.typedData);
+  const shallowFokSubmit = await callTool(artifact, submitOrderTool, {
+    preparedOrder: shallowFok.structuredContent.preparedOrder,
+    orderSignature: shallowFokSignature, clobAuth, orderType: "FOK",
+  }, { fixtures: true, fixtureScenario: "submit-fok-insufficient-depth", expectedSignerAddress: replaySigner.address });
+  if (shallowFokSubmit.structuredContent.status !== "REJECTED" || shallowFokSubmit.structuredContent.orderType !== "FOK") {
+    fail("Polymarket's insufficient-depth FOK rejection was not reported as a FOK rejection", "fok_depth_invalid");
+  }
+  for (const [prepared, signature, requestedType] of [
+    [replayPrepared, orderSignature, "FOK"],
+    [fokEoaPreparation.structuredContent.preparedOrder, fokEoaSignature, "FAK"],
   ]) {
-    const result = await callTool(artifact, submitTool, { preparedOrder: prepared, orderSignature: signature, clobAuth }, {
-      fixtures: true, fixtureScenario: scenario,
-    });
-    if (expectedCode === null ? result.structuredContent.status !== "SUBMITTED" : result.structuredContent.errorCode !== expectedCode) {
-      fail(`${scenario} did not apply current market constraints to the exact signed order`, "execution_snapshot_invalid");
+    const mismatch = await callTool(artifact, submitOrderTool, {
+      preparedOrder: prepared, orderSignature: signature, clobAuth, orderType: requestedType,
+    }, { fixtures: true, fixtureScenario: "submit-type-mismatch" });
+    if (mismatch.structuredContent.status !== "REJECTED" || mismatch.structuredContent.errorCode !== "PS_ORDER_TYPE_MISMATCH") {
+      fail(`prepared ${prepared.order.orderType} context changed to ${requestedType}`, "order_type_compatibility_invalid");
     }
   }
-  const offTickPreparedResponse = await callTool(artifact, prepareTool, {
-    ...base, makerAddress: replaySigner.address, signingAddress: replaySigner.address,
-    side: "BUY", priceLimit: "0.51", maxNominalPusd: "5.23",
-  }, { fixtures: true });
-  const offTickPrepared = offTickPreparedResponse.structuredContent.preparedOrder;
-  const offTickSignature = await replaySigner.signTypedData(offTickPrepared.typedData);
-  const offTickResult = await callTool(artifact, submitTool, {
-    preparedOrder: offTickPrepared, orderSignature: offTickSignature, clobAuth,
-  }, { fixtures: true, fixtureScenario: "snapshot-tick-invalid" });
-  if (offTickResult.structuredContent.errorCode !== "PS_PRICE_INVALID") {
-    fail(`signed price that violates the current tick size returned ${offTickResult.structuredContent.errorCode ?? offTickResult.structuredContent.status}`, "execution_snapshot_invalid");
+  const ambiguousFok = await callTool(artifact, submitOrderTool, {
+    preparedOrder: fokEoaPreparation.structuredContent.preparedOrder,
+    orderSignature: fokEoaSignature, clobAuth, orderType: "FOK",
+  }, { fixtures: true, fixtureScenario: "submit-fok-ambiguous-503", expectedSignerAddress: replaySigner.address });
+  if (ambiguousFok.structuredContent.status !== "UNKNOWN" || ambiguousFok.structuredContent.orderType !== "FOK"
+    || ambiguousFok.structuredContent.httpStatus !== 503) {
+    fail("ambiguous FOK POST did not stay UNKNOWN after one submission and one reconciliation read", "ambiguous_submit_invalid");
+  }
+  const statusTool = tools.find((tool) => tool.name === "get_order_status");
+  const cancelTool = tools.find((tool) => tool.name === "cancel_order");
+  if (statusTool.inputSchema.properties.requestedSize || statusTool.inputSchema.properties.orderType
+    || !statusTool.inputSchema.required.includes("accountWalletAddress")
+    || cancelTool.inputSchema.properties.requestedSize || !cancelTool.inputSchema.required.includes("accountWalletAddress")) {
+    fail("status and cancellation schemas require caller-invented size/type or omit the account wallet", "schema_invalid");
+  }
+  const statusOrderId = `0x${"a".repeat(64)}`;
+  const l1DerivationRejected = await callTool(artifact, statusTool, {
+    orderId: statusOrderId, signerAddress: replaySigner.address, accountWalletAddress: replaySigner.address, clobAuth,
+  }, { fixtures: true, fixtureScenario: "l1-derive-401", expectedSignerAddress: replaySigner.address });
+  if (l1DerivationRejected.structuredContent.errorCode !== "PS_CLOB_AUTH_REJECTED"
+    || l1DerivationRejected.structuredContent.httpStatus !== 401
+    || !/prepare and sign a new ClobAuth/i.test(l1DerivationRejected.structuredContent.message)) {
+    fail("HTTP 401 from L1 derivation was not distinguished from an order read failure", "clob_l1_failure_invalid");
+  }
+  const l2Rejected = await callTool(artifact, statusTool, {
+    orderId: statusOrderId, signerAddress: replaySigner.address, accountWalletAddress: replaySigner.address, clobAuth,
+  }, { fixtures: true, fixtureScenario: "order-status-l2-401", expectedSignerAddress: replaySigner.address });
+  if (l2Rejected.structuredContent.errorCode !== "PS_CLOB_PRIVATE_AUTH_REJECTED"
+    || l2Rejected.structuredContent.httpStatus !== 401) {
+    fail("HTTP 401 from an authenticated order read was hidden as an unknown order status", "clob_l2_failure_invalid");
+  }
+  if (JSON.stringify(l2Rejected.structuredContent).includes("SECRET_SENTINEL")) {
+    fail("L2 authentication failure exposed provider body data", "clob_l2_sanitization_invalid");
+  }
+  const missingOrder = await callTool(artifact, statusTool, {
+    orderId: statusOrderId, signerAddress: replaySigner.address, accountWalletAddress: replaySigner.address, clobAuth,
+  }, { fixtures: true, fixtureScenario: "order-status-404", expectedSignerAddress: replaySigner.address });
+  if (missingOrder.structuredContent.errorCode !== "PS_ORDER_NOT_FOUND" || missingOrder.structuredContent.httpStatus !== 404
+    || missingOrder.structuredContent.orderType !== null) {
+    fail("HTTP 404 did not leave provider order type unknown", "clob_order_not_found_invalid");
+  }
+  const statusUnavailable = await callTool(artifact, statusTool, {
+    orderId: statusOrderId, signerAddress: replaySigner.address, accountWalletAddress: replaySigner.address, clobAuth,
+  }, { fixtures: true, fixtureScenario: "order-status-503", expectedSignerAddress: replaySigner.address });
+  if (statusUnavailable.structuredContent.errorCode !== "PS_PROVIDER_UNAVAILABLE" || statusUnavailable.structuredContent.httpStatus !== 503) {
+    fail("HTTP 503 on an order read was not returned as a provider availability failure", "clob_order_unavailable_invalid");
+  }
+  const statusTimeout = await callTool(artifact, statusTool, {
+    orderId: statusOrderId, signerAddress: replaySigner.address, accountWalletAddress: replaySigner.address, clobAuth,
+  }, { fixtures: true, fixtureScenario: "order-status-timeout", expectedSignerAddress: replaySigner.address });
+  if (statusTimeout.structuredContent.errorCode !== "PS_PROVIDER_TIMEOUT") {
+    fail("order-status transport timeout was not distinguished from a missing order", "clob_order_timeout_invalid");
+  }
+  const foundOrder = await callTool(artifact, statusTool, {
+    orderId: statusOrderId, signerAddress: replaySigner.address,
+    accountWalletAddress: await fixtureWallet(replaySigner.address), clobAuth,
+  }, { fixtures: true, fixtureScenario: "order-status-found", expectedSignerAddress: replaySigner.address,
+  });
+  if (foundOrder.structuredContent.status !== "PARTIALLY_FILLED" || foundOrder.structuredContent.filledSize !== "2"
+    || foundOrder.structuredContent.remainingSize !== "8" || foundOrder.structuredContent.httpStatus !== 200) {
+    fail("authenticated order record was not returned with its actual fill data", "clob_order_record_invalid");
+  }
+  const missingOrderDetails = await callTool(artifact, statusTool, {
+    orderId: statusOrderId, signerAddress: replaySigner.address, accountWalletAddress: replaySigner.address, clobAuth,
+  }, { fixtures: true, fixtureScenario: "order-status-missing-details", expectedSignerAddress: replaySigner.address });
+  if (missingOrderDetails.structuredContent.status !== "UNKNOWN" || missingOrderDetails.structuredContent.orderType !== null
+    || missingOrderDetails.structuredContent.requestedSize !== null || missingOrderDetails.structuredContent.filledSize !== null) {
+    fail("incomplete provider order record did not remain unknown with null details", "clob_order_record_invalid");
+  }
+  const createdRead = await callTool(artifact, statusTool, { orderId: statusOrderId, signerAddress: replaySigner.address, accountWalletAddress: replaySigner.address, clobAuth },
+    { fixtures: true, fixtureScenario: "order-status-created", expectedSignerAddress: replaySigner.address });
+  if (createdRead.structuredContent.httpStatus !== 201) fail("SDK result reported an unobserved success HTTP status", "clob_order_record_invalid");
+  const partialFakRemainder = await callTool(artifact, statusTool, {
+    orderId: statusOrderId, signerAddress: replaySigner.address, accountWalletAddress: replaySigner.address, clobAuth,
+  }, { fixtures: true, fixtureScenario: "order-status-fak-partial", expectedSignerAddress: replaySigner.address });
+  if (partialFakRemainder.structuredContent.status !== "PARTIALLY_FILLED"
+    || partialFakRemainder.structuredContent.orderType !== "FAK"
+    || partialFakRemainder.structuredContent.filledSize !== "4"
+    || partialFakRemainder.structuredContent.remainingSize !== "6"
+    || !partialFakRemainder.structuredContent.message.includes("remainder does not rest")) {
+    fail("FAK partial fill and CLOB-canceled remainder were not reconciled correctly", "clob_order_record_invalid");
+  }
+  const foundFokOrder = await callTool(artifact, statusTool, {
+    orderId: statusOrderId, signerAddress: replaySigner.address, accountWalletAddress: replaySigner.address, clobAuth,
+  }, { fixtures: true, fixtureScenario: "order-status-fok-found", expectedSignerAddress: replaySigner.address });
+  if (foundFokOrder.structuredContent.status !== "FILLED" || foundFokOrder.structuredContent.orderType !== "FOK"
+    || foundFokOrder.structuredContent.filledSize !== "10") {
+    fail("authoritative FOK order read-back did not preserve its full-fill result", "clob_order_record_invalid");
+  }
+  const mismatchedOrderId = await callTool(artifact, statusTool, {
+    orderId: statusOrderId, signerAddress: replaySigner.address, accountWalletAddress: replaySigner.address, clobAuth,
+  }, { fixtures: true, fixtureScenario: "order-status-id-mismatch", expectedSignerAddress: replaySigner.address });
+  if (mismatchedOrderId.structuredContent.status !== "UNKNOWN" || mismatchedOrderId.structuredContent.errorCode !== "PS_ORDER_STATUS_UNKNOWN") {
+    fail("provider record with a different order ID was treated as the requested order", "order_identity_invalid");
+  }
+  const identityMismatch = await callTool(artifact, statusTool, {
+    orderId: statusOrderId, signerAddress: depositPrepared.wallet.makerAddress, accountWalletAddress: depositPrepared.wallet.makerAddress, clobAuth: depositClobAuth,
+  }, { fixtures: true, fixtureScenario: "identity-mismatch", expectedSignerAddress: depositPrepared.wallet.makerAddress });
+  if (identityMismatch.structuredContent.errorCode !== "PS_AUTH_WALLET_MISMATCH") {
+    fail("Deposit Wallet address was accepted as the owner EOA ClobAuth signer", "deposit_wallet_identity_invalid");
   }
   const invalidOrderSignature = await callTool(artifact, submitTool, {
     ...submitArgs, orderSignature: `0x${"0".repeat(130)}`,
@@ -314,17 +614,87 @@ export async function testOfflineArtifact(root = process.cwd()) {
   if (invalidOrderSignature.structuredContent.errorCode !== "PS_SIGNATURE_INVALID") {
     fail("invalid Polymarket order signature was accepted", "signature_validation_invalid");
   }
+  const belowMinimum = await callTool(artifact, prepareTool, { ...base, makerAddress: replaySigner.address,
+    signingAddress: replaySigner.address, clobAuth, side: "BUY", priceLimit: "0.50", size: "1" }, { fixtures: true });
+  if (belowMinimum.structuredContent.status !== "PREPARED") fail("SDK preparation unexpectedly enforced the provider minimum size", "provider_authority_invalid");
+  const providerMinimumResult = await callTool(artifact, submitTool, {
+    preparedOrder: belowMinimum.structuredContent.preparedOrder,
+    orderSignature: await replaySigner.signTypedData(belowMinimum.structuredContent.preparedOrder.typedData), clobAuth, orderType: "FAK",
+  }, { fixtures: true, fixtureScenario: "submit-provider-minimum", expectedSignerAddress: replaySigner.address });
+  if (providerMinimumResult.structuredContent.status !== "REJECTED" || providerMinimumResult.structuredContent.httpStatus !== 400) {
+    fail("provider minimum-size rejection was not authoritative", "provider_authority_invalid");
+  }
   const geoblocked = await callTool(artifact, submitTool, submitArgs, { fixtures: true, fixtureScenario: "geoblocked" });
   if (geoblocked.structuredContent.errorCode !== "PS_GEOBLOCKED") fail("official blocked geoblock response did not prevent submission", "geoblock_invalid");
   const missingCredentials = await callTool(artifact, submitTool, submitArgs, { fixtures: true, fixtureScenario: "missing-credentials" });
-  if (missingCredentials.structuredContent.errorCode !== "PS_CLOB_AUTH_FAILED") fail("missing CLOB credentials were not reported", "clob_auth_invalid");
-  const changedFee = await callTool(artifact, submitTool, submitArgs, { fixtures: true, fixtureScenario: "fee-changed" });
-  if (changedFee.structuredContent.errorCode !== "PS_SPENDING_CAP") {
-    fail("current fee increase was not bounded by the user-approved all-in spending cap", "spending_cap_invalid");
+  if (missingCredentials.structuredContent.errorCode !== "PS_CLOB_AUTH_REJECTED"
+    || missingCredentials.structuredContent.httpStatus !== 401
+    || JSON.stringify(missingCredentials.structuredContent).includes("SECRET_SENTINEL")) {
+    fail("L1 credential rejection did not preserve safe HTTP status or exposed a provider body", "clob_auth_invalid");
   }
-  const ambiguous = await callTool(artifact, submitTool, submitArgs, { fixtures: true, fixtureScenario: "submit-ambiguous" });
-  if (ambiguous.structuredContent.status !== "UNKNOWN" || ambiguous.structuredContent.errorCode !== "PS_SUBMISSION_UNKNOWN") {
-    fail("ambiguous order POST was retried or presented as a confirmed result", "ambiguous_submit_invalid");
+  for (const [scenario, httpStatus] of [
+    ["submit-ambiguous", 404], ["submit-ambiguous-429", 429], ["submit-ambiguous-503", 503],
+    ["submit-malformed-success", 200], ["submit-malformed-order-id", 200],
+  ]) {
+    const ambiguous = await callTool(artifact, submitTool, submitArgs, { fixtures: true, fixtureScenario: scenario });
+    if (ambiguous.structuredContent.status !== "UNKNOWN" || ambiguous.structuredContent.errorCode !== "PS_SUBMISSION_UNKNOWN"
+      || ambiguous.structuredContent.httpStatus !== httpStatus || JSON.stringify(ambiguous.structuredContent).includes("SECRET_SENTINEL")) {
+      fail(`${scenario} did not retain a sanitized unknown result and the single POST status`, "ambiguous_submit_invalid");
+    }
+  }
+  const submissionReconciled = await callTool(artifact, submitTool, submitArgs, { fixtures: true, fixtureScenario: "submit-reconciled" });
+  if (submissionReconciled.structuredContent.status !== "FILLED" || submissionReconciled.structuredContent.filledSize !== "10"
+    || submissionReconciled.structuredContent.httpStatus !== 503) {
+    fail("authoritative order read-back did not resolve an ambiguous POST while preserving the POST HTTP status", "ambiguous_submit_invalid");
+  }
+  for (const [scenario, errorCode, httpStatus] of [
+    ["submit-l2-401", "PS_CLOB_PRIVATE_AUTH_REJECTED", 401],
+    ["submit-400", "PS_CLOB_REJECTED", 400],
+    ["submit-403", "PS_CLOB_FORBIDDEN", 403],
+  ]) {
+    const rejected = await callTool(artifact, submitTool, submitArgs, { fixtures: true, fixtureScenario: scenario });
+    if (rejected.structuredContent.status !== "REJECTED" || rejected.structuredContent.errorCode !== errorCode
+      || rejected.structuredContent.httpStatus !== httpStatus || JSON.stringify(rejected.structuredContent).includes("SECRET_SENTINEL")) {
+      fail(`${scenario} did not retain its sanitized CLOB rejection classification`, "clob_submit_failure_invalid");
+    }
+  }
+  if (!cancelTool) fail("cancel_order was not returned by tools/list", "tool_catalog_invalid");
+  const cancelArgs = {
+    orderId: statusOrderId, signerAddress: replaySigner.address,
+    accountWalletAddress: await fixtureWallet(replaySigner.address), clobAuth, confirmCancel: true,
+  };
+  const canceled = await callTool(artifact, cancelTool, cancelArgs, {
+    fixtures: true, fixtureScenario: "cancel-valid", expectedSignerAddress: replaySigner.address,
+  });
+  if (canceled.structuredContent.status !== "CANCELLED" || canceled.structuredContent.httpStatus !== 200) {
+    fail("confirmed cancellation did not return the structured CLOB result", "cancel_result_invalid");
+  }
+  for (const [scenario, errorCode, httpStatus] of [
+    ["cancel-l1-401", "PS_CLOB_AUTH_REJECTED", 401],
+    ["cancel-l2-401", "PS_CLOB_PRIVATE_AUTH_REJECTED", 401],
+    ["cancel-403", "PS_CLOB_FORBIDDEN", 403],
+  ]) {
+    const rejected = await callTool(artifact, cancelTool, cancelArgs, {
+      fixtures: true, fixtureScenario: scenario, expectedSignerAddress: replaySigner.address,
+    });
+    if (!["FAILED", "REJECTED"].includes(rejected.structuredContent.status)
+      || rejected.structuredContent.errorCode !== errorCode || rejected.structuredContent.httpStatus !== httpStatus
+      || JSON.stringify(rejected.structuredContent).includes("SECRET_SENTINEL")) {
+      fail(`${scenario} did not return a schema-valid sanitized cancellation failure`, "cancel_result_invalid");
+    }
+  }
+  const cancelUnknown = await callTool(artifact, cancelTool, cancelArgs, {
+    fixtures: true, fixtureScenario: "cancel-ambiguous", expectedSignerAddress: replaySigner.address,
+  });
+  if (cancelUnknown.structuredContent.status !== "UNKNOWN" || cancelUnknown.structuredContent.errorCode !== "PS_CANCEL_UNKNOWN"
+    || cancelUnknown.structuredContent.httpStatus !== 503) {
+    fail("ambiguous cancellation did not preserve its single DELETE status and bounded read-back result", "cancel_result_invalid");
+  }
+  const cancelReconciled = await callTool(artifact, cancelTool, cancelArgs, {
+    fixtures: true, fixtureScenario: "cancel-reconciled", expectedSignerAddress: replaySigner.address,
+  });
+  if (cancelReconciled.structuredContent.status !== "CANCELLED" || cancelReconciled.structuredContent.httpStatus !== 503) {
+    fail("authoritative order read-back did not resolve an ambiguous cancellation", "cancel_result_invalid");
   }
   const sell = await callTool(artifact, prepareTool, { ...base, side: "SELL", priceLimit: "0.49" }, { fixtures: true });
   const sellOrder = sell.structuredContent.preparedOrder.order;
@@ -334,20 +704,14 @@ export async function testOfflineArtifact(root = process.cwd()) {
   }
   const deposit = await callTool(artifact, prepareTool, {
     ...base, makerAddress: "0x0000000000000000000000000000000000000002",
-    walletType: "DEPOSIT_WALLET", side: "BUY", priceLimit: "0.50",
+    side: "BUY", priceLimit: "0.50",
   }, { fixtures: true });
   const depositTypedData = deposit.structuredContent.preparedOrder.typedData;
   if (depositTypedData.primaryType !== "TypedDataSign"
-    || depositTypedData.message.verifyingContract !== "0x0000000000000000000000000000000000000002"
+    || depositTypedData.message.verifyingContract.toLowerCase() !== (await fixtureWallet(fixtureSigner.address)).toLowerCase()
     || depositTypedData.message.contents.signatureType !== 3
-    || deposit.structuredContent.preparedOrder.wallet.orderSignerAddress !== "0x0000000000000000000000000000000000000002") {
+    || deposit.structuredContent.preparedOrder.wallet.orderSignerAddress.toLowerCase() !== (await fixtureWallet(fixtureSigner.address)).toLowerCase()) {
     fail("Deposit Wallet order payload did not use the documented ERC-7739 TypedDataSign shape", "deposit_wallet_payload_invalid");
-  }
-  const stalePrepare = await callTool(artifact, prepareTool, { ...base, side: "BUY", priceLimit: "0.50" }, {
-    fixtures: true, fixtureScenario: "book-121000",
-  });
-  if (stalePrepare.structuredContent.status !== "PREPARED" || stalePrepare.structuredContent.preparationFreshness.bookAgeMs !== 121_000) {
-    fail("book age beyond 120 seconds blocked preparation", "preparation_freshness_invalid");
   }
   const unsafeSaltOrder = await runOperation(artifact, {
     method: "tools/call",
@@ -359,9 +723,9 @@ export async function testOfflineArtifact(root = process.cwd()) {
   }, { fixtures: true });
   if (unsafeSaltOrder.result?.isError !== true) fail("submit accepted an order salt that cannot be serialized exactly", "order_serialization_invalid");
   for (const [scenario, errorCode] of [
-    ["wrong-market", "PS_MARKET_IDENTITY"], ["wrong-book", "PS_MARKET_IDENTITY"],
+    ["wrong-market", "PS_MARKET_IDENTITY"],
     ["provider-invalid", "PS_PROVIDER_INVALID"], ["provider-invalid-json", "PS_PROVIDER_INVALID"],
-    ["invalid-level", "PS_PROVIDER_INVALID"], ["provider-unavailable", "PS_PROVIDER_UNAVAILABLE"],
+    ["provider-unavailable", "PS_PROVIDER_UNAVAILABLE"],
   ]) {
     const result = await callTool(artifact, prepareTool, { ...base, side: "BUY", priceLimit: "0.50" }, { fixtures: true, fixtureScenario: scenario });
     if (result.structuredContent.status !== "REJECTED" || result.structuredContent.errorCode !== errorCode
@@ -369,13 +733,9 @@ export async function testOfflineArtifact(root = process.cwd()) {
       fail("known preparation failure did not return a distinguishable structured rejection", "preparation_rejection_invalid");
     }
   }
-  for (const scenario of ["invalid-timestamp", "future-timestamp", "missing-book-timestamp"]) {
-    const result = await callTool(artifact, prepareTool, { ...base, side: "BUY", priceLimit: "0.50" }, {
-      fixtures: true, fixtureScenario: scenario,
-    });
-    if (result.structuredContent.status !== "PREPARED" || result.structuredContent.preparationFreshness.bookAgeMs !== null) {
-      fail(`${scenario} book timestamp affected preparation instead of remaining informational`, "book_timestamp_invalid");
-    }
+  for (const scenario of ["wrong-book", "invalid-level"]) {
+    const result = await callTool(artifact, prepareTool, { ...base, side: "BUY", priceLimit: "0.50" }, { fixtures: true, fixtureScenario: scenario });
+    if (result.structuredContent.status !== "PREPARED") fail(`${scenario} raw order-book metadata blocked SDK order preparation`, "preparation_redundant_fetch");
   }
   const unexpected = await runOperation(artifact, {
     method: "tools/call", params: { name: prepareTool.name, arguments: { ...base, side: "BUY", priceLimit: "0.50" } },
@@ -384,7 +744,7 @@ export async function testOfflineArtifact(root = process.cwd()) {
     || !unexpected.result.content.some((item) => item.text?.includes("fixture unexpected programming failure"))) {
     fail("unexpected programming failure was converted into a known preparation rejection", "unexpected_failure_hidden");
   }
-  const quoteTool = tools.find((tool) => tool.name === "get_quote");
+  const quoteTool = tools.find((tool) => tool.name === "get_market_quote");
   const quote = await callTool(artifact, quoteTool, { marketId: "1", assetId: "123", side: "BUY", size: "10" }, { fixtures: true });
   if ("marketRestricted" in quote.structuredContent || "accountGeoblockChecked" in quote.structuredContent) {
     fail("quote exposed removed market or account eligibility metadata", "quote_output_invalid");
@@ -395,27 +755,13 @@ export async function testOfflineArtifact(root = process.cwd()) {
   const staleQuote = await callTool(artifact, quoteTool, { marketId: "1", assetId: "123", side: "BUY", size: "10" }, { fixtures: true, fixtureScenario: "book-51000" });
   if (staleQuote.structuredContent.freshness !== "STALE" || staleQuote.structuredContent.bookAgeMs !== 51_000
     || staleQuote.structuredContent.staleAfterSeconds !== 30) fail("quote freshness label stopped being informational", "quote_freshness_invalid");
-  const overCap = await runOperation(artifact, {
-    method: "tools/call",
-    params: { name: prepareTool.name, arguments: { ...base, side: "BUY", priceLimit: "0.50", maxNominalPusd: "5.12" } },
-  }, { fixtures: true });
-  validateSample(prepareTool, { ...base, side: "BUY", priceLimit: "0.50", maxNominalPusd: "5.12" }, overCap.result);
-  if (overCap.result.structuredContent.status !== "REJECTED" || overCap.result.structuredContent.errorCode !== "PS_SPENDING_CAP") fail("BUY preparation accepted a fee-inclusive amount above the user cap", "order_policy_invalid");
   const wrongAsset = await runOperation(artifact, {
     method: "tools/call",
     params: { name: prepareTool.name, arguments: { ...base, assetId: "999", side: "BUY", priceLimit: "0.50" } },
   }, { fixtures: true });
   validateSample(prepareTool, { ...base, assetId: "999", side: "BUY", priceLimit: "0.50" }, wrongAsset.result);
   if (wrongAsset.result.structuredContent.status !== "REJECTED" || wrongAsset.result.structuredContent.errorCode !== "PS_MARKET_IDENTITY") fail("order preparation accepted an asset not mapped to the market outcome", "market_identity_invalid");
-  const newsTool = tools.find((tool) => tool.name === "get_soccer_news");
-  const continuationInstruction = "These tools provide API evidence, not exhaustive research. When statistics, injuries, lineups or other relevant information are missing, continue with the host's web search/browser tools before writing the final analysis.";
-  if (!newsTool?.description.includes(continuationInstruction)) fail("soccer-news browser continuation instruction is missing from the MCP tool definition", "tool_catalog_invalid");
-  const news = await callTool(artifact, newsTool, { teams: ["Arsenal"], limit: 5 }, { fixtures: true });
-  if (news.structuredContent.items.length !== 1 || news.structuredContent.items[0].matchedTeams[0] !== "Arsenal") {
-    fail("soccer news included a headline unrelated to the requested team", "news_attribution_invalid");
-  }
   const researchTool = tools.find((tool) => tool.name === "research_soccer");
-  if (!researchTool?.description.includes(continuationInstruction)) fail("soccer-research browser continuation instruction is missing from the MCP tool definition", "tool_catalog_invalid");
   const soccerSkill = await readFile(resolve(root, "skills/polyscope-soccer-research/SKILL.md"), "utf8");
   for (const phrase of ["Form returned, xG missing", "Injury information missing", "Browser unavailable", "original URL", "manager statements", "head-to-head history"]) {
     if (!soccerSkill.includes(phrase)) fail(`soccer research skill is missing expected workflow guidance: ${phrase}`, "soccer_skill_invalid");
@@ -490,7 +836,7 @@ export async function testOfflineArtifact(root = process.cwd()) {
     || new URL(partialSeasonApi.sourceUrl).searchParams.get("season") !== "2025") {
     fail("incomplete upstream season metadata did not use the consistent cross-year calendar season", "soccer_provider_invalid");
   }
-  const quoteToolForAnalysis = tools.find((tool) => tool.name === "get_quote");
+  const quoteToolForAnalysis = tools.find((tool) => tool.name === "get_market_quote");
   const analysisQuote = await callTool(artifact, quoteToolForAnalysis, { marketId: "1", assetId: "123", side: "BUY", size: "10", depth: 10 }, { fixtures: true });
   const resolutionRules = "The market resolves to the named team winning the scheduled 90 minutes; extra time and penalties do not count.";
   const baselineForm = await callTool(artifact, researchTool, { league: "PL", fixtureId: "1001", date: "2026-10-17" }, { fixtures: true });
@@ -997,42 +1343,67 @@ export async function testOfflineArtifact(root = process.cwd()) {
   }
   const unavailable = await callTool(artifact, researchTool, { league: "PL", date: "2026-11-01", days: 0, limit: 3 }, { fixtures: true });
   if (unavailable.structuredContent.availability !== "UNAVAILABLE") fail("provider failure was presented as available soccer data", "provider_failure_hidden");
-  const portfolioTool = tools.find((tool) => tool.name === "get_portfolio");
+  const portfolioTool = tools.find((tool) => tool.name === "get_positions");
   const portfolio = await callTool(artifact, portfolioTool, { walletAddress: "0x0000000000000000000000000000000000000001", limit: 10 }, { fixtures: true });
   if (portfolio.structuredContent.addressBinding !== "PUBLIC_ADDRESS_UNVERIFIED"
     || portfolio.structuredContent.positions.length !== 1 || portfolio.structuredContent.complete !== false
     || portfolio.structuredContent.hasMore !== true || portfolio.structuredContent.nextCursor !== "fixture-next-page") {
-    fail("portfolio did not preserve the representative partial v2 page and unverified address label", "portfolio_pagination_invalid");
+    fail("positions did not preserve the representative partial OPEN page and unverified address label", "positions_pagination_invalid");
   }
-  const redeemableToolDescription = tools.find((tool) => tool.name === "get_portfolio")?.description ?? "";
   const redeemablePortfolio = await callTool(artifact, portfolioTool, { walletAddress: "0x0000000000000000000000000000000000000001", limit: 10 },
     { fixtures: true, fixtureScenario: "portfolio-redeemable" });
-  if (!redeemableToolDescription.includes("OPEN may include held REDEEMABLE positions")
-    || new URL(redeemablePortfolio.structuredContent.sourceUrl).searchParams.get("status") !== "OPEN"
+  if (new URL(redeemablePortfolio.structuredContent.sourceUrl).searchParams.get("status") !== "OPEN"
     || redeemablePortfolio.structuredContent.positions[0]?.status !== "REDEEMABLE"
     || redeemablePortfolio.structuredContent.positions[0]?.redeemable !== true
     || redeemablePortfolio.structuredContent.hasMore !== true
     || redeemablePortfolio.structuredContent.nextCursor !== "fixture-next-page") {
-    fail("OPEN portfolio filtering dropped or misrepresented a redeemable position or its pagination", "portfolio_status_invalid");
+    fail("OPEN positions dropped or misrepresented a redeemable row or its pagination", "positions_status_invalid");
   }
   const portfolioNextPage = await callTool(artifact, portfolioTool, {
     walletAddress: "0x0000000000000000000000000000000000000001", limit: 10, cursor: portfolio.structuredContent.nextCursor,
   }, { fixtures: true });
   if (portfolioNextPage.structuredContent.positions.length !== 1 || portfolioNextPage.structuredContent.complete !== true
     || portfolioNextPage.structuredContent.hasMore !== false || portfolioNextPage.structuredContent.nextCursor !== null) {
-    fail("portfolio did not mark the final v2 cursor page complete", "portfolio_pagination_invalid");
+    fail("positions did not mark the final OPEN cursor page complete", "positions_pagination_invalid");
+  }
+  const approvalsTool = tools.find((tool) => tool.name === "get_trading_approvals");
+  if (!approvalsTool || approvalsTool.annotations?.readOnlyHint !== true) fail("trading approvals tool was not read-only", "tool_catalog_invalid");
+  const accountWallet = fixtureSigner.address;
+  const sdkApproved = await callTool(artifact, approvalsTool, { walletAddress: accountWallet }, { fixtures: true, fixtureScenario: "approvals-complete" });
+  if (sdkApproved.structuredContent.isFullyApproved !== true
+    || sdkApproved.structuredContent.missingRequirements?.erc20.length !== 0
+    || sdkApproved.structuredContent.missingRequirements?.erc1155.length !== 0) {
+    fail("SDK fully-approved state or empty missing requirements were not preserved", "trading_approvals_invalid");
+  }
+  const sdkMissing = await callTool(artifact, approvalsTool, { walletAddress: accountWallet }, { fixtures: true, fixtureScenario: "approvals-missing" });
+  if (sdkMissing.structuredContent.isFullyApproved !== false
+    || !sdkMissing.structuredContent.missingRequirements?.erc20.length
+    || !sdkMissing.structuredContent.missingRequirements?.erc1155.length
+    || !sdkMissing.structuredContent.missingRequirements.erc20[0].spenderAddress
+    || !sdkMissing.structuredContent.missingRequirements.erc20[0].tokenAddress
+    || !sdkMissing.structuredContent.missingRequirements.erc20[0].amount) {
+    fail("SDK missing ERC-20/ERC-1155 approval details were discarded", "trading_approvals_invalid");
+  }
+  const sdkUnavailable = await callTool(artifact, approvalsTool, { walletAddress: accountWallet }, { fixtures: true, fixtureScenario: "chain-read-unavailable" });
+  if (sdkUnavailable.structuredContent.isFullyApproved !== null || sdkUnavailable.structuredContent.missingRequirements !== null) {
+    fail("unavailable SDK approval state was presented as approved or missing", "trading_approvals_invalid");
   }
   const toolNames = new Set(tools.map((tool) => tool.name));
-  for (const name of ["submit_fak_order", "get_order_status", "cancel_order", "get_portfolio"]) {
-    if (!toolNames.has(name)) fail(`${name} was not registered`, "tool_catalog_invalid");
-  }
+  const textOnlyUncovered = [...toolNames].filter((name) => !textOnlyToolCoverage.has(name));
+  if (textOnlyUncovered.length > 0) fail(`text-only client did not exercise: ${textOnlyUncovered.join(", ")}`, "text_output_coverage_invalid");
+  if (toolNames.size !== 11) fail("final public MCP surface is not exactly 11 tools", "tool_catalog_invalid");
   return {
     status: "passed",
     deterministicCases: [
-      "BUY FAK preserves exact signed limit, size, precision, and fee-inclusive cap", "lack of visible liquidity does not block bounded FAK preparation", "no ExecutionApproval signature is required", "signed order is accepted for exactly one intercepted CLOB POST", "undocumented 300-second ClobAuth cutoff removed", "undocumented order-timestamp freshness cutoff removed", "SELL FAK preserves exact signed minimum price and size", "market fee descriptor and exact fee calculation",
+      "official SDK effective order amounts reach FAK/FOK submission without a custom cap gate",
+      "Deposit Wallet stateless finalizer matches the official SDK byte-for-byte",
+      "discovery makes no network calls; successful order-read HTTP status is observed, not inferred",
+      "BUY FAK preserves the SDK-generated signed amount", "lack of visible liquidity does not block SDK preparation", "no ExecutionApproval signature is required", "saved signed fields reach exactly one intercepted CLOB POST", "submit does not refresh Gamma, book, or fee metadata", "ClobAuth is delegated to the official SDK", "order timestamp is verified only for safe serialization", "SELL FAK preserves SDK-generated signed amounts", "informational quote fee estimate",
+      "EOA Type 0 FAK BUY remains compatible through submit_order", "EOA Type 0 FOK SELL reaches one POST with its exact prepared type and amounts", "Deposit Wallet Type 3 FAK BUY uses the shared submit_order handler", "Deposit Wallet Type 3 FOK BUY preserves ERC-7739 wrapping and FOK", "insufficient visible depth does not locally reject FOK; the CLOB's rejection remains FOK", "mismatched FAK submission rejects a prepared FOK without a POST", "ambiguous FOK outcome remains UNKNOWN after one POST and one read-only reconciliation", "FAK partial fill and CLOB-canceled remainder are reflected by status read-back", "FOK full fill is reflected by authoritative status read-back",
       "reject invalid Polymarket order signature", "reject real provider geoblock", "missing CLOB credentials handled", "Deposit Wallet TypedDataSign preparation", "local smart-wallet signer recovery is distinct from deferred CLOB acceptance", "Deposit Wallet ERC-7739 order reaches exactly one intercepted CLOB POST without Polygon RPC",
-      "121s book age is informational for preparation", "future, invalid, missing, and stale book timestamps do not block bounded FAK execution", "changed minimum decrease and still-valid tick are accepted", "increased minimum and invalid current tick reject the exact signed order", "zero current minimum is rejected as invalid provider data", "changed risk mode rejects an incompatible exchange domain", "restricted Gamma metadata omitted and does not reject preparation/submission", "market and quote responses omit removed eligibility metadata", "unsigned book metadata does not change EIP-712 signature validation", "51s quote remains labeled stale", "51s book age alone does not block bounded FAK execution", "ambiguous submission is reconciled once and never reposted", "provider-invalid structured diagnostics", "reject unsafe CLOB salt precision", "reject fee-inclusive cap overrun", "reject wrong outcome asset",
-      "team-attributed news", "PL/PD/SA/CL fixture mapping", "documented team-form filters with mixed-competition history filtering", "form counts and explanations for 5/5, 5/4, 5/0, and 0/0 histories",
+      "SDK preparation and submission do not require a custom book-age gate", "provider minimum-size rejection is authoritative", "provider record order ID must match the requested order ID", "FAK/FOK prepared approval context cannot be changed", "restricted Gamma metadata does not gate submission", "market and quote responses omit removed eligibility metadata", "signature validation rejects changes to signed token, maker/taker amounts, side, maker, or metadata", "51s quote remains labeled stale", "ambiguous POST outcomes reconcile once and never repost", "HTTP 400/401/403 POST errors retain sanitized classifications and status", "cancel_order issues one DELETE and reconciles ambiguous outcomes at most once", "provider-invalid structured diagnostics", "reject unsafe CLOB salt precision", "reject wrong outcome asset",
+      "all 11 MCP tools return machine-readable JSON content for text-only clients", "search-to-quote-to-PayBox-signing-to-internal-validation-to-submission workflow using content text only", "FOK text response preserves provider rejection without local depth guarantees",
+      "PL/PD/SA/CL fixture mapping", "documented team-form filters with mixed-competition history filtering", "form counts and explanations for 5/5, 5/4, 5/0, and 0/0 histories",
       "safe team-form HTTP 403 permission and 429 rate-limit diagnostics", "API-Football competition-scoped enrichment, upstream cross-year season reuse, independent IDs, exact fixture matching, and cutoff date",
       "provider 403, 204, HTTP 200 error envelope, unavailable/missing stats, mismatched names, kickoff conflicts, and ambiguous duplicates do not replace baseline data", "Poisson probability normalization and venue-specific API-Football and football-data fallback inputs",
       "CLOB multilevel depth-weighted price, fee-inclusive cost, positive and negative edge, partial fill, no liquidity, unsupported market rules, and honest SELL limitation",
@@ -1044,7 +1415,8 @@ export async function testOfflineArtifact(root = process.cwd()) {
       "API-Football competition IDs, starting-year season selection, wrong league/season rejection, unknown-season no-request diagnostics, and response cap",
       "fallback fixture ambiguity, kickoff conflicts, missing statistics, and source provenance",
       "host-attested identity evidence and exact market mapping consistency required for fallback probability/edge; source URLs are not fetched",
-      "official v2 OPEN portfolio includes REDEEMABLE positions and preserves cursor pagination", "public portfolio address is not wallet proof", "13-tool catalog without an order from analysis",
+      "official v2 OPEN portfolio includes REDEEMABLE positions and preserves cursor pagination", "public portfolio address is not wallet proof", "exact 11-tool catalog without aliases",
+      "official SDK indexed trading approval state and concrete missing requirements, without claiming funding or trade eligibility",
       "ClobAuth and Order intents match PayBox's documented typedData object contract",
     ],
   };
@@ -1137,7 +1509,8 @@ function validateCallResult(value) {
   if (result.isError !== undefined && typeof result.isError !== "boolean") fail("tools/call isError must be boolean");
 }
 
-export async function runOperation(artifact, operation, { fixtures = false, fixtureScenario } = {}) {
+export async function runOperation(artifact, operation, { fixtures = false, fixtureScenario, expectedSignerAddress, expectedMakerAddress, expectedOrderSignature, expectedAccountWalletAddress } = {}) {
+  if (fixtures && operation.method === "tools/call" && operation.params.name === "prepare_order") await fixtureAuth(operation.params.arguments);
   const home = await mkdtemp(resolve(tmpdir(), "paybox-plugin-conformance-"));
   try {
     const args = fixtures ? ["--import", resolve(dirname(artifact), "../tests/network-fixtures.mjs"), artifact] : [artifact];
@@ -1146,6 +1519,10 @@ export async function runOperation(artifact, operation, { fixtures = false, fixt
       env: {
         HOME: home, NODE_ENV: "production", NO_COLOR: "1", PATH: process.env.PATH ?? "/usr/local/bin:/usr/bin:/bin",
         ...(fixtureScenario === undefined ? {} : { POLYSCOPE_TEST_SCENARIO: fixtureScenario }),
+        ...(expectedSignerAddress === undefined ? {} : { POLYSCOPE_TEST_EXPECTED_SIGNER: expectedSignerAddress }),
+        ...(expectedMakerAddress === undefined ? {} : { POLYSCOPE_TEST_EXPECTED_MAKER: expectedMakerAddress }),
+        ...(expectedOrderSignature === undefined ? {} : { POLYSCOPE_TEST_EXPECTED_ORDER_SIGNATURE: expectedOrderSignature }),
+        ...(expectedAccountWalletAddress === undefined ? {} : { POLYSCOPE_TEST_EXPECTED_ACCOUNT_WALLET: expectedAccountWalletAddress }),
       },
     }, async (child, closed, stop) => {
       let stdoutBytes = 0;

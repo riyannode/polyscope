@@ -6,3 +6,6 @@ allowBuilds:
 
 overrides:
   ws: 8.21.0
+
+patchedDependencies:
+  '@polymarket/bindings@0.13.0': patches/@polymarket__bindings@0.13.0.patch

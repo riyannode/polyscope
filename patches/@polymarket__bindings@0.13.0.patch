@@ -1,0 +1,24 @@
+diff --git a/dist/data/index.d.ts b/dist/data/index.d.ts
+index 9e12c0e8a790e4071908e0c1ee375d087a2736d7..7355b1d841eb36cf200cbde0a11d19d854c586e3 100644
+--- a/dist/data/index.d.ts
++++ b/dist/data/index.d.ts
+@@ -3778,17 +3778,13 @@ declare function dataEnvelopeSchema<TPayload extends z.ZodType>(payload: TPayloa
+     data: TPayload;
+ }, z.core.$strip>, z.ZodTransform<Awaited<z.core.output<TPayload>>, ({
+     data: TPayload;
+-} extends infer T_1 extends z.core.$ZodLooseShape ? { -readonly [k in keyof T_1 as {
+-    data: TPayload;
+-}[k] extends {
++} extends infer T_1 extends z.core.$ZodLooseShape ? { -readonly [k in keyof T_1 as T_1[k] extends {
+     _zod: {
+         optout: "optional";
+     };
+ } ? never : k]: T_1[k]["_zod"]["output"]; } : never) & ({
+     data: TPayload;
+-} extends infer T_2 extends z.core.$ZodLooseShape ? { -readonly [k_1 in keyof T_2 as {
+-    data: TPayload;
+-}[k_1] extends {
++} extends infer T_2 extends z.core.$ZodLooseShape ? { -readonly [k_1 in keyof T_2 as T_2[k_1] extends {
+     _zod: {
+         optout: "optional";
+     };
