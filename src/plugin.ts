@@ -115,7 +115,6 @@ const gammaMarketSchema = z.object({
   liquidity: z.union([z.string(), z.number()]).nullable().optional(),
   active: z.boolean().optional(),
   closed: z.boolean().optional(),
-  restricted: z.boolean().optional(),
   acceptingOrders: z.boolean().optional(),
   enableOrderBook: z.boolean().optional(),
   endDate: z.string().nullable().optional(),
@@ -142,7 +141,7 @@ const bookSchema = z.object({
 const marketResultSchema = z.object({
   eventTitle: z.string(), marketId: z.string(), question: z.string(), slug: z.string().nullable(),
   conditionId: z.string(), version: z.enum(["v1", "v2"]).nullable(), negRisk: z.boolean(),
-  marketRestricted: z.boolean().nullable(), acceptingOrders: z.boolean().nullable(),
+  acceptingOrders: z.boolean().nullable(),
   endDate: z.string().nullable(), resolutionRules: z.string().nullable(), resolutionSource: z.string().nullable(),
   volume: z.union([z.string(), z.number()]).nullable(), volume24h: z.union([z.string(), z.number()]).nullable(),
   liquidity: z.union([z.string(), z.number()]).nullable(),
@@ -153,7 +152,7 @@ const sideSchema = z.enum(["BUY", "SELL"]);
 const quoteLevelSchema = z.object({ price: z.string(), size: z.string() }).strict();
 const quoteResultSchema = z.object({
   marketId: z.string(), question: z.string(), outcome: z.string(), assetId: decimalIdSchema,
-  version: z.enum(["v1", "v2"]).nullable(), marketRestricted: z.boolean().nullable(),
+  version: z.enum(["v1", "v2"]).nullable(),
   marketAcceptingOrders: z.boolean().nullable(), tickSize: z.enum(TICK_SIZES), minOrderSize: z.string(), side: sideSchema,
   availability: z.enum(["AVAILABLE", "NO_LIQUIDITY"]), freshness: z.enum(["FRESH", "STALE", "UNKNOWN"]),
   staleAfterSeconds: z.literal(30), bestBid: z.string().nullable(), bestAsk: z.string().nullable(),
@@ -162,7 +161,7 @@ const quoteResultSchema = z.object({
   worstPrice: z.string().nullable(), averagePrice: z.string().nullable(), grossAmountPusd: z.string().nullable(),
   feeRate: z.string().nullable(), feeExponent: z.number().int().min(0).max(6).nullable(), estimatedFeePusd: z.string().nullable(),
   bookTimestamp: z.string(), bookAgeMs: z.number().int().nullable(), observedAt: z.string().datetime(),
-  source: z.literal("Polymarket CLOB"), accountGeoblockChecked: z.literal(false),
+  source: z.literal("Polymarket CLOB"),
 }).strict();
 const providerAvailabilitySchema = z.enum(["AVAILABLE", "UNAVAILABLE"]);
 const providerFreshnessSchema = z.enum(["AVAILABLE", "STALE", "UNKNOWN"]);
@@ -215,7 +214,7 @@ const walletTypeSchema = z.enum(["EOA", "PROXY", "SAFE", "DEPOSIT_WALLET"]);
 const preparedOrderBaseSchema = z.object({
   market: z.object({
     id: z.string().regex(/^[0-9]{1,32}$/), conditionId: z.string().regex(/^0x[0-9a-fA-F]{64}$/), version: z.enum(["v1", "v2"]), outcome: z.string(), negRisk: z.boolean(),
-    marketRestricted: z.boolean().nullable(), acceptingOrders: z.boolean().nullable(),
+    acceptingOrders: z.boolean().nullable(),
     tickSize: z.enum(TICK_SIZES),
     minOrderSize: z.string(), bookTimestamp: z.string(),
   }).strict(),
@@ -1144,7 +1143,7 @@ async function validateExecutionSnapshot(prepared: PreparedOrder, budget?: Execu
   if (String(market.id) !== approvedMarket.id || market.conditionId?.toLowerCase() !== approvedMarket.conditionId.toLowerCase() || outcome?.name !== approvedMarket.outcome || book.asset_id !== order.assetId || book.market.toLowerCase() !== approvedMarket.conditionId.toLowerCase()) {
     throw new Error("PS_MARKET_IDENTITY: Refreshed market and order book no longer match the signed market outcome.");
   }
-  if (market.active !== true || market.closed !== false || market.restricted === true || market.acceptingOrders !== true || market.enableOrderBook === false) {
+  if (market.active !== true || market.closed !== false || market.acceptingOrders !== true || market.enableOrderBook === false) {
     throw new Error("PS_MARKET_CLOSED: Refreshed market is not accepting this order.");
   }
   const currentVersion = book.version ?? "v1";
@@ -1326,7 +1325,6 @@ async function createServer() {
             conditionId: market.conditionId,
             version: market.version ?? null,
             negRisk: market.negRisk,
-            marketRestricted: market.restricted ?? null,
             acceptingOrders: market.acceptingOrders ?? null,
             endDate: market.endDate ?? null,
             resolutionRules: market.description ?? null,
@@ -1432,7 +1430,6 @@ async function createServer() {
         outcome: selectedOutcome.name,
         assetId,
         version: market.version ?? null,
-        marketRestricted: market.restricted ?? null,
         marketAcceptingOrders: market.acceptingOrders ?? null,
         tickSize: book.tick_size,
         minOrderSize: book.min_order_size,
@@ -1458,7 +1455,6 @@ async function createServer() {
         bookAgeMs: ageMs,
         observedAt,
         source: "Polymarket CLOB",
-        accountGeoblockChecked: false,
       });
       return { content: [{ type: "text", text: `Read the current public ${side} quote. No order was created.` }], structuredContent };
     },
@@ -1656,7 +1652,7 @@ async function createServer() {
         const preparedBase = preparedOrderBaseSchema.parse({
           market: {
             id: marketId, conditionId: market.conditionId, version: protocolVersion, outcome: selectedOutcome.name,
-            negRisk: book.neg_risk, marketRestricted: market.restricted ?? null,
+            negRisk: book.neg_risk,
             acceptingOrders: market.acceptingOrders, tickSize: book.tick_size,
             minOrderSize: book.min_order_size, bookTimestamp: book.timestamp,
           },

@@ -78,7 +78,9 @@ globalThis.fetch = async (input, init = {}) => {
     if (scenario === "provider-unavailable") return new Response("unavailable", { status: 503 });
     body = scenario === "provider-invalid" ? { id: false } : { ...market };
     if (scenario === "wrong-market") body.id = "2";
-    if (scenario === "restricted") body.restricted = true;
+    if (scenario === "restricted-prepare" || scenario === "restricted-submit") body.restricted = true;
+  } else if (url.hostname === "gamma-api.polymarket.com" && url.pathname === "/public-search") {
+    body = { events: [{ title: "Sample event", markets: [{ ...market, restricted: true }] }] };
   } else if (url.hostname === "clob.polymarket.com" && url.pathname === "/book" && ["123", "124", "999"].includes(url.searchParams.get("token_id") ?? "")) {
     const assetId = url.searchParams.get("token_id");
     body = {
@@ -107,7 +109,7 @@ globalThis.fetch = async (input, init = {}) => {
     };
   } else if (url.hostname === "clob.polymarket.com" && url.pathname === "/order" && init.method === "POST") {
     orderPosts += 1;
-    if (scenario !== "submit-fresh" || orderPosts !== 1) process.exit(89);
+    if (!["submit-fresh", "restricted-submit"].includes(scenario) || orderPosts !== 1) process.exit(89);
     return new Response(JSON.stringify({ success: false, errorMsg: "offline fixture blocks order submission; attempts=1" }), {
       status: 403, headers: { "content-type": "application/json" },
     });

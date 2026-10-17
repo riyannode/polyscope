@@ -8,7 +8,7 @@ Errors from public reads include the stable code in the message. Known order-pre
 | `PS_PROVIDER_TIMEOUT` | Polymarket read exceeded its request timeout. | Reads may be retried; a timed-out order POST is `UNKNOWN` and must be reconciled. | Polymarket data did not respond in time. |
 | `PS_PROVIDER_INVALID` | Polymarket returned invalid JSON, an invalid preparation market/book schema, invalid or future book timestamp, missing market text, or malformed book numeric data. | Retry after checking provider status; do not prepare an order from malformed data. | Polymarket returned incomplete or unreadable data. |
 | `PS_RESPONSE_TOO_LARGE` | A Polymarket response exceeded 1 MiB. | Do not retry unchanged; reduce the requested result size where possible. | The provider response was too large to process. |
-| `PS_MARKET_CLOSED` | Market is inactive, closed, restricted, or not accepting orders. | Refresh discovery later; do not submit. | This market is not currently accepting the selected order. |
+| `PS_MARKET_CLOSED` | Market is inactive, closed, or not accepting orders. | Refresh discovery later; do not submit. | This market is not currently accepting the selected order. |
 | `PS_MARKET_UNSUPPORTED` | Required CLOB trading metadata is absent. | Do not submit; use a supported market. | This market does not expose the supported single-market order path. |
 | `PS_MARKET_IDENTITY` | Market, outcome asset, condition, or CLOB book does not match. | Re-run discovery and prepare a new order. | The selected outcome could not be matched to the live order book. |
 | `PS_MARKET_VERSION` | Gamma and CLOB disagree on exchange version or risk mode. | Do not submit; refresh market metadata. | Polymarket trading metadata changed or conflicts. |

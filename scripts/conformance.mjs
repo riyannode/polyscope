@@ -131,6 +131,11 @@ export async function testOfflineArtifact(root = process.cwd()) {
   const tools = await listTools(artifact);
   const prepareTool = tools.find((tool) => tool.name === "prepare_order_signing");
   if (!prepareTool) fail("prepare_order_signing was not returned by tools/list", "tool_catalog_invalid");
+  const searchTool = tools.find((tool) => tool.name === "search_markets");
+  const search = await callTool(artifact, searchTool, { query: "Sample market", limit: 3 }, { fixtures: true });
+  if (search.structuredContent.markets.length !== 1 || "marketRestricted" in search.structuredContent.markets[0]) {
+    fail("market search exposed Gamma restricted metadata", "market_output_invalid");
+  }
   const submitTool = tools.find((tool) => tool.name === "submit_fak_order");
   if (!submitTool) fail("submit_fak_order was not returned by tools/list", "tool_catalog_invalid");
   const base = {
@@ -141,6 +146,16 @@ export async function testOfflineArtifact(root = process.cwd()) {
   };
   const buy = await callTool(artifact, prepareTool, { ...base, side: "BUY", priceLimit: "0.50" }, { fixtures: true });
   const buyOrder = buy.structuredContent.preparedOrder.order;
+  if ("marketRestricted" in buy.structuredContent.preparedOrder.market) {
+    fail("prepared order exposed Gamma restricted metadata", "market_output_invalid");
+  }
+  const restrictedPreparation = await callTool(artifact, prepareTool, {
+    ...base, side: "BUY", priceLimit: "0.50",
+  }, { fixtures: true, fixtureScenario: "restricted-prepare" });
+  if (restrictedPreparation.structuredContent.status !== "PREPARED"
+    || "marketRestricted" in restrictedPreparation.structuredContent.preparedOrder.market) {
+    fail("Gamma restricted metadata incorrectly blocked order preparation", "market_eligibility_invalid");
+  }
   if (buyOrder.orderType !== "FAK" || buyOrder.maxFeePusd !== "0.125" || buyOrder.maxNominalPusd !== "5.13") {
     fail("BUY preparation did not preserve FAK and the fee-inclusive cap", "order_policy_invalid");
   }
@@ -159,6 +174,13 @@ export async function testOfflineArtifact(root = process.cwd()) {
   if (replayApprovalData.message.orderHash !== hashTypedData(replayPrepared.typedData)
     || replayApprovalData.message.signingAddress.toLowerCase() !== replaySigner.address.toLowerCase()) {
     fail("execution approval did not bind the exact order hash and signing address", "approval_binding_invalid");
+  }
+  const validateOrderTool = tools.find((tool) => tool.name === "validate_order_signature");
+  const validOrderSignature = await callTool(artifact, validateOrderTool, {
+    preparedOrder: replayPrepared, signature: await replaySigner.signTypedData(replayPrepared.typedData),
+  }, { fixtures: true });
+  if (validOrderSignature.structuredContent.valid !== true) {
+    fail("metadata-free prepared order did not validate its unchanged EIP-712 signature", "signature_validation_invalid");
   }
   const replayArgs = {
     preparedOrder: replayPrepared,
@@ -222,7 +244,6 @@ export async function testOfflineArtifact(root = process.cwd()) {
     || deposit.structuredContent.preparedOrder.wallet.orderSignerAddress !== "0x0000000000000000000000000000000000000002") {
     fail("Deposit Wallet order payload did not use the documented ERC-7739 TypedDataSign shape", "deposit_wallet_payload_invalid");
   }
-  const validateOrderTool = tools.find((tool) => tool.name === "validate_order_signature");
   const invalidOrderSignature = await callTool(artifact, validateOrderTool, {
     preparedOrder: buy.structuredContent.preparedOrder, signature: `0x${"0".repeat(130)}`,
   }, { fixtures: true });
@@ -274,7 +295,7 @@ export async function testOfflineArtifact(root = process.cwd()) {
   const signedArgs = { ...replayArgs, orderSignature: await replaySigner.signTypedData(replayPrepared.typedData), clobAuth };
   for (const [scenario, errorCode] of [
     ["book-51000", "PS_STALE_BOOK"], ["book-30001", "PS_STALE_BOOK"],
-    ["wrong-book", "PS_MARKET_IDENTITY"], ["restricted", "PS_MARKET_CLOSED"],
+    ["wrong-book", "PS_MARKET_IDENTITY"], ["restricted-submit", "PS_CLOB_REJECTED"],
     ["geoblocked", "PS_GEOBLOCKED"], ["low-balance", "PS_BALANCE"], ["low-allowance", "PS_ALLOWANCE"],
     ["close-only", "PS_ACCOUNT_CLOSE_ONLY"], ["fee-changed", "PS_APPROVAL_STALE"],
     ["price-bound", "PS_NO_MARKETABLE_LIQUIDITY"], ["submit-fresh", "PS_CLOB_REJECTED"],
@@ -286,6 +307,9 @@ export async function testOfflineArtifact(root = process.cwd()) {
   }
   const quoteTool = tools.find((tool) => tool.name === "get_quote");
   const quote = await callTool(artifact, quoteTool, { marketId: "1", assetId: "123", side: "BUY", size: "10" }, { fixtures: true });
+  if ("marketRestricted" in quote.structuredContent || "accountGeoblockChecked" in quote.structuredContent) {
+    fail("quote exposed removed market or account eligibility metadata", "quote_output_invalid");
+  }
   if (quote.structuredContent.feeRate !== "0.05" || quote.structuredContent.feeExponent !== 1 || quote.structuredContent.estimatedFeePusd !== "0.125") {
     fail("quote did not use the official per-market fee descriptor and exact fee calculation", "fee_calculation_invalid");
   }
@@ -398,7 +422,7 @@ export async function testOfflineArtifact(root = process.cwd()) {
     deterministicCases: [
       "BUY FAK fee-inclusive approval binding", "order-hash and signer-bound approval replay rejection", "bounded preflight stops before POST", "SELL FAK", "market fee descriptor and exact fee calculation",
       "reject invalid approval before CLOB preflight", "reject invalid order signature", "Deposit Wallet TypedDataSign preparation",
-      "51s/119s unsigned preparation; exact 120000ms boundary; 121s structured rejection", "51s quote remains stale", "signed submission rejects stale refreshed book and preserves preflight guards", "fresh signed submission reaches exactly one fixture POST", "provider-invalid structured diagnostics", "reject unsafe CLOB salt precision", "reject cap overrun", "reject wrong outcome asset",
+      "51s/119s unsigned preparation; exact 120000ms boundary; 121s structured rejection", "restricted Gamma metadata omitted and does not reject preparation/submission", "market and quote responses omit removed eligibility metadata", "metadata-free prepared order preserves EIP-712 signature verification", "51s quote remains stale", "signed submission rejects stale refreshed book and preserves preflight guards", "fresh signed submission reaches exactly one fixture POST", "provider-invalid structured diagnostics", "reject unsafe CLOB salt precision", "reject cap overrun", "reject wrong outcome asset",
       "team-attributed news", "PL/PD/SA/CL fixture mapping", "documented team-form filters with mixed-competition history filtering", "independent Brentford/Liverpool form status",
       "safe team-form HTTP 403 permission and 429 rate-limit diagnostics", "complete and unavailable form handling", "provider failure remains unavailable", "official v2 portfolio rows and cursor pagination completeness", "public portfolio address is not wallet proof", "trade tools registered without submission",
     ],

@@ -94,11 +94,17 @@ Polymarket documents ClobAuth, L2 credential derive/create endpoints, wallet sig
 - The geoblock preflight checks Polymarket's request location as seen from the hosted PayBox egress IP. It fails closed when blocked or unavailable and is not evidence of user eligibility; CLOB remains the final enforcement point. No bypass is used.
 - A missing/invalid credential, wallet mismatch, unsupported wallet signature, missing fee descriptor, stale book, closed/changed market, insufficient balance/allowance, geoblock, or timeout blocks submission. No fallback wallet or silent amount/order-type change exists.
 
+### Eligibility metadata and hosted schema compatibility
+
+The Gamma API schema and Polymarket's market-data reference describe market discovery metadata and CLOB order-book fields, but do not define Gamma's `restricted` value as an order-placement prohibition. PolyScope therefore does not expose that value as a trading eligibility flag or reject execution based on it alone. Execution still checks market identity, active/closed/accepting-orders status, CLOB availability and exchange constraints, and the official geoblock response; a blocked geoblock response continues to fail closed. [Gamma API OpenAPI schema](https://gamma-api.polymarket.com/docs) · [Polymarket market-data reference](https://github.com/Polymarket/agent-skills/blob/main/market-data.md)
+
+This change removes `marketRestricted` from search, quote, and prepared-order schemas and responses, and removes `accountGeoblockChecked` from quote. Hosted PayBox registrations that persist the previous strict output schemas must refresh them with the updated plugin schema: the old schemas require these fields and reject responses that omit them. The strict prepared-order input schema also rejects in-flight prepared orders containing the removed `market.marketRestricted` property. Prepared orders expire after 120 seconds, so clients should prepare and sign again after switching versions. The order's EIP-712 payload and the separate execution-approval payload are unchanged; local conformance verifies the order hash and signature with the new metadata-free shape. Hosted registration compatibility still needs a PayBox refresh/readback; this PR does not upload a bundle or change the hosted registration.
+
 ## Changed files
 
-- `src/plugin.ts` — exact order-hash and signer approval binding, bounded FAK submit/reconciliation budget, egress-IP geoblock wording, v2 cursor-paginated OPEN positions, and team history query without the 400-producing date filter.
-- `scripts/conformance.mjs` — approval replay, no-POST budget exhaustion, representative portfolio pagination, and numeric team-form filter/no-date regressions.
-- `tests/network-fixtures.mjs` — representative Data API v2 rows and pagination plus offline-only request timing, numeric competition filters, date-filter rejection, and safe 403/429 fixtures; not live CLOB credentials or trade evidence.
+- `src/plugin.ts` — removes Gamma restricted and hardcoded account geoblock metadata from public outputs and removes the restricted-only live execution rejection; preserves documented market, book, exchange, and geoblock checks.
+- `scripts/conformance.mjs` — verifies omitted metadata, unchanged EIP-712 signature validation, and restricted=true preparation/submission behavior alongside existing preflight cases.
+- `tests/network-fixtures.mjs` — adds restricted=true Gamma responses for offline discovery, preparation, and submission checks; fixtures do not represent authenticated CLOB credentials or live trade evidence.
 - `docs/errors.md` — stable error codes, retry guidance, user-facing explanations, and safe football provider HTTP/network failure behavior.
 - `outputs/POLYSCOPE_COMPATIBILITY.md` — this report.
 - `outputs/plugin.mjs` — distributable copy of the built artifact.
