@@ -337,7 +337,9 @@ export async function testOfflineArtifact(root = process.cwd()) {
     const exactForm = await callTool(artifact, researchTool, { league, fixtureId, date: "2026-10-17", days: 0, limit: 3 }, { fixtures: true });
     const fixture = exactForm.structuredContent.fixtures[0];
     const teamFormSources = exactForm.structuredContent.sources.filter((source) => source.purpose === "TEAM_FORM");
-    if (fixture?.formCoverage !== "COMPLETE_LAST_5" || fixture.homeRecentResults.length !== 5 || fixture.awayRecentResults.length !== 5) {
+    if (fixture?.formCoverage !== "COMPLETE_LAST_5" || fixture.formReason !== null
+      || fixture.homeFormResultCount !== 5 || fixture.awayFormResultCount !== 5
+      || fixture.homeRecentResults.length !== 5 || fixture.awayRecentResults.length !== 5) {
       fail(`${league} form was not reported as complete with exactly five results per team`, "soccer_form_invalid");
     }
     if (teamFormSources.length !== 2 || teamFormSources.some((source) => {
@@ -353,7 +355,9 @@ export async function testOfflineArtifact(root = process.cwd()) {
   const mixedFixture = mixedCompetitionForm.structuredContent.fixtures[0];
   const brentfordSource = mixedCompetitionForm.structuredContent.sources.find((source) => source.purpose === "TEAM_FORM" && source.teamProviderId === "402");
   const liverpoolSource = mixedCompetitionForm.structuredContent.sources.find((source) => source.purpose === "TEAM_FORM" && source.teamProviderId === "64");
-  if (mixedFixture?.formCoverage !== "PARTIAL" || brentfordSource?.teamName !== "Brentford FC"
+  if (mixedFixture?.formCoverage !== "PARTIAL" || mixedFixture.homeFormResultCount !== 5
+    || mixedFixture.awayFormResultCount !== 0 || !mixedFixture.formReason?.includes("Liverpool FC (0/5 results)")
+    || !mixedFixture.formReason.includes("HTTP 403") || brentfordSource?.teamName !== "Brentford FC"
     || brentfordSource.availability !== "AVAILABLE" || brentfordSource.returnedResultCount !== 5
     || liverpoolSource?.teamName !== "Liverpool FC" || liverpoolSource.availability !== "UNAVAILABLE"
     || !liverpoolSource.reason?.includes("HTTP 403")) {
@@ -368,8 +372,22 @@ export async function testOfflineArtifact(root = process.cwd()) {
   if (incompleteForm.structuredContent.fixtures[0]?.formCoverage !== "PARTIAL"
     || incompleteForm.structuredContent.fixtures[0]?.homeFormCoverage !== "PARTIAL"
     || incompleteForm.structuredContent.fixtures[0]?.homeFormResultCount !== 4
-    || incompleteForm.structuredContent.fixtures[0]?.homeRecentResults.length !== 4) {
+    || incompleteForm.structuredContent.fixtures[0]?.homeRecentResults.length !== 4
+    || !incompleteForm.structuredContent.fixtures[0]?.formReason?.includes("4/5 results")) {
     fail("partial historical soccer form was not returned with its actual count", "soccer_form_invalid");
+  }
+  const fiveFourForm = await callTool(artifact, researchTool, { league: "PL", fixtureId: "7777", date: "2026-10-20", days: 0, limit: 3 }, { fixtures: true });
+  const fiveFourFixture = fiveFourForm.structuredContent.fixtures[0];
+  if (fiveFourFixture?.formCoverage !== "PARTIAL" || fiveFourFixture.homeFormResultCount !== 5
+    || fiveFourFixture.awayFormResultCount !== 4 || fiveFourFixture.homeRecentResults.length !== 5
+    || fiveFourFixture.awayRecentResults.length !== 4 || !fiveFourFixture.formReason?.includes("Partial History FC (4/5 results)")) {
+    fail("5/4 team form did not retain both teams' available results and explain partial coverage", "soccer_form_invalid");
+  }
+  const zeroZeroForm = await callTool(artifact, researchTool, { league: "PL", fixtureId: "7776", date: "2026-10-20", days: 0, limit: 3 }, { fixtures: true });
+  const zeroZeroFixture = zeroZeroForm.structuredContent.fixtures[0];
+  if (zeroZeroFixture?.formCoverage !== "UNAVAILABLE" || zeroZeroFixture.homeFormResultCount !== 0
+    || zeroZeroFixture.awayFormResultCount !== 0 || !zeroZeroFixture.formReason?.startsWith("Form unavailable:")) {
+    fail("0/0 team form did not report unavailable coverage", "soccer_form_invalid");
   }
   const deniedForm = await callTool(artifact, researchTool, { league: "PL", fixtureId: "8888", date: "2026-10-21", days: 0, limit: 3 }, { fixtures: true });
   const deniedReason = deniedForm.structuredContent.sources.find((source) => source.purpose === "TEAM_FORM" && source.teamProviderId === "888")?.reason ?? "";
@@ -378,7 +396,10 @@ export async function testOfflineArtifact(root = process.cwd()) {
   }
   const rateLimitedForm = await callTool(artifact, researchTool, { league: "SA", fixtureId: "8889", date: "2026-10-22", days: 0, limit: 3 }, { fixtures: true });
   const rateLimitReason = rateLimitedForm.structuredContent.sources.find((source) => source.purpose === "TEAM_FORM" && source.teamProviderId === "889")?.reason ?? "";
-  if (!rateLimitReason.includes("HTTP 429")) {
+  const rateLimitedFixture = rateLimitedForm.structuredContent.fixtures[0];
+  if (!rateLimitReason.includes("HTTP 429") || rateLimitedFixture?.formCoverage !== "PARTIAL"
+    || rateLimitedFixture.homeFormResultCount !== 0 || rateLimitedFixture.awayFormResultCount !== 5
+    || !rateLimitedFixture.formReason?.includes("HTTP 429")) {
     fail("team-form rate-limit failures did not expose the HTTP status", "soccer_provider_error_invalid");
   }
   const unavailable = await callTool(artifact, researchTool, { league: "PL", date: "2026-11-01", days: 0, limit: 3 }, { fixtures: true });
@@ -407,9 +428,9 @@ export async function testOfflineArtifact(root = process.cwd()) {
       "BUY FAK fee-inclusive approval binding", "order-hash and signer-bound approval replay rejection", "bounded preflight stops before POST", "SELL FAK", "market fee descriptor and exact fee calculation",
       "reject invalid approval before CLOB preflight", "reject invalid order signature", "Deposit Wallet TypedDataSign preparation",
       "51s/119s unsigned preparation; exact 120000ms boundary; 121s structured rejection", "51s quote remains stale", "signed submission rejects stale refreshed book and preserves preflight guards", "fresh signed submission reaches exactly one fixture POST", "provider-invalid structured diagnostics", "reject unsafe CLOB salt precision", "reject cap overrun", "reject wrong outcome asset",
-      "team-attributed news", "PL/PD/SA/CL fixture mapping", "documented team-form filters with mixed-competition history filtering", "independent Brentford/Liverpool form status",
+      "team-attributed news", "PL/PD/SA/CL fixture mapping", "documented team-form filters with mixed-competition history filtering", "form counts and explanations for 5/5, 5/4, 5/0, and 0/0 histories", "safe team-form HTTP 403 permission and 429 rate-limit diagnostics",
       "soccer skill continuation for missing xG, missing injury reports, and unavailable browser tools",
-      "safe team-form HTTP 403 permission and 429 rate-limit diagnostics", "complete and unavailable form handling", "provider failure remains unavailable", "official v2 portfolio rows and cursor pagination completeness", "public portfolio address is not wallet proof", "trade tools registered without submission",
+      "provider failure remains unavailable", "official v2 portfolio rows and cursor pagination completeness", "public portfolio address is not wallet proof", "trade tools registered without submission",
     ],
   };
 }

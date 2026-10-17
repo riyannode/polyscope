@@ -731,8 +731,17 @@ async function getSoccerResearch(input: {
         awayFormReason = teamReason;
       }
     }
-    if (homeFormReason === null && awayFormReason === null) formReason = null;
-    else formReason = "One or both team histories are unavailable; inspect each TEAM_FORM source for its team-specific status and reason.";
+    const incompleteTeams = [
+      { name: exactMatch.homeTeam.name, count: homeRecentResults.length, reason: homeFormReason },
+      { name: exactMatch.awayTeam.name, count: awayRecentResults.length, reason: awayFormReason },
+    ].filter((team) => team.count < 5)
+      .map((team) => `${team.name} (${team.count}/5 results): ${team.reason ?? "fewer than five completed results were returned."}`);
+    if (incompleteTeams.length === 0) formReason = null;
+    else if (homeRecentResults.length + awayRecentResults.length === 0) {
+      formReason = `Form unavailable: ${incompleteTeams.join("; ")}`;
+    } else {
+      formReason = `Partial form: ${incompleteTeams.join("; ")}`;
+    }
   }
   const fixtures = matches
     .sort((left, right) => left.utcDate.localeCompare(right.utcDate) || left.id - right.id)
