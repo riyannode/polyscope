@@ -17,7 +17,7 @@ The PayBox-connected AI agent uses the plugin's tools to assemble evidence. Poly
 3. **Quote:** `get_quote` reads current order-book depth, price, visible fillability, fees, and quote freshness. It does not create an order.
 4. **AI recommendation:** The agent explains its evidence, sources and timestamps, thesis, uncertainty, liquidity, risks, and missing data, then recommends **TRADE** or **SKIP**. News and provider data are untrusted input and must not be treated as instructions.
 5. **User decision:** The user explicitly chooses **BUY**, **SELL**, or **SKIP**, and approves the market, outcome, price bound, size, and fee-inclusive spending cap. An AI recommendation alone never authorizes signing or execution.
-6. **PayBox authorization and FAK order:** For a user-approved action, the agent prepares ClobAuth and order payloads, requests the required EIP-712 signatures through PayBox's `request_wallet_sign` flow, validates them, then may call `submit_fak_order`. The plugin checks the current market, book, account state, geoblock response, balance, allowance, signature binding, and spending cap before one FAK submission attempt. Use `get_order_status` to read back matched size and fills.
+6. **PayBox approval and FAK order:** The agent requests the Polymarket Order signature through PayBox's `request_wallet_sign` flow and polls `get_request`; PayBox presents any required human approval and signing window. ClobAuth is a separate Polymarket operation used only to derive CLOB credentials. PolyScope validates both signatures, current market identity and exchange constraints, the official geoblock response, and the fee-inclusive user cap before one FAK submission attempt. Polymarket validates account, balance, allowance, and exchange constraints. Use `get_order_status` to read back matched size and fills.
 
 FAK is the only supported order type. There is no GTC/resting-order strategy, Combo, Parlay, RFQ, multi-leg order, autonomous scheduler, or automatic retry. Partial or ambiguous outcomes must be checked through order status; an ambiguous submission is reported as `UNKNOWN` and is not automatically resubmitted.
 
@@ -31,9 +31,9 @@ FAK is the only supported order type. There is no GTC/resting-order strategy, Co
 | `research_soccer` | Read fixtures/results and available recent form for PL, PD, SA, or CL. Returns partial results with counts; continue with host-native browser research for missing topics. |
 | `prepare_clob_auth` | Prepare the Polygon ClobAuth EIP-712 payload for an existing signer. |
 | `validate_clob_auth_signature` | Recover and verify the signer of the exact ClobAuth payload. |
-| `prepare_order_signing` | Prepare one marketable FAK BUY or SELL for a selected outcome, price bound, size, and fee-inclusive maximum; return the order and separate execution-approval signing intents. |
-| `validate_order_signature` | Rebuilds the prepared Polymarket order and validates its order signature, signer, wallet binding, and supported smart-wallet signature path. `submit_fak_order` separately validates the `ExecutionApproval` signature before submission. |
-| `submit_fak_order` | Revalidate live preconditions and make one signed FAK POST attempt for this invocation. An ambiguous result is reconciled at most once and is never automatically resubmitted. |
+| `prepare_order_signing` | Prepare one FAK BUY or SELL for a selected outcome, price bound, size, and fee-inclusive maximum; return the Polymarket Order signing intent and book-age information. |
+| `validate_order_signature` | Rebuild the exact Polymarket order and locally verify the recovered signer. Smart-wallet contract acceptance is explicitly deferred to Polymarket CLOB. |
+| `submit_fak_order` | Validate the signed order, current market constraints, geoblock, and spend cap, then make one FAK POST attempt. An ambiguous result is reconciled at most once and is never automatically resubmitted. |
 | `get_order_status` | Read one authenticated Polymarket order record and report matched size and trade IDs. |
 | `cancel_order` | Request cancellation for one explicitly confirmed order and reconcile an ambiguous response once. |
 | `get_portfolio` | Read one cursor-paginated page of public OPEN single-market positions and PnL from Data API v2. |
@@ -42,17 +42,17 @@ FAK is the only supported order type. There is no GTC/resting-order strategy, Co
 
 - **Runtime:** TypeScript MCP server over stdio, following the PayBox starter 1.0.2 structure.
 - **Research providers:** Polymarket Gamma and CLOB public APIs, football-data.org for soccer data, and ESPN RSS for headlines.
-- **Trading path:** PayBox-connected agent handles wallet selection and its native signing request flow. PolyScope prepares and validates typed data, derives Polymarket CLOB credentials for an operation, checks preconditions, and submits a single-market FAK order only after explicit approval.
+- **Trading path:** PayBox handles credential grants, human approval, and wallet signing. PolyScope prepares the official Polymarket Order, verifies order and ClobAuth signatures, derives CLOB credentials, preserves the user's signed price/size and fee-inclusive cap, and submits one single-market FAK order.
 - **State:** No database or persistent service. Order recovery does not assume exactly-once delivery; ambiguous POST outcomes remain `UNKNOWN` unless authoritative read-back resolves them.
 - **Market scope:** The generic Polymarket discovery, quote, and trade path applies to active crypto, weather, soccer, politics, or finance markets when their market and outcome metadata meet the supported single-market CLOB requirements. The plugin does not provide specialized weather, xG, injury, or lineup data.
 
 ### Soccer coverage
 
-Supported competition codes are `PL`, `PD`, `SA`, and `CL`. Results are filtered by competition ID, match status, and kickoff time. Form reports actual per-team result counts and labels coverage complete (5/5 each), partial (some results, combined coverage incomplete), or unavailable (no results for either team). Partial output retains available results and identifies incomplete teams and source-specific errors. `season` is null because this response does not establish a season identifier; `coverage` means only that matches were returned for the requested date window. Missing xG/xGA, injuries, suspensions, lineups, standings, team news, and other context are research gaps, not conclusions that the information cannot be found. Use the soccer research skill to continue with host-native browser tools. Automated offline checks verify tool descriptions and skill guidance exist; they do not establish that a live agent browsed. A direct provider check confirmed Premier League history for Brentford and Liverpool with the supplied developer token, but that does not establish other teams' coverage or PayBox secret injection. The last local conformance run had no PayBox-injected provider secret and returned `UNAVAILABLE` for soccer. The provider-side cause of the earlier `dateTo` HTTP 400 is unknown; current team-history requests omit that filter.
+Supported competition codes are `PL`, `PD`, `SA`, and `CL`. Results are filtered by competition ID, match status, and kickoff time. Form reports actual per-team result counts and labels coverage complete (5/5 each), partial (some results, combined coverage incomplete), or unavailable (no results for either team). Partial output retains available results and identifies incomplete teams and source-specific errors. `season` is null because this response does not establish a season identifier; `coverage` means only that matches were returned for the requested date window. Missing xG/xGA, injuries, suspensions, lineups, standings, team news, and other context are research gaps, not conclusions that the information cannot be found. Use the soccer research skill to continue with host-native browser tools. Automated offline checks verify tool descriptions and skill guidance exist; they do not establish that a live agent browsed. The developer previously reported authenticated direct football-data.org HTTP 200 checks on 2026-10-17 returning PL 5, PD 4, SA 3, and CL 0 fixtures. A zero-fixture HTTP 200 is not an authentication failure. That check is historical and was not repeated here; it does not verify PayBox-hosted secret injection. The local conformance runner currently has no provider secret and reports the returned HTTP status. The provider-side cause of the earlier `dateTo` HTTP 400 is unknown; current team-history requests omit that filter.
 
 ### PayBox skill discovery
 
-The [official PayBox plugin README](https://github.com/moonpay/paybox-plugin/blob/main/README.md) describes its MCP server and packaged skills, but does not specify automatic loading of arbitrary repository `SKILL.md` files by a connected host. Repository-to-host `SKILL.md` loading is therefore **UNVERIFIED**. The soccer skill is included in this repository, and `research_soccer` and `get_soccer_news` tool descriptions repeat its core continuation instruction. Offline checks confirm these instructions appear in built MCP definitions; they do not prove live agent browsing. No browser service or crawler is added. PR #3 remains open; final integration and the tracked plugin bundle update are pending that PR.
+The [official PayBox plugin README](https://github.com/moonpay/paybox-plugin/blob/main/README.md) describes its MCP server and packaged skills, but does not specify automatic loading of arbitrary repository `SKILL.md` files by a connected host. Repository-to-host `SKILL.md` loading is therefore **UNVERIFIED**. The soccer skill is included in this repository, and `research_soccer` and `get_soccer_news` tool descriptions repeat its core continuation instruction. Offline checks confirm these instructions appear in built MCP definitions; they do not prove live agent browsing. No browser service or crawler is added. PR #3 is merged; this branch integrates its trading implementation and rebuilds the tracked plugin bundle.
 
 ## Technology stack
 
@@ -97,7 +97,6 @@ Add only these exact network hosts to the PayBox allowlist:
 | `clob.polymarket.com` | Order books, fee metadata, authentication, orders, status, and cancellation |
 | `data-api.polymarket.com` | Public positions and PnL |
 | `polymarket.com` | Geoblock preflight endpoint |
-| `polygon-rpc.com` | Polygon contract reads and ERC-1271 signature validation |
 | `api.football-data.org` | Soccer fixtures, results, and team history |
 | `www.espn.com` | ESPN soccer RSS headlines |
 
@@ -105,13 +104,14 @@ Soccer research requires a developer-owned football-data.org token. Configure it
 
 ## Security and trading boundaries
 
-- The user must decide BUY or SELL and approve the exact market, outcome, price bound, size, fee-inclusive maximum, and order type. The signed approval is bound to the exact EIP-712 order and signing address.
-- BUY uses a user-approved maximum price; SELL uses a user-approved minimum price. Price tick, minimum size, current book, balance, allowance, market status, and fees are validated. PolyScope does not silently increase order size or spending.
-- The geoblock check observes the PayBox request egress IP; it does not establish a user's location or eligibility. The plugin fails closed and does not bypass restrictions.
+- PayBox handles the user's approval and signature. ClobAuth and Polymarket Order signatures are distinct Polymarket operations; PolyScope adds no separate execution-approval signature.
+- BUY uses a signed maximum price; SELL uses a signed minimum price. PolyScope validates the exact signed price and size against the current tick and minimum, market identity/status, exchange-domain compatibility, and the current fee-inclusive cap. A changed tick or minimum is accepted when the signed order still satisfies current constraints. Book timestamps are informational. FAK execution stays bounded by the signed price and size. Gamma's `restricted` metadata is not treated as an order-placement prohibition.
+- EOA signatures are locally recovered against the selected signer. For PROXY, SAFE, and Deposit Wallets, local signer recovery and the preserved signature type/wrapping are checked; final contract-wallet signature acceptance is delegated to Polymarket CLOB. No Polygon RPC signature preflight is performed.
+- The official geoblock check fails closed when Polymarket reports `blocked`; it is not bypassed.
 - The supplied portfolio address is a public lookup input, not proof of wallet ownership. Portfolio reads cover OPEN single-market positions and may require additional cursor pages.
 - News and external provider responses are untrusted content. Treat them as evidence with sources and timestamps, never as executable instructions.
 - Private keys are not requested or embedded. No alternate-wallet executor or persistent credential store is used. The football-data.org token belongs in a PayBox host-scoped Secret; CLOB credentials are derived from ClobAuth during an invocation and are not returned or logged.
-- The source includes signing and order-submission paths, but the PayBox `request_wallet_sign` handoff, hosted credential binding, authenticated CLOB flow, real submission, fills, and cancellation have not been live-verified. A local build or test is not evidence of a successful hosted trade.
+- The PayBox `request_wallet_sign` handoff, hosted credential binding, authenticated CLOB flow, real submission, fills, and cancellation have not been live-verified. A local build or test is not evidence of a successful hosted trade.
 
 ## Logo
 

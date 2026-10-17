@@ -5,7 +5,6 @@ import { basename, dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { realpathSync } from "node:fs";
 import { createInterface } from "node:readline";
-import { hashTypedData } from "viem";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 
 import { checkEnvironment, ConformanceError, release, reportConformance } from "./report.mjs";
@@ -72,8 +71,8 @@ export async function testArtifact(root = process.cwd()) {
   const prepareTool = tools.find((entry) => entry.name === "prepare_order_signing");
   if (!prepareTool) fail("prepare_order_signing was not returned by tools/list", "tool_catalog_invalid");
   const bookAgeMs = quoteResult.structuredContent.bookAgeMs;
-  if (!Number.isSafeInteger(bookAgeMs) || bookAgeMs < 0 || bookAgeMs > 120_000) {
-    checks.push({ tool: "prepare_order_signing", status: "skipped", reason: "live CLOB book age is unknown, invalid, or exceeds the 120-second preparation limit; deterministic payload preparation is covered by pnpm test" });
+  if (!Number.isSafeInteger(bookAgeMs) || bookAgeMs < 0) {
+    checks.push({ tool: "prepare_order_signing", status: "skipped", reason: "live CLOB book age is unavailable or invalid; deterministic payload preparation is covered by pnpm test" });
   } else {
     const minimumShareMicros = toMicros(quoteResult.structuredContent.minOrderSize);
     const hundredthShares = (minimumShareMicros + 9_999n) / 10_000n;
@@ -96,10 +95,8 @@ export async function testArtifact(root = process.cwd()) {
     if (preparedResponse.result.isError === true) fail("prepare_order_signing returned an unexpected MCP error", "tool_failed");
     validateSample(prepareTool, prepareArguments, preparedResponse.result);
     const prepared = preparedResponse.result.structuredContent;
-    if (prepared.status === "REJECTED") {
-      if (prepared.errorCode !== "PS_PREPARATION_STALE_BOOK") fail(`preparation rejected: ${prepared.errorCode}`, "tool_failed");
-      checks.push({ tool: "prepare_order_signing", status: "skipped", reason: prepared.reason });
-    } else {
+    if (prepared.status === "REJECTED") fail(`preparation rejected: ${prepared.errorCode}`, "tool_failed");
+    else {
       if (prepared.submitsOrder !== false || prepared.preparedOrder?.market?.outcome !== outcome.name) {
         fail("prepared payload did not preserve the selected outcome or no-submit boundary", "result_invalid");
       }
@@ -129,10 +126,26 @@ async function callTool(artifact, tool, argumentsValue, options = {}) {
 export async function testOfflineArtifact(root = process.cwd()) {
   const artifact = resolve(root, "dist/plugin.mjs");
   const tools = await listTools(artifact);
+  if (tools.length !== 12) fail(`expected 12 MCP tools, received ${tools.length}`, "tool_catalog_invalid");
+  const removedSchemaFields = ["ExecutionApproval", "executionApprovalSignature", "executionApprovalSigningIntent", "marketRestricted", "accountGeoblockChecked"];
+  for (const tool of tools) {
+    const schemas = JSON.stringify({ inputSchema: tool.inputSchema, outputSchema: tool.outputSchema });
+    if (removedSchemaFields.some((field) => schemas.includes(field))) {
+      fail(`${tool.name} schema contains a removed trading-policy field`, "tool_catalog_invalid");
+    }
+  }
   const prepareTool = tools.find((tool) => tool.name === "prepare_order_signing");
   if (!prepareTool) fail("prepare_order_signing was not returned by tools/list", "tool_catalog_invalid");
+  const searchTool = tools.find((tool) => tool.name === "search_markets");
+  const search = await callTool(artifact, searchTool, { query: "Sample market", limit: 3 }, { fixtures: true });
+  if (search.structuredContent.markets.length !== 1 || "marketRestricted" in search.structuredContent.markets[0]) {
+    fail("market search exposed Gamma restricted metadata", "market_output_invalid");
+  }
   const submitTool = tools.find((tool) => tool.name === "submit_fak_order");
   if (!submitTool) fail("submit_fak_order was not returned by tools/list", "tool_catalog_invalid");
+  if ("executionApprovalSignature" in submitTool.inputSchema.properties) {
+    fail("submit schema still requires a PolyScope execution approval signature", "schema_invalid");
+  }
   const base = {
     marketId: "1", assetId: "123",
     makerAddress: "0x0000000000000000000000000000000000000001",
@@ -141,12 +154,31 @@ export async function testOfflineArtifact(root = process.cwd()) {
   };
   const buy = await callTool(artifact, prepareTool, { ...base, side: "BUY", priceLimit: "0.50" }, { fixtures: true });
   const buyOrder = buy.structuredContent.preparedOrder.order;
-  if (buyOrder.orderType !== "FAK" || buyOrder.maxFeePusd !== "0.125" || buyOrder.maxNominalPusd !== "5.13") {
-    fail("BUY preparation did not preserve FAK and the fee-inclusive cap", "order_policy_invalid");
+  if ("marketRestricted" in buy.structuredContent.preparedOrder.market
+    || "executionApprovalSigningIntent" in buy.structuredContent
+    || "accountGeoblockChecked" in buy.structuredContent) {
+    fail("prepared order exposed removed eligibility or execution-approval metadata", "market_output_invalid");
   }
-  const approval = buy.structuredContent.executionApprovalSigningIntent?.typedData?.message;
-  if (approval?.orderType !== "FAK" || approval?.maxNominalMicros !== "5130000" || approval?.limitPriceMicros !== "500000" || approval?.sizeMicros !== "10000000" || approval?.feeRateMicros !== "50000" || approval?.feeExponent !== 1) {
-    fail("execution approval did not bind FAK and the fee-inclusive cap", "order_policy_invalid");
+  if (buyOrder.orderType !== "FAK" || buyOrder.maxFeePusd !== "0.125" || buyOrder.maxNominalPusd !== "5.13"
+    || buyOrder.price !== "0.50" || buyOrder.size !== "10" || buyOrder.makerAmount !== "5000000" || buyOrder.takerAmount !== "10000000") {
+    fail("BUY order did not preserve the exact user price, size, FAK type, and fee-inclusive cap", "order_policy_invalid");
+  }
+  const restrictedPreparation = await callTool(artifact, prepareTool, { ...base, side: "BUY", priceLimit: "0.50" }, {
+    fixtures: true, fixtureScenario: "restricted-prepare",
+  });
+  if (restrictedPreparation.structuredContent.status !== "PREPARED") {
+    fail("Gamma restricted metadata alone blocked order preparation", "market_eligibility_invalid");
+  }
+  if (buy.structuredContent.preparationFreshness.staleAfterMs !== undefined) {
+    fail("prepared-order response retained an arbitrary age threshold", "order_hash_invalid");
+  }
+  const noVisibleLiquidity = await callTool(artifact, prepareTool, { ...base, side: "BUY", priceLimit: "0.50" }, {
+    fixtures: true, fixtureScenario: "no-visible-liquidity",
+  });
+  if (noVisibleLiquidity.structuredContent.status !== "PREPARED"
+    || noVisibleLiquidity.structuredContent.preparedOrder.order.price !== "0.50"
+    || noVisibleLiquidity.structuredContent.preparedOrder.order.orderType !== "FAK") {
+    fail("lack of visible liquidity added a PolyScope preparation rejection or changed the signed limit", "liquidity_policy_invalid");
   }
   const replaySigner = privateKeyToAccount(generatePrivateKey());
   const replayOrder = await callTool(artifact, prepareTool, {
@@ -154,42 +186,33 @@ export async function testOfflineArtifact(root = process.cwd()) {
     side: "BUY", priceLimit: "0.50",
   }, { fixtures: true });
   const replayPrepared = replayOrder.structuredContent.preparedOrder;
-  const replayApprovalData = replayOrder.structuredContent.executionApprovalSigningIntent.typedData;
-  const replayApprovalSignature = await replaySigner.signTypedData(replayApprovalData);
-  if (replayApprovalData.message.orderHash !== hashTypedData(replayPrepared.typedData)
-    || replayApprovalData.message.signingAddress.toLowerCase() !== replaySigner.address.toLowerCase()) {
-    fail("execution approval did not bind the exact order hash and signing address", "approval_binding_invalid");
+  const orderSignature = await replaySigner.signTypedData(replayPrepared.typedData);
+  const validateOrderTool = tools.find((tool) => tool.name === "validate_order_signature");
+  const validOrderSignature = await callTool(artifact, validateOrderTool, {
+    preparedOrder: replayPrepared, signature: orderSignature,
+  }, { fixtures: true });
+  if (validOrderSignature.structuredContent.localSignerVerified !== true
+    || validOrderSignature.structuredContent.contractWalletAcceptance !== "NOT_APPLICABLE") {
+    fail("metadata-free prepared order did not validate its unchanged Polymarket EIP-712 signature", "signature_validation_invalid");
   }
-  const replayArgs = {
-    preparedOrder: replayPrepared,
-    executionApprovalSignature: replayApprovalSignature,
-    orderSignature: `0x${"0".repeat(130)}`,
-    clobAuth: { timestamp: String(Math.floor(Date.now() / 1000)), nonce: "0", signature: `0x${"0".repeat(130)}` },
+  const futureOrderTimestamp = String(Date.now() + 60_000);
+  const futureTimestampPrepared = {
+    ...replayPrepared,
+    order: { ...replayPrepared.order, timestamp: futureOrderTimestamp },
+    typedData: { ...replayPrepared.typedData, message: { ...replayPrepared.typedData.message, timestamp: futureOrderTimestamp } },
   };
-  const approvedOrderCheck = await callTool(artifact, submitTool, replayArgs, { fixtures: true });
-  if (approvedOrderCheck.structuredContent.errorCode !== "PS_SIGNATURE_INVALID") {
-    fail("valid approval for order A was not distinguished from its invalid order signature", "approval_binding_invalid");
-  }
-  const saltReplay = await callTool(artifact, submitTool, {
-    ...replayArgs,
-    preparedOrder: { ...replayPrepared, order: { ...replayPrepared.order, salt: (BigInt(replayPrepared.order.salt) + 1n).toString() } },
+  const futureTimestampValidation = await callTool(artifact, validateOrderTool, {
+    preparedOrder: futureTimestampPrepared,
+    signature: await replaySigner.signTypedData(futureTimestampPrepared.typedData),
   }, { fixtures: true });
-  if (saltReplay.structuredContent.errorCode !== "PS_APPROVAL_INVALID") {
-    fail("approval for order A authorized order B with a different salt", "approval_replay_accepted");
+  if (futureTimestampValidation.structuredContent.localSignerVerified !== true) {
+    fail("an undocumented order-timestamp freshness gate rejected a correctly signed order", "order_timestamp_invalid");
   }
-  const otherReplaySigner = privateKeyToAccount(generatePrivateKey());
-  const signerReplay = await callTool(artifact, submitTool, {
-    ...replayArgs,
-    preparedOrder: {
-      ...replayPrepared,
-      wallet: {
-        ...replayPrepared.wallet, makerAddress: otherReplaySigner.address,
-        signingAddress: otherReplaySigner.address, orderSignerAddress: otherReplaySigner.address,
-      },
-    },
+  const metadataOnlyChange = await callTool(artifact, validateOrderTool, {
+    preparedOrder: { ...replayPrepared, market: { ...replayPrepared.market, bookTimestamp: "1" } }, signature: orderSignature,
   }, { fixtures: true });
-  if (signerReplay.structuredContent.errorCode !== "PS_APPROVAL_INVALID") {
-    fail("approval for order A authorized an order with a different signer", "approval_replay_accepted");
+  if (metadataOnlyChange.structuredContent.localSignerVerified !== true) {
+    fail("changing unsigned book-age metadata changed Polymarket EIP-712 signature validation", "order_hash_invalid");
   }
   const clobAuthTool = tools.find((tool) => tool.name === "prepare_clob_auth");
   const clobAuthResult = await callTool(artifact, clobAuthTool, { signerAddress: replaySigner.address, nonce: "0" }, { fixtures: true });
@@ -198,18 +221,106 @@ export async function testOfflineArtifact(root = process.cwd()) {
     nonce: clobAuthResult.structuredContent.nonce,
     signature: await replaySigner.signTypedData(clobAuthResult.structuredContent.typedData),
   };
-  const budgetResult = await callTool(artifact, submitTool, {
-    ...replayArgs,
-    orderSignature: await replaySigner.signTypedData(replayPrepared.typedData),
-    clobAuth,
-  }, { fixtures: true, fixtureScenario: "submit-budget" });
-  if (budgetResult.structuredContent.status !== "FAILED"
-    || budgetResult.structuredContent.errorCode !== "PS_EXECUTION_BUDGET_EXHAUSTED") {
-    fail("submit did not stop before its FAK POST when safe budget for reconciliation was unavailable", "submit_budget_invalid");
+  const oldAuthTimestamp = String(Math.floor(Date.now() / 1000) - 301);
+  const oldAuthTypedData = {
+    ...clobAuthResult.structuredContent.typedData,
+    message: { ...clobAuthResult.structuredContent.typedData.message, timestamp: oldAuthTimestamp },
+  };
+  const oldClobAuth = { ...clobAuth, timestamp: oldAuthTimestamp, signature: await replaySigner.signTypedData(oldAuthTypedData) };
+  const submitArgs = { preparedOrder: replayPrepared, orderSignature, clobAuth };
+  const successfulSubmit = await callTool(artifact, submitTool, submitArgs, { fixtures: true, fixtureScenario: "submit-valid" });
+  if (successfulSubmit.structuredContent.status !== "SUBMITTED" || !successfulSubmit.structuredContent.orderId) {
+    fail("a valid signed FAK order without ExecutionApproval did not reach one intercepted CLOB POST", "submit_invalid");
+  }
+  const oldAuthSubmit = await callTool(artifact, submitTool, { ...submitArgs, clobAuth: oldClobAuth }, {
+    fixtures: true, fixtureScenario: "submit-stale-auth",
+  });
+  if (oldAuthSubmit.structuredContent.status !== "SUBMITTED") {
+    fail("an undocumented 300-second ClobAuth cutoff blocked credential derivation", "clob_auth_freshness_invalid");
+  }
+  for (const [scenario, age] of [["restricted-submit", 0], ["submit-stale-book", 51_000], ["submit-future-book", null], ["missing-book-timestamp", null]]) {
+    const result = await callTool(artifact, submitTool, submitArgs, { fixtures: true, fixtureScenario: scenario });
+    if (result.structuredContent.status !== "SUBMITTED") {
+      fail(`${scenario} alone incorrectly blocked a signed limit-bounded FAK order`, "submit_preflight_invalid");
+    }
+    if (age > 0 && result.structuredContent.errorCode !== null) fail("stale informational book age created an execution error", "submit_preflight_invalid");
+  }
+  const depositSigner = privateKeyToAccount(generatePrivateKey());
+  const depositOrder = await callTool(artifact, prepareTool, {
+    ...base, makerAddress: "0x0000000000000000000000000000000000000002",
+    signingAddress: depositSigner.address, walletType: "DEPOSIT_WALLET", side: "BUY", priceLimit: "0.50",
+  }, { fixtures: true });
+  const depositPrepared = depositOrder.structuredContent.preparedOrder;
+  const depositOrderSignature = await depositSigner.signTypedData(depositPrepared.typedData);
+  const depositValidation = await callTool(artifact, validateOrderTool, {
+    preparedOrder: depositPrepared, signature: depositOrderSignature,
+  }, { fixtures: true });
+  if (depositValidation.structuredContent.localSignerVerified !== true
+    || depositValidation.structuredContent.contractWalletAcceptance !== "DEFERRED_TO_CLOB"
+    || (depositValidation.structuredContent.signedOrderSignature?.length ?? 0) <= depositOrderSignature.length) {
+    fail("Deposit Wallet signer recovery or ERC-7739 wrapping was not reported distinctly from CLOB contract acceptance", "deposit_wallet_signature_invalid");
+  }
+  const depositAuthResult = await callTool(artifact, clobAuthTool, { signerAddress: depositSigner.address, nonce: "0" }, { fixtures: true });
+  const depositClobAuth = {
+    timestamp: depositAuthResult.structuredContent.timestamp,
+    nonce: depositAuthResult.structuredContent.nonce,
+    signature: await depositSigner.signTypedData(depositAuthResult.structuredContent.typedData),
+  };
+  const depositSubmit = await callTool(artifact, submitTool, {
+    preparedOrder: depositPrepared, orderSignature: depositOrderSignature, clobAuth: depositClobAuth,
+  }, { fixtures: true, fixtureScenario: "submit-deposit-wallet" });
+  if (depositSubmit.structuredContent.status !== "SUBMITTED") {
+    fail("valid Deposit Wallet signing data did not reach its single intercepted CLOB POST without Polygon RPC", "deposit_wallet_submit_invalid");
+  }
+  for (const [scenario, expectedCode, prepared, signature] of [
+    ["snapshot-min-decrease", null, replayPrepared, orderSignature],
+    ["snapshot-min-increase", "PS_SIZE_BELOW_MINIMUM", replayPrepared, orderSignature],
+    ["snapshot-min-zero", "PS_PROVIDER_INVALID", replayPrepared, orderSignature],
+    ["snapshot-tick-valid", null, replayPrepared, orderSignature],
+    ["snapshot-risk-changed", "PS_MARKET_CHANGED", replayPrepared, orderSignature],
+  ]) {
+    const result = await callTool(artifact, submitTool, { preparedOrder: prepared, orderSignature: signature, clobAuth }, {
+      fixtures: true, fixtureScenario: scenario,
+    });
+    if (expectedCode === null ? result.structuredContent.status !== "SUBMITTED" : result.structuredContent.errorCode !== expectedCode) {
+      fail(`${scenario} did not apply current market constraints to the exact signed order`, "execution_snapshot_invalid");
+    }
+  }
+  const offTickPreparedResponse = await callTool(artifact, prepareTool, {
+    ...base, makerAddress: replaySigner.address, signingAddress: replaySigner.address,
+    side: "BUY", priceLimit: "0.51", maxNominalPusd: "5.23",
+  }, { fixtures: true });
+  const offTickPrepared = offTickPreparedResponse.structuredContent.preparedOrder;
+  const offTickSignature = await replaySigner.signTypedData(offTickPrepared.typedData);
+  const offTickResult = await callTool(artifact, submitTool, {
+    preparedOrder: offTickPrepared, orderSignature: offTickSignature, clobAuth,
+  }, { fixtures: true, fixtureScenario: "snapshot-tick-invalid" });
+  if (offTickResult.structuredContent.errorCode !== "PS_PRICE_INVALID") {
+    fail(`signed price that violates the current tick size returned ${offTickResult.structuredContent.errorCode ?? offTickResult.structuredContent.status}`, "execution_snapshot_invalid");
+  }
+  const invalidOrderSignature = await callTool(artifact, submitTool, {
+    ...submitArgs, orderSignature: `0x${"0".repeat(130)}`,
+  }, { fixtures: true });
+  if (invalidOrderSignature.structuredContent.errorCode !== "PS_SIGNATURE_INVALID") {
+    fail("invalid Polymarket order signature was accepted", "signature_validation_invalid");
+  }
+  const geoblocked = await callTool(artifact, submitTool, submitArgs, { fixtures: true, fixtureScenario: "geoblocked" });
+  if (geoblocked.structuredContent.errorCode !== "PS_GEOBLOCKED") fail("official blocked geoblock response did not prevent submission", "geoblock_invalid");
+  const missingCredentials = await callTool(artifact, submitTool, submitArgs, { fixtures: true, fixtureScenario: "missing-credentials" });
+  if (missingCredentials.structuredContent.errorCode !== "PS_CLOB_AUTH_FAILED") fail("missing CLOB credentials were not reported", "clob_auth_invalid");
+  const changedFee = await callTool(artifact, submitTool, submitArgs, { fixtures: true, fixtureScenario: "fee-changed" });
+  if (changedFee.structuredContent.errorCode !== "PS_SPENDING_CAP") {
+    fail("current fee increase was not bounded by the user-approved all-in spending cap", "spending_cap_invalid");
+  }
+  const ambiguous = await callTool(artifact, submitTool, submitArgs, { fixtures: true, fixtureScenario: "submit-ambiguous" });
+  if (ambiguous.structuredContent.status !== "UNKNOWN" || ambiguous.structuredContent.errorCode !== "PS_SUBMISSION_UNKNOWN") {
+    fail("ambiguous order POST was retried or presented as a confirmed result", "ambiguous_submit_invalid");
   }
   const sell = await callTool(artifact, prepareTool, { ...base, side: "SELL", priceLimit: "0.49" }, { fixtures: true });
-  if (sell.structuredContent.preparedOrder.order.side !== "SELL" || sell.structuredContent.preparedOrder.order.orderType !== "FAK") {
-    fail("SELL preparation did not preserve the user-selected FAK order", "order_policy_invalid");
+  const sellOrder = sell.structuredContent.preparedOrder.order;
+  if (sellOrder.side !== "SELL" || sellOrder.orderType !== "FAK" || sellOrder.price !== "0.49"
+    || sellOrder.size !== "10" || sellOrder.makerAmount !== "10000000" || sellOrder.takerAmount !== "4900000") {
+    fail("SELL order did not preserve the exact user minimum price, size, and FAK type", "order_policy_invalid");
   }
   const deposit = await callTool(artifact, prepareTool, {
     ...base, makerAddress: "0x0000000000000000000000000000000000000002",
@@ -222,46 +333,38 @@ export async function testOfflineArtifact(root = process.cwd()) {
     || deposit.structuredContent.preparedOrder.wallet.orderSignerAddress !== "0x0000000000000000000000000000000000000002") {
     fail("Deposit Wallet order payload did not use the documented ERC-7739 TypedDataSign shape", "deposit_wallet_payload_invalid");
   }
-  const validateOrderTool = tools.find((tool) => tool.name === "validate_order_signature");
-  const invalidOrderSignature = await callTool(artifact, validateOrderTool, {
-    preparedOrder: buy.structuredContent.preparedOrder, signature: `0x${"0".repeat(130)}`,
-  }, { fixtures: true });
-  if (invalidOrderSignature.structuredContent.valid !== false || invalidOrderSignature.structuredContent.recoveredSignerAddress !== null) {
-    fail("invalid order signature was accepted", "signature_validation_invalid");
+  const stalePrepare = await callTool(artifact, prepareTool, { ...base, side: "BUY", priceLimit: "0.50" }, {
+    fixtures: true, fixtureScenario: "book-121000",
+  });
+  if (stalePrepare.structuredContent.status !== "PREPARED" || stalePrepare.structuredContent.preparationFreshness.bookAgeMs !== 121_000) {
+    fail("book age beyond 120 seconds blocked preparation", "preparation_freshness_invalid");
   }
   const unsafeSaltOrder = await runOperation(artifact, {
     method: "tools/call",
     params: { name: submitTool.name, arguments: {
       preparedOrder: { ...buy.structuredContent.preparedOrder, order: { ...buyOrder, salt: "9007199254740992" } },
-      executionApprovalSignature: `0x${"0".repeat(130)}`, orderSignature: `0x${"0".repeat(130)}`,
+      orderSignature: `0x${"0".repeat(130)}`,
       clobAuth: { timestamp: String(Math.floor(Date.now() / 1000)), nonce: "0", signature: `0x${"0".repeat(130)}` },
     } },
   }, { fixtures: true });
   if (unsafeSaltOrder.result?.isError !== true) fail("submit accepted an order salt that cannot be serialized exactly", "order_serialization_invalid");
-  for (const age of [51_000, 119_000, 120_000, 120_001, 121_000]) {
-    const result = await callTool(artifact, prepareTool, { ...base, side: "BUY", priceLimit: "0.50" }, {
-      fixtures: true, fixtureScenario: `book-${age}`,
-    });
-    const output = result.structuredContent;
-    if (output.preparationFreshness.bookAgeMs !== age || output.preparationFreshness.staleAfterMs !== 120_000
-      || output.status !== (age <= 120_000 ? "PREPARED" : "REJECTED")) {
-      fail("unsigned preparation did not enforce the exact millisecond freshness threshold", "preparation_freshness_invalid");
-    }
-    if (age > 120_000 && (output.errorCode !== "PS_PREPARATION_STALE_BOOK" || "preparedOrder" in output
-      || "requestWalletSignIntent" in output || "executionApprovalSigningIntent" in output)) {
-      fail("stale preparation was not an explicit rejection without signing intents", "preparation_rejection_invalid");
-    }
-  }
   for (const [scenario, errorCode] of [
     ["wrong-market", "PS_MARKET_IDENTITY"], ["wrong-book", "PS_MARKET_IDENTITY"],
     ["provider-invalid", "PS_PROVIDER_INVALID"], ["provider-invalid-json", "PS_PROVIDER_INVALID"],
-    ["invalid-level", "PS_PROVIDER_INVALID"], ["invalid-timestamp", "PS_PROVIDER_INVALID"],
-    ["future-timestamp", "PS_PROVIDER_INVALID"], ["provider-unavailable", "PS_PROVIDER_UNAVAILABLE"],
+    ["invalid-level", "PS_PROVIDER_INVALID"], ["provider-unavailable", "PS_PROVIDER_UNAVAILABLE"],
   ]) {
     const result = await callTool(artifact, prepareTool, { ...base, side: "BUY", priceLimit: "0.50" }, { fixtures: true, fixtureScenario: scenario });
     if (result.structuredContent.status !== "REJECTED" || result.structuredContent.errorCode !== errorCode
       || !result.structuredContent.reason || "preparedOrder" in result.structuredContent) {
       fail("known preparation failure did not return a distinguishable structured rejection", "preparation_rejection_invalid");
+    }
+  }
+  for (const scenario of ["invalid-timestamp", "future-timestamp", "missing-book-timestamp"]) {
+    const result = await callTool(artifact, prepareTool, { ...base, side: "BUY", priceLimit: "0.50" }, {
+      fixtures: true, fixtureScenario: scenario,
+    });
+    if (result.structuredContent.status !== "PREPARED" || result.structuredContent.preparationFreshness.bookAgeMs !== null) {
+      fail(`${scenario} book timestamp affected preparation instead of remaining informational`, "book_timestamp_invalid");
     }
   }
   const unexpected = await runOperation(artifact, {
@@ -271,36 +374,17 @@ export async function testOfflineArtifact(root = process.cwd()) {
     || !unexpected.result.content.some((item) => item.text?.includes("fixture unexpected programming failure"))) {
     fail("unexpected programming failure was converted into a known preparation rejection", "unexpected_failure_hidden");
   }
-  const signedArgs = { ...replayArgs, orderSignature: await replaySigner.signTypedData(replayPrepared.typedData), clobAuth };
-  for (const [scenario, errorCode] of [
-    ["book-51000", "PS_STALE_BOOK"], ["book-30001", "PS_STALE_BOOK"],
-    ["wrong-book", "PS_MARKET_IDENTITY"], ["restricted", "PS_MARKET_CLOSED"],
-    ["geoblocked", "PS_GEOBLOCKED"], ["low-balance", "PS_BALANCE"], ["low-allowance", "PS_ALLOWANCE"],
-    ["close-only", "PS_ACCOUNT_CLOSE_ONLY"], ["fee-changed", "PS_APPROVAL_STALE"],
-    ["price-bound", "PS_NO_MARKETABLE_LIQUIDITY"], ["submit-fresh", "PS_CLOB_REJECTED"],
-  ]) {
-    const result = await callTool(artifact, submitTool, signedArgs, { fixtures: true, fixtureScenario: scenario });
-    if (result.structuredContent.errorCode !== errorCode) {
-      fail(`submission preflight ${scenario} did not preserve ${errorCode}`, "submit_preflight_invalid");
-    }
-  }
   const quoteTool = tools.find((tool) => tool.name === "get_quote");
   const quote = await callTool(artifact, quoteTool, { marketId: "1", assetId: "123", side: "BUY", size: "10" }, { fixtures: true });
+  if ("marketRestricted" in quote.structuredContent || "accountGeoblockChecked" in quote.structuredContent) {
+    fail("quote exposed removed market or account eligibility metadata", "quote_output_invalid");
+  }
   if (quote.structuredContent.feeRate !== "0.05" || quote.structuredContent.feeExponent !== 1 || quote.structuredContent.estimatedFeePusd !== "0.125") {
     fail("quote did not use the official per-market fee descriptor and exact fee calculation", "fee_calculation_invalid");
   }
   const staleQuote = await callTool(artifact, quoteTool, { marketId: "1", assetId: "123", side: "BUY", size: "10" }, { fixtures: true, fixtureScenario: "book-51000" });
   if (staleQuote.structuredContent.freshness !== "STALE" || staleQuote.structuredContent.bookAgeMs !== 51_000
-    || staleQuote.structuredContent.staleAfterSeconds !== 30) fail("quote freshness changed with preparation", "quote_freshness_invalid");
-  const rejected = await callTool(artifact, submitTool, {
-    preparedOrder: buy.structuredContent.preparedOrder,
-    executionApprovalSignature: `0x${"0".repeat(130)}`,
-    orderSignature: `0x${"0".repeat(130)}`,
-    clobAuth: { timestamp: String(Math.floor(Date.now() / 1000)), nonce: "0", signature: `0x${"0".repeat(130)}` },
-  }, { fixtures: true });
-  if (rejected.structuredContent.status !== "REJECTED" || rejected.structuredContent.errorCode !== "PS_APPROVAL_INVALID") {
-    fail("invalid execution approval did not reject before the CLOB preflight", "approval_validation_invalid");
-  }
+    || staleQuote.structuredContent.staleAfterSeconds !== 30) fail("quote freshness label stopped being informational", "quote_freshness_invalid");
   const overCap = await runOperation(artifact, {
     method: "tools/call",
     params: { name: prepareTool.name, arguments: { ...base, side: "BUY", priceLimit: "0.50", maxNominalPusd: "5.12" } },
@@ -425,12 +509,11 @@ export async function testOfflineArtifact(root = process.cwd()) {
   return {
     status: "passed",
     deterministicCases: [
-      "BUY FAK fee-inclusive approval binding", "order-hash and signer-bound approval replay rejection", "bounded preflight stops before POST", "SELL FAK", "market fee descriptor and exact fee calculation",
-      "reject invalid approval before CLOB preflight", "reject invalid order signature", "Deposit Wallet TypedDataSign preparation",
-      "51s/119s unsigned preparation; exact 120000ms boundary; 121s structured rejection", "51s quote remains stale", "signed submission rejects stale refreshed book and preserves preflight guards", "fresh signed submission reaches exactly one fixture POST", "provider-invalid structured diagnostics", "reject unsafe CLOB salt precision", "reject cap overrun", "reject wrong outcome asset",
-      "team-attributed news", "PL/PD/SA/CL fixture mapping", "documented team-form filters with mixed-competition history filtering", "form counts and explanations for 5/5, 5/4, 5/0, and 0/0 histories", "safe team-form HTTP 403 permission and 429 rate-limit diagnostics",
-      "soccer skill continuation for missing xG, missing injury reports, and unavailable browser tools",
-      "provider failure remains unavailable", "official v2 portfolio rows and cursor pagination completeness", "public portfolio address is not wallet proof", "trade tools registered without submission",
+      "BUY FAK preserves exact signed limit, size, precision, and fee-inclusive cap", "lack of visible liquidity does not block bounded FAK preparation", "no ExecutionApproval signature is required", "signed order is accepted for exactly one intercepted CLOB POST", "undocumented 300-second ClobAuth cutoff removed", "undocumented order-timestamp freshness cutoff removed", "SELL FAK preserves exact signed minimum price and size", "market fee descriptor and exact fee calculation",
+      "reject invalid Polymarket order signature", "reject real provider geoblock", "missing CLOB credentials handled", "Deposit Wallet TypedDataSign preparation", "local smart-wallet signer recovery is distinct from deferred CLOB acceptance", "Deposit Wallet ERC-7739 order reaches exactly one intercepted CLOB POST without Polygon RPC",
+      "121s book age is informational for preparation", "future, invalid, missing, and stale book timestamps do not block bounded FAK execution", "changed minimum decrease and still-valid tick are accepted", "increased minimum and invalid current tick reject the exact signed order", "zero current minimum is rejected as invalid provider data", "changed risk mode rejects an incompatible exchange domain", "restricted Gamma metadata omitted and does not reject preparation/submission", "market and quote responses omit removed eligibility metadata", "unsigned book metadata does not change EIP-712 signature validation", "51s quote remains labeled stale", "51s book age alone does not block bounded FAK execution", "ambiguous submission is reconciled once and never reposted", "provider-invalid structured diagnostics", "reject unsafe CLOB salt precision", "reject fee-inclusive cap overrun", "reject wrong outcome asset",
+      "team-attributed news", "PL/PD/SA/CL fixture mapping", "documented team-form filters with mixed-competition history filtering", "form counts and explanations for 5/5, 5/4, 5/0, and 0/0 histories",
+      "safe team-form HTTP 403 permission and 429 rate-limit diagnostics", "soccer skill continuation for missing xG, missing injury reports, and unavailable browser tools", "provider failure remains unavailable", "official v2 portfolio rows and cursor pagination completeness", "public portfolio address is not wallet proof", "trade tools registered without submission",
     ],
   };
 }
