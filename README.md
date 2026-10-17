@@ -12,7 +12,7 @@ PolyScope is a PayBox plugin for AI-assisted Polymarket research and user-approv
 
 [Live status](#live-validation-status) · [11 tools](#tools) · [Workflow](#research-to-trade-workflow) · [Architecture](#architecture) · [Setup & build](#local-setup-and-build) · [Validation evidence](outputs/POLYSCOPE_COMPATIBILITY.md#local-validation-evidence-2026-10-18)
 
-11 PayBox plugin tools cover market discovery, soccer research, quote / liquidity analysis, FAK/FOK preparation, PayBox EIP-712 signing, exact signed-wire validation, and provider-authoritative submission/reconciliation. Successful trading is not yet verified.
+PolyScope exposes 11 tools through PayBox for market discovery, soccer research, quote and liquidity analysis, FAK/FOK preparation, EIP-712 payload preparation, signed-wire validation, and provider-authoritative submission/reconciliation. Live signing and CLOB submission were verified; a successful fill/cancellation is not yet verified.
 
 ## Live validation status
 
@@ -23,7 +23,7 @@ PolyScope is a PayBox plugin for AI-assisted Polymarket research and user-approv
 - Hosted CLOB result: HTTP 403 / `PS_CLOB_FORBIDDEN`; no order created and no funds spent
 - Successful fill / cancellation: not yet verified
 
-Verified wallet binding: owner/signing EOA `0x7bdE0dd8acC78f04AAcE3e7b488E369F60a3CB9B`; Deposit Wallet / maker `0xB4BC85B0C28C3d27955c44dAf0Aa2aaf98c78059`.
+Wallet binding for the live Type-3 signing path was verified.
 
 The exact cause of the hosted CLOB 403 is unproven. Local Indonesia connectivity reports `blocked=false`; this does not establish the hosted rejection as a geoblock. See [`outputs/POLYSCOPE_COMPATIBILITY.md`](outputs/POLYSCOPE_COMPATIBILITY.md) for validation details.
 
