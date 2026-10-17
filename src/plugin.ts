@@ -259,7 +259,9 @@ const soccerEdgeOutputSchema = z.object({
   requestedShares: z.string().nullable(), fillableShares: z.string().nullable(), unfilledShares: z.string().nullable(),
   bestBid: z.string().nullable(), bestAsk: z.string().nullable(), spread: z.string().nullable(), depthWeightedExecutionPrice: z.string().nullable(), estimatedFeesPusd: z.string().nullable(),
   effectiveBuyCostPerShare: z.string().nullable(), grossProbabilityPriceDifference: z.string().nullable(), netEdgePerShare: z.string().nullable(),
-  estimatedExpectedValuePusd: z.string().nullable(), quoteObservedAt: z.string().datetime().nullable(), quoteFreshness: z.enum(["FRESH", "STALE", "UNKNOWN"]),
+  estimatedExpectedValuePusd: z.string().nullable(), quoteObservedAt: z.string().datetime().nullable(), quoteBookTimestamp: z.string().nullable(),
+  quoteFreshness: z.enum(["FRESH", "STALE", "UNKNOWN"]), quoteFreshnessAtCapture: z.enum(["FRESH", "STALE", "UNKNOWN"]),
+  quoteAgeMsAtAnalysis: z.number().int().nonnegative().nullable(), quoteStaleAfterSeconds: z.literal(30),
   calculationAssumptions: z.array(z.string()),
   identityEvidence: z.array(z.object({ provider: z.string(), url: z.string().url(), observedAt: z.string().datetime(), publishedAt: z.string().datetime().nullable(),
     verificationStatus: fixtureEvidenceStatusSchema, confidenceCategory: z.enum(["LOW", "MODERATE", "HIGH"]), confidenceReason: z.string(),
@@ -591,12 +593,15 @@ const SPORTS_COMPETITIONS = {
   CL: { name: "UEFA Champions League", competitionId: "2001" },
 } as const;
 
+const API_FOOTBALL_COMPETITION_IDS = { PL: 39, PD: 140, SA: 135, CL: 2 } as const;
+
 type SoccerLeague = keyof typeof SPORTS_COMPETITIONS;
 
 const footballTeamSchema = z.object({ id: z.number().int().positive(), name: z.string().min(1) }).passthrough();
 const footballDataMatchSchema = z.object({
   id: z.number().int().positive(), utcDate: z.string().datetime(), status: z.string().min(1),
   lastUpdated: z.string().datetime().nullable().optional(),
+  season: z.object({ startDate: z.string().nullable().optional(), endDate: z.string().nullable().optional() }).passthrough().optional(),
   competition: z.object({ id: z.number().int().positive().optional(), code: z.string().optional(), name: z.string().optional() }).passthrough().optional(),
   homeTeam: footballTeamSchema, awayTeam: footballTeamSchema,
   score: z.object({ fullTime: z.object({
@@ -683,6 +688,32 @@ function providerCompetitionMatches(league: SoccerLeague, providerName: string):
   return accepted.includes(name);
 }
 
+function resolveApiFootballSeason(league: SoccerLeague, date: string, evidence?: { startDate?: string | null; endDate?: string | null }): number | null {
+  if (!validDate(date)) return null;
+  const month = Number(date.slice(5, 7));
+  const year = Number(date.slice(0, 4));
+  const seasonStartMonth = league === "CL" ? 7 : 8;
+  const calendarSeason = month >= seasonStartMonth ? year : month <= 5 ? year - 1 : null;
+  const startDate = evidence?.startDate ?? undefined;
+  const endDate = evidence?.endDate ?? undefined;
+  if ((startDate !== undefined && !validDate(startDate)) || (endDate !== undefined && !validDate(endDate))) return null;
+  if (startDate !== undefined && endDate !== undefined) {
+    return startDate <= endDate && startDate <= date && date <= endDate ? Number(startDate.slice(0, 4)) : null;
+  }
+  if (calendarSeason === null) return null;
+  if (startDate !== undefined && (startDate > date || Number(startDate.slice(0, 4)) !== calendarSeason)) return null;
+  if (endDate !== undefined && (date > endDate || Number(endDate.slice(0, 4)) !== calendarSeason + 1)) return null;
+  return calendarSeason;
+}
+
+function apiFootballFixtureUrl(league: SoccerLeague, season: number | null, date: string): string {
+  return apiFootballUrl("fixtures", {
+    league: String(API_FOOTBALL_COMPETITION_IDS[league]),
+    ...(season === null ? {} : { season: String(season) }),
+    date, timezone: "UTC",
+  });
+}
+
 function apiFootballUrl(path: string, parameters: Record<string, string>): string {
   const url = new URL(`${API_FOOTBALL_API}/${path}`);
   for (const [key, value] of Object.entries(parameters)) url.searchParams.set(key, value);
@@ -742,15 +773,18 @@ async function getApiFootballTeamStatistics(match: z.infer<typeof apiFootballFix
   };
 }
 
-async function getApiFootballEnrichment(fixture: z.infer<typeof soccerFixtureSchema>, league: SoccerLeague) {
+async function getApiFootballEnrichment(fixture: z.infer<typeof soccerFixtureSchema>, league: SoccerLeague,
+  seasonEvidence?: { startDate?: string | null; endDate?: string | null }) {
   const fixtureDate = fixture.kickoffUtc.slice(0, 10);
-  const fixturesUrl = apiFootballUrl("fixtures", { date: fixtureDate, timezone: "UTC" });
+  const season = resolveApiFootballSeason(league, fixtureDate, seasonEvidence);
+  const fixturesUrl = apiFootballFixtureUrl(league, season, fixtureDate);
   const observedAt = new Date().toISOString();
   const unavailable = (reason: string) => ({
     availability: "UNAVAILABLE" as const, reason, sourceUrl: fixturesUrl, observedAt,
     matchIdentity: null, homeStats: null, awayStats: null,
     sources: [{ provider: "API-Football" as const, purpose: "MATCH_ENRICHMENT" as const, url: fixturesUrl, observedAt, availability: "UNAVAILABLE" as const, reason }],
   });
+  if (season === null) return unavailable("API-Football enrichment was not requested because football-data.org season metadata was invalid or conflicting, or the fixture date is ambiguous under the competition calendar.");
   const listing = await getApiFootballJson(fixturesUrl);
   if (!listing.ok) return unavailable(listing.reason);
   const parsedListing = apiFootballFixturesResponseSchema.safeParse(listing.data);
@@ -759,7 +793,8 @@ async function getApiFootballEnrichment(fixture: z.infer<typeof soccerFixtureSch
   const awayName = normalizedTeamName(fixture.awayTeam);
   const targetKickoff = Date.parse(fixture.kickoffUtc);
   const candidates = parsedListing.data.response.filter((entry) =>
-    providerCompetitionMatches(league, entry.league.name)
+    entry.league.id === API_FOOTBALL_COMPETITION_IDS[league] && entry.league.season === season
+      && providerCompetitionMatches(league, entry.league.name)
       && normalizedTeamName(entry.teams.home.name) === homeName
       && normalizedTeamName(entry.teams.away.name) === awayName
       && Date.parse(entry.fixture.date) === targetKickoff);
@@ -804,10 +839,10 @@ function apiFootballFallbackCoverage(requestedDateFrom: string, requestedDateTo:
 
 async function getApiFootballFallback(league: SoccerLeague, date: string, requestedDateFrom: string, requestedDateTo: string,
   fixtureIdentity?: z.infer<typeof fixtureIdentitySchema>, exactFixtureRequested = false) {
-  const sourceUrl = apiFootballUrl("fixtures", { date, timezone: "UTC" });
+  const season = resolveApiFootballSeason(league, date);
+  const sourceUrl = apiFootballFixtureUrl(league, season, date);
   const observedAt = new Date().toISOString();
   const coverage = apiFootballFallbackCoverage(requestedDateFrom, requestedDateTo, date);
-  const listing = await getApiFootballJson(sourceUrl);
   const unavailable = (reason: string, httpStatus: number | null, verificationStatus: z.infer<typeof fixtureEvidenceStatusSchema> = "UNVERIFIED") => ({
     diagnostic: {
       provider: "API-Football" as const, availability: "UNAVAILABLE" as const, reason, sourceUrl, observedAt, httpStatus,
@@ -817,10 +852,13 @@ async function getApiFootballFallback(league: SoccerLeague, date: string, reques
     },
     fixtures: [] as z.infer<typeof providerQualifiedFixtureSchema>[],
   });
+  if (season === null) return unavailable("API-Football fallback was not requested because the competition season could not be established safely from the requested date.", null);
+  const listing = await getApiFootballJson(sourceUrl);
   if (!listing.ok) return unavailable(listing.reason, listing.httpStatus ?? null);
   const parsed = apiFootballFixturesResponseSchema.safeParse(listing.data);
   if (!parsed.success) return unavailable("API-Football returned an unexpected fixtures response shape.", listing.httpStatus);
-  const dayFixtures = parsed.data.response.filter((fixture) => providerCompetitionMatches(league, fixture.league.name)
+  const dayFixtures = parsed.data.response.filter((fixture) => fixture.league.id === API_FOOTBALL_COMPETITION_IDS[league]
+    && fixture.league.season === season && providerCompetitionMatches(league, fixture.league.name)
     && new Date(fixture.fixture.date).toISOString().slice(0, 10) === date);
   if (dayFixtures.length === 0) return unavailable("API-Football returned a valid response with no fixtures for the requested competition and UTC date.", listing.httpStatus);
 
@@ -1137,7 +1175,7 @@ async function getSoccerResearch(input: {
       exactFixture.formSources = sources.filter((source) => source.provider === "football-data.org" && source.purpose === "TEAM_FORM")
         .map((source) => ({ provider: "football-data.org" as const, url: source.url, observedAt: source.observedAt }));
       if (input.includeApiFootball) {
-        const enrichment = await getApiFootballEnrichment(exactFixture, input.league);
+        const enrichment = await getApiFootballEnrichment(exactFixture, input.league, exactMatch.season);
         exactFixture.apiFootball = enrichment;
         sources.push(...enrichment.sources);
       }
@@ -1646,7 +1684,11 @@ function analyzeSoccerEdge(input: {
   identityEvidence?: z.infer<typeof identityEvidenceSchema>[];
   marketMapping?: z.infer<typeof marketMappingSchema>;
 }) {
-  const now = new Date().toISOString();
+  const analysisNowMs = Date.now();
+  const now = new Date(analysisNowMs).toISOString();
+  const quoteAgeMsAtAnalysis = bookAgeMs(input.quote.bookTimestamp, analysisNowMs);
+  const quoteFreshness = quoteAgeMsAtAnalysis === null ? "UNKNOWN" as const
+    : quoteAgeMsAtAnalysis <= input.quote.staleAfterSeconds * 1000 ? "FRESH" as const : "STALE" as const;
   const providerFixture = "provider" in input.fixture ? input.fixture : null;
   const footballDataFixture = "fixtureId" in input.fixture ? input.fixture : null;
   const fallbackFixture = providerFixture !== null;
@@ -1795,11 +1837,14 @@ function analyzeSoccerEdge(input: {
   }
   const calculationAssumptions = [
     "Polymarket CLOB BUY ask levels, requested size, estimated gross cost, and fees come from the supplied get_quote result; midpoint and Gamma indicative prices are not used.",
+    "The 30-second quote freshness threshold is a PolyScope analysis indicator, not a Polymarket order-expiration rule.",
     "The estimate covers only visible fillable shares; FAK may partially fill and discards the unfilled remainder.",
     "Net edge per share equals modeled probability minus (estimated gross fill cost plus fees) divided by fillable shares.",
     "Expected value is fillable shares multiplied by estimated net edge per share; it is not guaranteed profitability.",
     `Market resolution rules supplied for the mapping: ${input.marketResolutionRules}`,
   ];
+  if (quoteFreshness === "STALE") calculationAssumptions.push(`This is a historical edge estimate based on the book observed at ${input.quote.observedAt}; its ${quoteAgeMsAtAnalysis} ms age at analysis means it must not be treated as current executable market evidence.`);
+  if (quoteFreshness === "UNKNOWN") calculationAssumptions.push(`Quote freshness is unknown at analysis time; the quote observed at ${input.quote.observedAt} cannot be treated as current executable market evidence.`);
   if (fallbackFixture) calculationAssumptions.push("Identity and market evidence are host-agent attestations. PolyScope checks supplied fields for consistency but does not fetch source URLs or independently verify claims.");
   return soccerEdgeOutputSchema.parse({
     probabilityStatus: available ? "AVAILABLE" : "UNAVAILABLE", probabilityReason,
@@ -1809,7 +1854,8 @@ function analyzeSoccerEdge(input: {
     bestBid: input.quote.bestBid, bestAsk: input.quote.bestAsk, spread: input.quote.spread, depthWeightedExecutionPrice: weightedPrice,
     estimatedFeesPusd: estimatedFees, effectiveBuyCostPerShare: effectiveCost, grossProbabilityPriceDifference: grossDifference,
     netEdgePerShare: netEdge, estimatedExpectedValuePusd: expectedValue, quoteObservedAt: input.quote.observedAt,
-    quoteFreshness: input.quote.freshness, calculationAssumptions,
+    quoteBookTimestamp: input.quote.bookTimestamp, quoteFreshness, quoteFreshnessAtCapture: input.quote.freshness,
+    quoteAgeMsAtAnalysis, quoteStaleAfterSeconds: input.quote.staleAfterSeconds, calculationAssumptions,
     ...(fallbackFixture ? {
       identityEvidence: matchingIdentityEvidence.map((evidence) => ({ ...evidence, attestationAuthority: "HOST_AGENT" as const })),
       ...(mapping ? { marketMapping: { ...mapping, attestationAuthority: "HOST_AGENT" as const } } : {}),
@@ -1891,7 +1937,7 @@ async function createServer() {
     "get_quote",
     {
       title: "Read a Polymarket order book quote",
-      description: "Reads the public CLOB book and current fee rate for one market outcome and estimates visible BUY/SELL fill, average price, gross amount, and fee. No order is created. Quotes older than 30 seconds are marked stale; refresh before any later signing step.",
+      description: "Reads the public CLOB book and current fee rate for one market outcome and estimates visible BUY/SELL fill, average price, gross amount, and fee. No order is created. The 30-second freshness threshold is a PolyScope indicator, not an order-expiration rule; analysis recalculates freshness from the book timestamp.",
       inputSchema: z.object({
         marketId: z.string().regex(/^[0-9]{1,32}$/), assetId: decimalIdSchema, side: sideSchema,
         size: z.string().max(32).optional(), depth: z.number().int().min(1).max(20).default(10),
@@ -2043,7 +2089,7 @@ async function createServer() {
     "analyze_soccer_edge",
     {
       title: "Estimate soccer probabilities and Polymarket net edge",
-      description: "Deterministically estimates regulation-time Home/Draw/Away probabilities from API-Football venue averages or football-data.org pre-kickoff same-venue form. For API-Football-only fallback fixtures, identityEvidence and marketMapping are host-agent attestations: their source URLs are not fetched or independently verified by PolyScope. PolyScope checks the supplied identity fields against the fixture and supplied market fields against the quote, fixture, and rules; evidenceAssessment reports these local checks separately from external source verification. Without a host-attested VERIFIED identity claim, probabilities are UNAVAILABLE; without a consistent market mapping and exact 90-minute resolution declaration, market-specific edge is unavailable. Browser-researched statistics are not model inputs. This read-only analysis does not fetch providers, create orders, impose a trading gate, or authorize a trade.",
+      description: "Deterministically estimates regulation-time Home/Draw/Away probabilities from API-Football venue averages or football-data.org pre-kickoff same-venue form. It recalculates quote freshness from the original book timestamp at analysis time; the 30-second label is informational, and stale quote results are historical rather than current executable evidence. For API-Football-only fallback fixtures, identityEvidence and marketMapping are host-agent attestations: their source URLs are not fetched or independently verified by PolyScope. PolyScope checks supplied identity fields against the fixture and supplied market fields against the quote, fixture, and rules; evidenceAssessment reports these local checks separately from external source verification. Without a host-attested VERIFIED identity claim, probabilities are UNAVAILABLE; without a consistent market mapping and exact 90-minute resolution declaration, market-specific edge is unavailable. Browser-researched statistics are not model inputs. This read-only analysis does not fetch providers, create orders, impose a trading gate, or authorize a trade.",
       inputSchema: z.object({
         fixture: z.union([soccerFixtureSchema, providerQualifiedFixtureSchema]), quote: quoteResultSchema,
         outcome: z.enum(["HOME_WIN", "DRAW", "AWAY_WIN"]),
@@ -2478,7 +2524,7 @@ async function createServer() {
     "get_portfolio",
     {
       title: "Read public Polymarket positions and PnL",
-      description: "Reads one cursor-paginated page of the default OPEN single-market positions and PnL view from Polymarket Data API v2. Pass nextCursor to continue; complete is true only after the final page of this view. The caller-provided address is not proof of wallet ownership. Closed positions and combos are not included.",
+      description: "Reads one cursor-paginated page of the default OPEN single-market positions and PnL view from Polymarket Data API v2. OPEN may include held REDEEMABLE positions after resolution; these rows are preserved. Pass nextCursor to continue; complete is true only after the final page of this view. The caller-provided address is not proof of wallet ownership. Closed positions and combos are not included.",
       inputSchema: z.object({
         walletAddress: addressSchema, limit: z.number().int().min(1).max(50).default(20),
         cursor: z.string().min(1).max(4_096).optional(),

@@ -82,6 +82,22 @@ The deterministic offline suite uses isolated fixtures to validate mapping and n
 
 The generic market search and order tools use a single selected Polymarket CLOB market/outcome. Crypto, weather, soccer, politics, and finance are discoverable through the same market-data path when a corresponding active CLOB market exists. There are no specialized weather/xG/injury datasets or combo/multi-leg tools.
 
+## Hosted findings corrective patch
+
+API-Football fixture discovery and optional enrichment now request only the mapped competition and a resolved season for one UTC date. PL/PD/SA/CL use API-Football league IDs 39/140/135/2, not football-data.org IDs. Exact matches still require competition, both teams, and kickoff. Enrichment reuses football-data.org season dates only when they cover the fixture date; fallback dates use the documented starting-year season convention and known competition calendars. Calendar-gap dates or conflicting upstream dates produce a no-request diagnostic. The 1 MB response cap and one-date fallback budget are unchanged. [API-Football fixture query guidance](https://www.api-football.com/news/post/how-to-optimize-api-sports-calls-and-quota-usage) · [API-Football starting-year season convention](https://www.api-football.com/news/post/how-to-get-started-with-api-football-the-complete-beginners-guide)
+
+The Data API v2 `status=OPEN` query is retained. Its documented results can include held positions marked `REDEEMABLE` after resolution; `get_portfolio` returns those rows and retains cursor pagination. It does not infer wallet ownership from the address. [Polymarket Data API v2](https://data-api.polymarket.com/v2/docs)
+
+`get_quote` preserves the raw CLOB book timestamp and capture-time age. `analyze_soccer_edge` recalculates freshness against its calculation time; missing, invalid, or future book timestamps produce `UNKNOWN`. Its 30-second threshold is an analysis indicator, not an order-expiration rule. A stale quote may still support a historical calculation, but the result includes the original quote observation time and book timestamp, age, and a limitation that it is not current executable evidence. Signed order bounds, FAK behavior, and submission logic are unchanged.
+
+**VERIFY-04: unresolved PayBox host contract discrepancy; no PolyScope formatting defect found.** The published PayBox MCP reference describes `{ "op": "typedData", "typedData": { ... } }`, and deterministic contract tests now assert an object payload with `primaryType: "ClobAuth"` and `primaryType: "Order"`. The connected `request_wallet_sign` tool schema exposed in this session instead types `typedData` as a string. No live signing request was made, so the signing-window `primaryType: undefined` symptom remains unresolved. Reproduction for PayBox: pass the `requestWalletSignIntent` from `prepare_clob_auth` or `prepare_order_signing` to `request_wallet_sign`, then inspect whether the tool/host adapter preserves the nested `typedData.primaryType` or converts/relabels the object before the signing window renders. Do not use an alternative signing format as a workaround without an updated host contract. [Published PayBox MCP tool reference](https://docs.paybox.sh/reference/mcp-tools)
+
+## PR #6 local validation
+
+Node `24.20.0` and pnpm `11.11.0` were used. Frozen install, typecheck, deterministic tests, conformance, repeated build, production dependency audit, and `git diff --check` passed. The built MCP catalog contains 13 tools. Soccer provider calls in conformance returned HTTP 403 for both local provider credentials; this is recorded as unavailable data, not successful authentication. The read-only quote had no visible liquidity, and preparation did not submit an order.
+
+The rebuilt `dist/plugin.mjs` is **609,541 bytes**, with SHA-256 `4c8b2d75cedeb252d7f325ae2f7dd85753baa669d760a398f54db5af06210721`. The tracked `outputs/plugin.mjs` is byte-identical. This local artifact was not uploaded to PayBox.
+
 ## PayBox signing and stateless runtime compatibility
 
 **PayBox automatic skill loading: UNVERIFIED.** The public PayBox plugin README lists its packaged skills but does not specify that a connected host automatically loads arbitrary repository `SKILL.md` files. PolyScope therefore also puts browser-continuation instructions in both MCP tool descriptions. That fallback is verified in the built tool catalog; it does not prove live agent browsing.

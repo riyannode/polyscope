@@ -4,6 +4,7 @@ if (ageScenario || scenario === "invalid-timestamp" || scenario === "future-time
   const observedNow = Date.now();
   Date.now = () => observedNow;
 }
+if (scenario === "analysis-fixed-clock") Date.now = () => Date.parse("2026-10-17T04:23:29.396Z");
 if (scenario === "unexpected-failure") {
   Object.defineProperty(globalThis.crypto, "getRandomValues", { value: () => { throw new Error("fixture unexpected programming failure"); } });
 }
@@ -28,6 +29,7 @@ const apiFootballLeagueNames = { PL: "Premier League", PD: "La Liga", SA: "Serie
 function match(id, competition, date, status = "SCHEDULED") {
   return {
     id, utcDate: `${date}T19:00:00Z`, status, lastUpdated: "2026-10-16T12:00:00Z",
+    season: { startDate: "2026-08-01", endDate: "2027-05-31" },
     competition: { id: Number(footballCompetitionIds[competition]), code: competition, name: competitionNames[competition] },
     homeTeam: { id: 101, name: "Arsenal" }, awayTeam: { id: 202, name: "Chelsea" },
     score: { fullTime: { home: status === "FINISHED" ? 2 : null, away: status === "FINISHED" ? 1 : null } },
@@ -137,6 +139,7 @@ globalThis.fetch = async (input, init = {}) => {
     process.exit(91);
   } else if (url.hostname === "v3.football.api-sports.io" && url.pathname === "/fixtures") {
     if (scenario === "no-unneeded-api") process.exit(97);
+    if (["api-football-season-conflict", "api-football-season-invalid", "api-football-season-ambiguous"].includes(scenario)) process.exit(99);
     if (scenario === "api-football-403") return new Response("forbidden", { status: 403 });
     if (scenario === "api-football-204") return new Response(null, { status: 204 });
     if (scenario === "fallback-api-403") return new Response("forbidden", { status: 403 });
@@ -144,6 +147,24 @@ globalThis.fetch = async (input, init = {}) => {
     if (scenario === "fallback-api-invalid-json") return new Response("{", { headers: { "content-type": "application/json" } });
     if (scenario === "fallback-api-empty") return Response.json({ errors: [], response: [] });
     if (scenario === "fallback-api-invalid-shape") return Response.json({ errors: [], response: [{ fixture: { id: "bad" } }] });
+    if (scenario === "api-football-oversized" || scenario === "fallback-api-oversized") return new Response("x".repeat(1_000_001));
+    if (scenario === "api-football-wrong-league" || scenario === "fallback-api-wrong-league") return Response.json({ errors: [], response: [{
+      fixture: { id: 90001, date: `${url.searchParams.get("date")}T19:00:00+00:00` }, league: { id: 140, name: "Premier League", season: Number(url.searchParams.get("season")) },
+      teams: { home: { id: 501, name: "Arsenal FC" }, away: { id: 502, name: "Chelsea" } },
+    }] });
+    if (scenario === "api-football-wrong-season" || scenario === "fallback-api-wrong-season") return Response.json({ errors: [], response: [{
+      fixture: { id: 90001, date: `${url.searchParams.get("date")}T19:00:00+00:00` }, league: { id: 39, name: "Premier League", season: 2025 },
+      teams: { home: { id: 501, name: "Arsenal FC" }, away: { id: 502, name: "Chelsea" } },
+    }] });
+    if (scenario === "api-football-enrichment-cross-season" || scenario === "api-football-season-partial") return Response.json({ errors: [], response: [{
+      fixture: { id: 90012, date: "2026-01-17T19:00:00+00:00" }, league: { id: 39, name: "Premier League", season: 2025 },
+      teams: { home: { id: 501, name: "Arsenal FC" }, away: { id: 502, name: "Chelsea" } },
+    }] });
+    if (scenario === "fallback-cross-season") return Response.json({ errors: [], response: [{
+      fixture: { id: 90011, date: "2026-01-17T19:00:00+00:00" }, league: { id: 39, name: "Premier League", season: 2025 },
+      teams: { home: { id: 501, name: "Arsenal FC" }, away: { id: 502, name: "Chelsea" } },
+    }] });
+    if (scenario === "fallback-season-unknown") process.exit(98);
     if (scenario === "fallback-later-date") {
       const date = url.searchParams.get("date");
       const laterFixture = {
@@ -166,7 +187,9 @@ globalThis.fetch = async (input, init = {}) => {
       { fixture: { id: 90004, date: "2026-10-17T19:00:00+00:00" }, league: { id: 2, name: apiFootballLeagueNames.CL, season: 2026 }, teams: { home: { id: 801, name: "Paris Saint-Germain" }, away: { id: 802, name: "Bayern Munich" } } },
     ];
     body = scenario === "api-football-api-error" || scenario === "fallback-api-error" ? { errors: { token: "fixture detail suppressed" }, response: [] }
-      : { errors: [], response: scenario === "api-football-mismatch" ? [] : scenario === "api-football-ambiguous" || scenario === "fallback-ambiguous" ? [fixture, { ...fixture, fixture: { ...fixture.fixture, id: 90005 } }] : competitionFixtures };
+      : { errors: [], response: scenario === "api-football-mismatch" ? [] : scenario === "api-football-ambiguous" || scenario === "fallback-ambiguous" ? [fixture, { ...fixture, fixture: { ...fixture.fixture, id: 90005 } }] : competitionFixtures.filter((entry) =>
+        entry.league.id === Number(url.searchParams.get("league")) && entry.league.season === Number(url.searchParams.get("season"))
+          && entry.fixture.date.slice(0, 10) === url.searchParams.get("date")) };
   } else if (url.hostname === "v3.football.api-sports.io" && url.pathname === "/teams/statistics") {
     if (scenario === "api-football-stats-403" || scenario === "fallback-api-stats-403") return new Response("forbidden", { status: 403 });
     const home = url.searchParams.get("team") === "501";
@@ -186,10 +209,11 @@ globalThis.fetch = async (input, init = {}) => {
     if (scenario === "fallback-http-403") return new Response("forbidden", { status: 403 });
     if (scenario === "fallback-http-429") return new Response("rate limited", { status: 429 });
     if (scenario === "fallback-http-503") return new Response("provider unavailable", { status: 503 });
-    if (scenario === "fallback-later-date") return new Response("provider unavailable", { status: 503 });
+    if (scenario === "fallback-later-date" || scenario === "fallback-cross-season") return new Response("provider unavailable", { status: 503 });
     if (scenario === "fallback-invalid-json") return new Response("{", { headers: { "content-type": "application/json" } });
     if (scenario === "fallback-invalid-shape") return new Response(JSON.stringify({ matches: [{ id: "bad" }] }), { headers: { "content-type": "application/json" } });
     if (scenario === "fallback-empty") return Response.json({ matches: [] });
+    if (scenario === "fallback-season-unknown") return new Response("provider unavailable", { status: 503 });
     if (url.searchParams.get("dateFrom") === "2026-11-01") return new Response("provider unavailable", { status: 403 });
     body = { matches: [match(({ PL: 1001, PD: 2001, SA: 3001, CL: 4001 })[league], league, "2026-10-17")] };
   } else if (url.hostname === "api.football-data.org" && url.pathname === "/v4/matches/9999") {
@@ -223,7 +247,14 @@ globalThis.fetch = async (input, init = {}) => {
     if (scenario === "fallback-timeout") throw new DOMException("fixture timed out", "TimeoutError");
     const id = Number(url.pathname.split("/").at(-1));
     const league = ({ 1001: "PL", 2001: "PD", 3001: "SA", 4001: "CL" })[id];
-    body = match(id, league, "2026-10-17");
+    body = ["api-football-enrichment-cross-season", "api-football-season-partial"].includes(scenario)
+      ? match(id, league, "2026-01-17") : scenario === "api-football-season-ambiguous" ? match(id, league, "2026-06-17") : match(id, league, "2026-10-17");
+    if (scenario === "api-football-season-conflict") body.season = { startDate: "2025-08-01", endDate: "2026-05-31" };
+    if (scenario === "api-football-season-missing") body.season = { startDate: null, endDate: null };
+    if (scenario === "api-football-season-partial") body.season = { startDate: "2025-08-01", endDate: null };
+    if (scenario === "api-football-season-invalid") body.season = { startDate: "not-a-date", endDate: null };
+    if (scenario === "api-football-season-ambiguous") body.season = { startDate: null, endDate: null };
+    if (scenario === "api-football-enrichment-cross-season") body.season = { startDate: "2025-08-01", endDate: "2026-05-31" };
   } else if (url.hostname === "api.football-data.org" && url.pathname.startsWith("/v4/teams/")) {
     const teamId = Number(url.pathname.split("/")[3]);
     if (url.searchParams.has("dateTo")) return new Response(JSON.stringify({ message: "Provider rejected dateTo for team history." }), {
@@ -264,8 +295,9 @@ globalThis.fetch = async (input, init = {}) => {
     return new Response(body, { headers: { "content-type": "application/rss+xml" } });
   } else if (url.hostname === "data-api.polymarket.com" && url.pathname === "/v2/positions") {
     const secondPage = url.searchParams.get("cursor") === "fixture-next-page";
+    const position = scenario === "portfolio-redeemable" ? { ...portfolioPosition, redeemable: true, status: "REDEEMABLE" } : portfolioPosition;
     body = {
-      data: [secondPage ? { ...portfolioPosition, condition_id: `0x${"3".repeat(64)}`, token_id: "789" } : portfolioPosition],
+      data: [secondPage ? { ...position, condition_id: `0x${"3".repeat(64)}`, token_id: "789" } : position],
       pagination: {
         has_more: !secondPage,
         limit: 10,
