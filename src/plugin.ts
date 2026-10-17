@@ -74,7 +74,7 @@ const preparationErrorCodeSchema = z.enum([
   "PS_MARKET_IDENTITY", "PS_PROVIDER_INVALID", "PS_PROVIDER_UNAVAILABLE",
   "PS_PROVIDER_TIMEOUT", "PS_RESPONSE_TOO_LARGE", "PS_MARKET_CLOSED", "PS_MARKET_UNSUPPORTED",
   "PS_MARKET_VERSION", "PS_FEE_INVALID", "PS_WALLET_BINDING", "PS_AMOUNT_INVALID", "PS_AMOUNT_PRECISION",
-  "PS_PRICE_INVALID", "PS_SIZE_BELOW_MINIMUM", "PS_SPENDING_CAP", "PS_NO_MARKETABLE_LIQUIDITY",
+  "PS_PRICE_INVALID", "PS_SIZE_BELOW_MINIMUM", "PS_SPENDING_CAP",
 ]);
 const preparationFreshnessSchema = z.object({
   bookAgeMs: z.number().int().nonnegative().nullable(),
@@ -1125,7 +1125,7 @@ function validatePreparedOrder(prepared: PreparedOrder): {
   if (BigInt(order.salt) > BigInt(Number.MAX_SAFE_INTEGER)) {
     throw new Error("PS_ORDER_INVALID: Order salt exceeds the exact integer range of the CLOB JSON format.");
   }
-  if (!Number.isSafeInteger(timestamp) || timestamp <= 0 || timestamp > Date.now() + 5_000) {
+  if (!Number.isSafeInteger(timestamp) || timestamp <= 0) {
     throw new Error("PS_ORDER_INVALID: Prepared order timestamp is invalid.");
   }
   if (priceUnits <= 0n || priceUnits >= MICRO || priceUnits % toUnits(prepared.market.tickSize, 6) !== 0n) {
@@ -1512,14 +1512,6 @@ async function createServer() {
         }
         const amountPrecision = 10n ** BigInt(6 - rules.amountDecimals);
         if (quoteUnits % amountPrecision !== 0n) throw new Error(`PS_AMOUNT_PRECISION: Order quote exceeds this market's ${rules.amountDecimals}-decimal amount precision.`);
-        const available = side === "BUY" ? book.asks : book.bids;
-        const marketable = available.some((level) => {
-          const levelPrice = toUnits(level.price, 6);
-          const levelSize = toUnits(level.size, 6);
-          return levelSize > 0n && (side === "BUY" ? levelPrice <= priceUnits : levelPrice >= priceUnits);
-        });
-        if (!marketable) throw new Error("PS_NO_MARKETABLE_LIQUIDITY: No visible order-book liquidity satisfies the approved FAK price limit.");
-
         const saltBytes = crypto.getRandomValues(new Uint8Array(8));
         const rawSalt = BigInt(bytesToHex(saltBytes));
         const salt = (rawSalt % BigInt(Number.MAX_SAFE_INTEGER)).toString();
@@ -1660,16 +1652,6 @@ async function createServer() {
         message: "ERC-1271 wallet validation was unavailable; no order was sent.",
         errorCode: "PS_WALLET_VALIDATION_UNAVAILABLE",
       });
-
-      const authTime = Number(clobAuth.timestamp);
-      if (!Number.isSafeInteger(authTime) || Math.abs(Math.floor(Date.now() / 1000) - authTime) > 300) {
-        return tradeToolResult({
-          status: "REJECTED", orderId: null, orderType: FAK, requestedSize: prepared.order.size,
-          filledSize: null, remainingSize: prepared.order.size, tradeIds: [],
-          message: "ClobAuth signature is stale; no order was sent.",
-          errorCode: "PS_AUTH_STALE",
-        });
-      }
 
       let credentials: ClobCredentials;
       let snapshot: Awaited<ReturnType<typeof validateExecutionSnapshot>>;

@@ -53,7 +53,7 @@ Polymarket documents FAK with a maximum BUY price or minimum SELL price. The off
 | Provider | Local result | What this proves |
 |---|---|---|
 | Polymarket Gamma | `AVAILABLE` | Current sample market search returned valid active market/outcome data. |
-| Polymarket CLOB | `AVAILABLE`, `STALE` | This conformance run returned a 115,977 ms book age and still prepared the unsigned order. Quote freshness remains informational for execution. |
+| Polymarket CLOB | `AVAILABLE`, `STALE` | This follow-up conformance run returned a 45,599 ms book age and still prepared the unsigned order. Quote freshness remains informational for execution. |
 | ESPN RSS | `AVAILABLE` | Team-filtered soccer headlines and source timestamps were returned. This is not a verified injury or lineup feed. |
 | football-data.org direct API diagnostic | Brentford `402` and Liverpool `64`: baseline HTTP 200; adding `dateTo=2026-10-16` returned HTTP 400 for each; numeric `competitions=2021` without `dateTo` returned HTTP 200. The production query (`competitions=2021&status=FINISHED&limit=100`) returned HTTP 200 with six finished PL matches for each team. | The developer-supplied token can read PL team history for these two teams. It does not prove all-team or all-competition coverage, and no response body or token was retained. |
 | `pnpm conformance` soccer calls | `UNAVAILABLE` for PL, PD, SA, and CL; each call returned HTTP 403 because the local runner has no PayBox host-scoped secret injection. | The offline/runtime harness correctly reports missing local credentials. The direct token diagnostic above is separate and is not a hosted PayBox test. |
@@ -98,6 +98,12 @@ The Gamma API schema and Polymarket's market-data reference describe market disc
 
 The strict PayBox schemas have these compatibility changes: `marketRestricted` is removed from search, quote, and prepared-order market objects; `accountGeoblockChecked` is removed from quote; `executionApprovalSigningIntent` is removed from PREPARED output; and `executionApprovalSignature` is removed from `submit_fak_order` input. `preparationFreshness` changes from `{ bookAgeMs, staleAfterMs }` to `{ bookAgeMs }`. Old hosted strict schemas will reject new outputs or the new submit input, and the new strict submit schema rejects the removed approval-signature field. Refresh the hosted plugin registration after review. `preparedOrder.market.bookTimestamp` and preparation age are not part of the signed EIP-712 order; deterministic signature checks verify the signature remains valid when that metadata changes. The Polymarket Order EIP-712 fields and digest construction remain unchanged.
 
+### Local trading rejection audit
+
+`docs/errors.md` classifies remaining trade-path rejection codes as official Polymarket protocol requirements or exact user-approved order constraints. No redundant/custom PolyScope policy gate remains. The visible-liquidity rejection in `prepare_order_signing` was removed; `get_quote` continues to report liquidity, while preparation preserves the user's signed price/size and FAK behavior.
+
+The official [API authentication guide](https://docs.polymarket.com/getting-started/api#authentication) requires a current Unix-seconds timestamp in ClobAuth but specifies no 300-second acceptance window. The [wallets and authentication guide](https://docs.polymarket.com/trading/wallets-auth) likewise gives no age limit. The local 300-second rejection was removed; signer recovery remains, and CLOB credential derivation is authoritative for timestamp acceptance. The official [Order format](https://docs.polymarket.com/trading/place-orders) includes a signed Unix-millisecond timestamp without a five-second future tolerance; that local cutoff was removed while retaining positive safe-integer encoding. Offline fixtures confirm these undocumented local cutoffs no longer block the adapter.
+
 ### Signing workflow, request count, and latency
 
 | Stage | Before | After |
@@ -115,9 +121,9 @@ The official `@polymarket/client` package is Node 24 compatible, but its documen
 
 ## Changed files
 
-- `src/plugin.ts` — removes the custom ExecutionApproval signature; drops 30-second submission and 120-second preparation hard gates, seven-second total budget, close-only read, and balance/allowance refreshes; retains bounded request timeouts, official geoblock, market identity/status, exchange constraints, exact signed price/size, fee-inclusive cap, and one-POST semantics.
-- `scripts/conformance.mjs` — verifies a valid externally signed FAK order without ExecutionApproval reaches one intercepted POST, Gamma `restricted=true` and a 51-second book alone do not block, fees/caps and amount precision remain bounded, geoblock blocks, missing credentials reject, and ambiguous POST is not repeated.
-- `tests/network-fixtures.mjs` — offline CLOB, Gamma, geoblock, credentials, and POST fixtures; no real signing or live order is performed.
+- `src/plugin.ts` — removes the custom ExecutionApproval signature, visible-liquidity rejection, 300-second ClobAuth age cutoff, five-second future Order-timestamp cutoff, 30-second submission and 120-second preparation hard gates, seven-second total budget, close-only read, and balance/allowance refreshes; retains bounded request timeouts, official geoblock, market identity/status, exchange constraints, exact signed price/size, fee-inclusive cap, and one-POST semantics.
+- `scripts/conformance.mjs` — verifies a valid externally signed FAK order without ExecutionApproval reaches one intercepted POST; no visible liquidity, Gamma `restricted=true`, 51-second book age, 301-second ClobAuth age, and a correctly signed future Order timestamp do not add local policy rejections; fee caps and amount precision remain bounded, geoblock blocks, missing credentials reject, and ambiguous POST is not repeated.
+- `tests/network-fixtures.mjs` — offline CLOB, Gamma, geoblock, credentials, no-visible-liquidity, and POST fixtures; no real signing or live order is performed.
 - `docs/errors.md` — stable error codes, retry guidance, user-facing explanations, and safe football provider HTTP/network failure behavior.
 - `outputs/POLYSCOPE_COMPATIBILITY.md` — this report.
 - `outputs/plugin.mjs` — distributable copy of the built artifact.
@@ -132,27 +138,27 @@ Toolchain used: Node.js `24.22.0`, pnpm `11.11.0`.
 |---|---|
 | `pnpm install --frozen-lockfile` | PASS — frozen lockfile unchanged; already up to date |
 | `pnpm typecheck` | PASS — `tsc --noEmit` |
-| `pnpm test` | PASS — repeat builds were byte-identical and all offline cases passed, including one signed FAK fixture POST without ExecutionApproval, exact price/size, fee cap, stale age, `restricted=true`, geoblock, missing credentials, and ambiguous POST non-retry; no live order submission |
-| `pnpm conformance` | PASS — market/news/quote reads and preparation succeeded; quote age was 11,107 ms (FRESH). PL, PD, SA, and CL returned HTTP 403 without local PayBox secret injection and were reported `UNAVAILABLE`. Tool catalog remained 12 tools. |
-| `pnpm build` | PASS — Node.js 24.22.0 and pnpm 11.11.0; generated `dist/plugin.mjs` matches tracked `outputs/plugin.mjs` (576,198 bytes, SHA-256 `d590a91d5d0c8c5093430248d636305011ad1a2bec28f50aab54bec963b67727`). |
+| `pnpm test` | PASS — repeat builds were byte-identical and all offline cases passed, including one signed FAK fixture POST without ExecutionApproval, no-visible-liquidity preparation, 301-second ClobAuth age, future Order timestamp, exact price/size, fee cap, stale age, `restricted=true`, geoblock, missing credentials, and ambiguous POST non-retry; no live order submission |
+| `pnpm conformance` | PASS — market/news/quote reads and preparation succeeded; quote age was 45,599 ms (`STALE`). PL, PD, SA, and CL returned HTTP 403 without local PayBox secret injection and were reported `UNAVAILABLE`. Tool catalog remained 12 tools. |
+| `pnpm build` | PASS — Node.js 24.22.0 and pnpm 11.11.0; generated `dist/plugin.mjs` matches tracked `outputs/plugin.mjs` (575,597 bytes, SHA-256 `93fde516eeef3f4a8b946760cc01b215c88fba61eb963010abd29d909628d50f`). |
 | `pnpm audit --prod` | PASS — no known production dependency vulnerabilities reported |
 | `git diff --check` | PASS after source, report, and bundle updates |
 
 
-Offline cases include exact BUY/SELL signed price and share amounts, one valid FAK order POST intercepted in a fixture without ExecutionApproval, fee-inclusive caps (including changed fees), `restricted=true`, 51-second submission book age, 121-second preparation age, blocked geoblock, missing CLOB credentials, invalid order signature, one-time ambiguous POST reconciliation, Deposit Wallet typed-data envelope, team attribution, all four deterministic competition mappings and numeric team-form filters, complete/incomplete form handling, safe HTTP 403/429 diagnostics, provider failure handling, portfolio pagination, and 12-tool registration. Local signatures use generated test-only keys; fixture credentials and POSTs are not live CLOB evidence.
+Offline cases include exact BUY/SELL signed price and share amounts, one valid FAK order POST intercepted in a fixture without ExecutionApproval, no-visible-liquidity preparation, 301-second ClobAuth age, future signed Order timestamp, fee-inclusive caps (including changed fees), `restricted=true`, 51-second submission book age, 121-second preparation age, blocked geoblock, missing CLOB credentials, invalid order signature, one-time ambiguous POST reconciliation, Deposit Wallet typed-data envelope, team attribution, all four deterministic competition mappings and numeric team-form filters, complete/incomplete form handling, safe HTTP 403/429 diagnostics, provider failure handling, portfolio pagination, and 12-tool registration. Local signatures use generated test-only keys; fixture credentials and POSTs are not live CLOB evidence.
 
 **Not covered locally:** PayBox signing-window `primaryType` behavior and wallet binding, real ERC-1271 acceptance, authenticated L2 credentials, live balance/allowance/geoblock behavior, real fills, status read-back, cancellation, or real ambiguous-POST reconciliation. The fixture demonstrates adapter behavior only; no live signature or trade was requested.
 
-Current public conformance returned an AVAILABLE CLOB quote marked STALE at 115,977 ms and prepared the unsigned order. Soccer calls returned HTTP 403 without local PayBox secret injection. The separate historical direct API diagnostic remains unchanged and does not substitute for a hosted PayBox retest.
+Current public conformance returned an AVAILABLE CLOB quote marked STALE at 45,599 ms and prepared the unsigned order. Soccer calls returned HTTP 403 without local PayBox secret injection. The separate historical direct API diagnostic remains unchanged and does not substitute for a hosted PayBox retest.
 
 ## Artifact
 
 - Path: `dist/plugin.mjs` (matching tracked copy at `outputs/plugin.mjs`)
-- Size: **576,198 bytes** (569.3 KiB; below 10 MiB)
-- SHA-256: `d590a91d5d0c8c5093430248d636305011ad1a2bec28f50aab54bec963b67727`
+- Size: **575,597 bytes** (562.1 KiB; below 10 MiB)
+- SHA-256: `93fde516eeef3f4a8b946760cc01b215c88fba61eb963010abd29d909628d50f`
 
 ## Readiness decision and next gate
 
-**Hosted PayBox Marketplace BUY/SELL: NOT PROVEN.** The source contains a FAK order path that performs the documented Polymarket checks and submission contract, but no authenticated order or fill was attempted. The latest local quote was fresh, but live trading remains unverified. Soccer calls returned 403 without local PayBox secret injection. PayBox's signing-window `primaryType` blocker, real wallet signing, and authenticated CLOB BUY/SELL have not been exercised. Hosted compatibility and separate explicit live-trading approval remain required before claiming an end-to-end trade works.
+**Hosted PayBox Marketplace BUY/SELL: NOT PROVEN.** The source contains a FAK order path that performs the documented Polymarket checks and submission contract, but no authenticated order or fill was attempted. The latest local quote was marked stale, but preparation succeeded and live trading remains unverified. Soccer calls returned 403 without local PayBox secret injection. PayBox's signing-window `primaryType` blocker, real wallet signing, and authenticated CLOB BUY/SELL have not been exercised. Hosted compatibility and separate explicit live-trading approval remain required before claiming an end-to-end trade works.
 
 The tracked bundle was rebuilt in this PR and was not uploaded to hosted PayBox. No live signature, order broadcast, deposit, deployment, merge, or project resubmission was performed. The `Submitted` status above is the project owner's reported hackathon status, not an action taken in this update.

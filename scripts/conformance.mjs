@@ -164,6 +164,14 @@ export async function testOfflineArtifact(root = process.cwd()) {
   if (buy.structuredContent.preparationFreshness.staleAfterMs !== undefined) {
     fail("prepared-order response retained an arbitrary age threshold", "order_hash_invalid");
   }
+  const noVisibleLiquidity = await callTool(artifact, prepareTool, { ...base, side: "BUY", priceLimit: "0.50" }, {
+    fixtures: true, fixtureScenario: "no-visible-liquidity",
+  });
+  if (noVisibleLiquidity.structuredContent.status !== "PREPARED"
+    || noVisibleLiquidity.structuredContent.preparedOrder.order.price !== "0.50"
+    || noVisibleLiquidity.structuredContent.preparedOrder.order.orderType !== "FAK") {
+    fail("lack of visible liquidity added a PolyScope preparation rejection or changed the signed limit", "liquidity_policy_invalid");
+  }
   const replaySigner = privateKeyToAccount(generatePrivateKey());
   const replayOrder = await callTool(artifact, prepareTool, {
     ...base, makerAddress: replaySigner.address, signingAddress: replaySigner.address,
@@ -178,6 +186,19 @@ export async function testOfflineArtifact(root = process.cwd()) {
   if (validOrderSignature.structuredContent.valid !== true) {
     fail("metadata-free prepared order did not validate its unchanged Polymarket EIP-712 signature", "signature_validation_invalid");
   }
+  const futureOrderTimestamp = String(Date.now() + 60_000);
+  const futureTimestampPrepared = {
+    ...replayPrepared,
+    order: { ...replayPrepared.order, timestamp: futureOrderTimestamp },
+    typedData: { ...replayPrepared.typedData, message: { ...replayPrepared.typedData.message, timestamp: futureOrderTimestamp } },
+  };
+  const futureTimestampValidation = await callTool(artifact, validateOrderTool, {
+    preparedOrder: futureTimestampPrepared,
+    signature: await replaySigner.signTypedData(futureTimestampPrepared.typedData),
+  }, { fixtures: true });
+  if (futureTimestampValidation.structuredContent.valid !== true) {
+    fail("an undocumented order-timestamp freshness gate rejected a correctly signed order", "order_timestamp_invalid");
+  }
   const metadataOnlyChange = await callTool(artifact, validateOrderTool, {
     preparedOrder: { ...replayPrepared, market: { ...replayPrepared.market, bookTimestamp: "1" } }, signature: orderSignature,
   }, { fixtures: true });
@@ -191,10 +212,22 @@ export async function testOfflineArtifact(root = process.cwd()) {
     nonce: clobAuthResult.structuredContent.nonce,
     signature: await replaySigner.signTypedData(clobAuthResult.structuredContent.typedData),
   };
+  const oldAuthTimestamp = String(Math.floor(Date.now() / 1000) - 301);
+  const oldAuthTypedData = {
+    ...clobAuthResult.structuredContent.typedData,
+    message: { ...clobAuthResult.structuredContent.typedData.message, timestamp: oldAuthTimestamp },
+  };
+  const oldClobAuth = { ...clobAuth, timestamp: oldAuthTimestamp, signature: await replaySigner.signTypedData(oldAuthTypedData) };
   const submitArgs = { preparedOrder: replayPrepared, orderSignature, clobAuth };
   const successfulSubmit = await callTool(artifact, submitTool, submitArgs, { fixtures: true, fixtureScenario: "submit-valid" });
   if (successfulSubmit.structuredContent.status !== "SUBMITTED" || !successfulSubmit.structuredContent.orderId) {
     fail("a valid signed FAK order without ExecutionApproval did not reach one intercepted CLOB POST", "submit_invalid");
+  }
+  const oldAuthSubmit = await callTool(artifact, submitTool, { ...submitArgs, clobAuth: oldClobAuth }, {
+    fixtures: true, fixtureScenario: "submit-stale-auth",
+  });
+  if (oldAuthSubmit.structuredContent.status !== "SUBMITTED") {
+    fail("an undocumented 300-second ClobAuth cutoff blocked credential derivation", "clob_auth_freshness_invalid");
   }
   for (const [scenario, age] of [["restricted-submit", 0], ["submit-stale-book", 51_000]]) {
     const result = await callTool(artifact, submitTool, submitArgs, { fixtures: true, fixtureScenario: scenario });
@@ -378,7 +411,7 @@ export async function testOfflineArtifact(root = process.cwd()) {
   return {
     status: "passed",
     deterministicCases: [
-      "BUY FAK preserves exact signed limit, size, precision, and fee-inclusive cap", "no ExecutionApproval signature is required", "signed order is accepted for exactly one intercepted CLOB POST", "SELL FAK preserves exact signed minimum price and size", "market fee descriptor and exact fee calculation",
+      "BUY FAK preserves exact signed limit, size, precision, and fee-inclusive cap", "lack of visible liquidity does not block bounded FAK preparation", "no ExecutionApproval signature is required", "signed order is accepted for exactly one intercepted CLOB POST", "undocumented 300-second ClobAuth cutoff removed", "undocumented order-timestamp freshness cutoff removed", "SELL FAK preserves exact signed minimum price and size", "market fee descriptor and exact fee calculation",
       "reject invalid Polymarket order signature", "reject real provider geoblock", "missing CLOB credentials handled", "Deposit Wallet TypedDataSign preparation",
       "121s book age is informational for preparation", "restricted Gamma metadata omitted and does not reject preparation/submission", "market and quote responses omit removed eligibility metadata", "unsigned book metadata does not change EIP-712 signature validation", "51s quote remains labeled stale", "51s book age alone does not block bounded FAK execution", "ambiguous submission is reconciled once and never reposted", "provider-invalid structured diagnostics", "reject unsafe CLOB salt precision", "reject fee-inclusive cap overrun", "reject wrong outcome asset",
       "team-attributed news", "PL/PD/SA/CL fixture mapping", "documented team-form filters with mixed-competition history filtering", "independent Brentford/Liverpool form status",

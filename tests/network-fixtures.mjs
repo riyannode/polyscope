@@ -86,6 +86,7 @@ globalThis.fetch = async (input, init = {}) => {
       bids: [{ price: "0.49", size: "100" }], asks: [{ price: "0.50", size: "100" }],
       min_order_size: "5", tick_size: "0.01", neg_risk: false, version: "v1",
     };
+    if (scenario === "no-visible-liquidity") body.asks = [];
     if (scenario === "wrong-book") body.asset_id = "999";
     if (scenario === "invalid-timestamp") body.timestamp = "0";
     if (scenario === "future-timestamp") body.timestamp = String(Date.now() + 1);
@@ -100,13 +101,13 @@ globalThis.fetch = async (input, init = {}) => {
     return new Response("not found", { status: 404 });
   } else if (url.hostname === "clob.polymarket.com" && url.pathname === "/order" && init.method === "POST") {
     orderPosts += 1;
-    if (!["submit-valid", "restricted-submit", "submit-stale-book", "submit-ambiguous"].includes(scenario) || orderPosts !== 1) process.exit(89);
+    if (!["submit-valid", "restricted-submit", "submit-stale-book", "submit-stale-auth", "submit-ambiguous"].includes(scenario) || orderPosts !== 1) process.exit(89);
     const postedOrder = JSON.parse(init.body);
     if (postedOrder.orderType !== "FAK" || postedOrder.order.side !== "BUY"
       || postedOrder.order.makerAmount !== "5000000" || postedOrder.order.takerAmount !== "10000000"
       || postedOrder.order.timestamp === undefined || !postedOrder.order.signature) process.exit(90);
     if (scenario === "submit-ambiguous") throw new Error("fixture connection reset after request body");
-    if (["submit-valid", "restricted-submit", "submit-stale-book"].includes(scenario)) {
+    if (["submit-valid", "restricted-submit", "submit-stale-book", "submit-stale-auth"].includes(scenario)) {
       return new Response(JSON.stringify({ success: true, orderID: `0x${"a".repeat(64)}`, status: "MATCHED", tradeIDs: [] }), {
         status: 200, headers: { "content-type": "application/json" },
       });
