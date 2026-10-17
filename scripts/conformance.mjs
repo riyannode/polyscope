@@ -226,27 +226,67 @@ export async function testOfflineArtifact(root = process.cwd()) {
     || authIntent.typedData.primaryType !== "ClobAuth" || !authIntent.typedData.domain || !authIntent.typedData.types || !authIntent.typedData.message) {
     fail("ClobAuth signing intent did not match PayBox's documented EIP-712 object contract", "wallet_intent_invalid");
   }
+  if (clobAuthResult.structuredContent.timestamp !== "1800000000") {
+    fail("ClobAuth did not use the CLOB server timestamp", "clob_auth_time_invalid");
+  }
+  for (const [fixtureScenario, expectedCode] of [["time-unavailable", "PS_CLOB_TIME_UNAVAILABLE"], ["time-invalid", "PS_CLOB_TIME_INVALID"]]) {
+    const timeFailure = await runOperation(artifact, {
+      method: "tools/call", params: { name: clobAuthTool.name, arguments: { signerAddress: replaySigner.address, nonce: "0" } },
+    }, { fixtures: true, fixtureScenario });
+    const timeFailureText = JSON.stringify(timeFailure.result);
+    if (timeFailure.result?.isError !== true || !timeFailureText.includes(expectedCode) || timeFailureText.includes("SECRET_SENTINEL")) {
+      fail(`${fixtureScenario} did not fail closed with a sanitized server-time error`, "clob_auth_time_invalid");
+    }
+  }
   const clobAuth = {
     timestamp: clobAuthResult.structuredContent.timestamp,
     nonce: clobAuthResult.structuredContent.nonce,
     signature: await replaySigner.signTypedData(clobAuthResult.structuredContent.typedData),
   };
-  const oldAuthTimestamp = String(Math.floor(Date.now() / 1000) - 301);
+  const validateClobAuthTool = tools.find((tool) => tool.name === "validate_clob_auth_signature");
+  const freshAuthValidation = await callTool(artifact, validateClobAuthTool, {
+    signerAddress: replaySigner.address, ...clobAuth,
+  }, { fixtures: true });
+  if (freshAuthValidation.structuredContent.valid !== true) {
+    fail("fresh ClobAuth signature did not recover to its owner EOA", "clob_auth_signature_invalid");
+  }
+  const oldAuthTimestamp = "1";
   const oldAuthTypedData = {
     ...clobAuthResult.structuredContent.typedData,
     message: { ...clobAuthResult.structuredContent.typedData.message, timestamp: oldAuthTimestamp },
   };
   const oldClobAuth = { ...clobAuth, timestamp: oldAuthTimestamp, signature: await replaySigner.signTypedData(oldAuthTypedData) };
   const submitArgs = { preparedOrder: replayPrepared, orderSignature, clobAuth };
-  const successfulSubmit = await callTool(artifact, submitTool, submitArgs, { fixtures: true, fixtureScenario: "submit-valid" });
+  const successfulSubmit = await callTool(artifact, submitTool, submitArgs, {
+    fixtures: true, fixtureScenario: "submit-valid", expectedSignerAddress: replaySigner.address,
+  });
   if (successfulSubmit.structuredContent.status !== "SUBMITTED" || !successfulSubmit.structuredContent.orderId) {
     fail("a valid signed FAK order without ExecutionApproval did not reach one intercepted CLOB POST", "submit_invalid");
   }
   const oldAuthSubmit = await callTool(artifact, submitTool, { ...submitArgs, clobAuth: oldClobAuth }, {
-    fixtures: true, fixtureScenario: "submit-stale-auth",
+    fixtures: true, fixtureScenario: "submit-rejected-l1-auth", expectedSignerAddress: replaySigner.address,
   });
-  if (oldAuthSubmit.structuredContent.status !== "SUBMITTED") {
-    fail("an undocumented 300-second ClobAuth cutoff blocked credential derivation", "clob_auth_freshness_invalid");
+  if (oldAuthSubmit.structuredContent.status !== "FAILED" || oldAuthSubmit.structuredContent.errorCode !== "PS_CLOB_AUTH_REJECTED"
+    || oldAuthSubmit.structuredContent.httpStatus !== 401
+    || !/prepare and sign a new ClobAuth/i.test(oldAuthSubmit.structuredContent.message)) {
+    fail("rejected ClobAuth did not fail closed with sanitized status and explicit re-sign guidance", "clob_auth_recovery_invalid");
+  }
+  if (JSON.stringify(oldAuthSubmit.structuredContent).includes("SECRET_SENTINEL")) {
+    fail("L1 authentication failure exposed provider body data", "clob_auth_sanitization_invalid");
+  }
+  const existingApiKeySubmit = await callTool(artifact, submitTool, submitArgs, {
+    fixtures: true, fixtureScenario: "existing-api-key", expectedSignerAddress: replaySigner.address,
+  });
+  if (existingApiKeySubmit.structuredContent.status !== "SUBMITTED") {
+    fail("create HTTP 400 did not fall back once to deriving the existing CLOB API key", "clob_auth_creation_invalid");
+  }
+  const invalidClobAuth = await callTool(artifact, submitTool, {
+    ...submitArgs, clobAuth: { ...clobAuth, signature: `0x${"0".repeat(130)}` },
+  }, { fixtures: true, fixtureScenario: "invalid-clob-auth" });
+  if (invalidClobAuth.structuredContent.status !== "FAILED"
+    || invalidClobAuth.structuredContent.errorCode !== "PS_AUTH_SIGNATURE_INVALID"
+    || !/prepare and sign a new ClobAuth/i.test(invalidClobAuth.structuredContent.message)) {
+    fail("locally invalid ClobAuth did not fail closed with re-sign guidance", "clob_auth_signature_invalid");
   }
   for (const [scenario, age] of [["restricted-submit", 0], ["submit-stale-book", 51_000], ["submit-future-book", null], ["missing-book-timestamp", null]]) {
     const result = await callTool(artifact, submitTool, submitArgs, { fixtures: true, fixtureScenario: scenario });
@@ -261,6 +301,12 @@ export async function testOfflineArtifact(root = process.cwd()) {
     signingAddress: depositSigner.address, walletType: "DEPOSIT_WALLET", side: "BUY", priceLimit: "0.50",
   }, { fixtures: true });
   const depositPrepared = depositOrder.structuredContent.preparedOrder;
+  if (depositPrepared.wallet.signatureType !== 3
+    || depositPrepared.wallet.makerAddress !== "0x0000000000000000000000000000000000000002"
+    || depositPrepared.wallet.signingAddress.toLowerCase() !== depositSigner.address.toLowerCase()
+    || depositPrepared.wallet.orderSignerAddress.toLowerCase() !== depositPrepared.wallet.makerAddress.toLowerCase()) {
+    fail("Deposit Wallet owner EOA, maker, order signer, and signature type were not kept distinct and consistent", "deposit_wallet_identity_invalid");
+  }
   const depositOrderSignature = await depositSigner.signTypedData(depositPrepared.typedData);
   const depositValidation = await callTool(artifact, validateOrderTool, {
     preparedOrder: depositPrepared, signature: depositOrderSignature,
@@ -278,9 +324,63 @@ export async function testOfflineArtifact(root = process.cwd()) {
   };
   const depositSubmit = await callTool(artifact, submitTool, {
     preparedOrder: depositPrepared, orderSignature: depositOrderSignature, clobAuth: depositClobAuth,
-  }, { fixtures: true, fixtureScenario: "submit-deposit-wallet" });
+  }, {
+    fixtures: true, fixtureScenario: "submit-deposit-wallet",
+    expectedSignerAddress: depositSigner.address, expectedMakerAddress: depositPrepared.wallet.makerAddress,
+  });
   if (depositSubmit.structuredContent.status !== "SUBMITTED") {
     fail("valid Deposit Wallet signing data did not reach its single intercepted CLOB POST without Polygon RPC", "deposit_wallet_submit_invalid");
+  }
+  const statusTool = tools.find((tool) => tool.name === "get_order_status");
+  const statusOrderId = `0x${"a".repeat(64)}`;
+  const l1DerivationRejected = await callTool(artifact, statusTool, {
+    orderId: statusOrderId, requestedSize: "10", signerAddress: replaySigner.address, clobAuth,
+  }, { fixtures: true, fixtureScenario: "l1-derive-401", expectedSignerAddress: replaySigner.address });
+  if (l1DerivationRejected.structuredContent.errorCode !== "PS_CLOB_AUTH_REJECTED"
+    || l1DerivationRejected.structuredContent.httpStatus !== 401
+    || !/prepare and sign a new ClobAuth/i.test(l1DerivationRejected.structuredContent.message)) {
+    fail("HTTP 401 from L1 derivation was not distinguished from an order read failure", "clob_l1_failure_invalid");
+  }
+  const l2Rejected = await callTool(artifact, statusTool, {
+    orderId: statusOrderId, requestedSize: "10", signerAddress: replaySigner.address, clobAuth,
+  }, { fixtures: true, fixtureScenario: "order-status-l2-401", expectedSignerAddress: replaySigner.address });
+  if (l2Rejected.structuredContent.errorCode !== "PS_CLOB_PRIVATE_AUTH_REJECTED"
+    || l2Rejected.structuredContent.httpStatus !== 401) {
+    fail("HTTP 401 from an authenticated order read was hidden as an unknown order status", "clob_l2_failure_invalid");
+  }
+  if (JSON.stringify(l2Rejected.structuredContent).includes("SECRET_SENTINEL")) {
+    fail("L2 authentication failure exposed provider body data", "clob_l2_sanitization_invalid");
+  }
+  const missingOrder = await callTool(artifact, statusTool, {
+    orderId: statusOrderId, requestedSize: "10", signerAddress: replaySigner.address, clobAuth,
+  }, { fixtures: true, fixtureScenario: "order-status-404", expectedSignerAddress: replaySigner.address });
+  if (missingOrder.structuredContent.errorCode !== "PS_ORDER_NOT_FOUND" || missingOrder.structuredContent.httpStatus !== 404) {
+    fail("HTTP 404 for a nonexistent order was not distinguished from authentication failure", "clob_order_not_found_invalid");
+  }
+  const statusUnavailable = await callTool(artifact, statusTool, {
+    orderId: statusOrderId, requestedSize: "10", signerAddress: replaySigner.address, clobAuth,
+  }, { fixtures: true, fixtureScenario: "order-status-503", expectedSignerAddress: replaySigner.address });
+  if (statusUnavailable.structuredContent.errorCode !== "PS_PROVIDER_UNAVAILABLE" || statusUnavailable.structuredContent.httpStatus !== 503) {
+    fail("HTTP 503 on an order read was not returned as a provider availability failure", "clob_order_unavailable_invalid");
+  }
+  const statusTimeout = await callTool(artifact, statusTool, {
+    orderId: statusOrderId, requestedSize: "10", signerAddress: replaySigner.address, clobAuth,
+  }, { fixtures: true, fixtureScenario: "order-status-timeout", expectedSignerAddress: replaySigner.address });
+  if (statusTimeout.structuredContent.errorCode !== "PS_PROVIDER_TIMEOUT") {
+    fail("order-status transport timeout was not distinguished from a missing order", "clob_order_timeout_invalid");
+  }
+  const foundOrder = await callTool(artifact, statusTool, {
+    orderId: statusOrderId, requestedSize: "10", signerAddress: replaySigner.address, clobAuth,
+  }, { fixtures: true, fixtureScenario: "order-status-found", expectedSignerAddress: replaySigner.address });
+  if (foundOrder.structuredContent.status !== "PARTIALLY_FILLED" || foundOrder.structuredContent.filledSize !== "2"
+    || foundOrder.structuredContent.remainingSize !== "8" || foundOrder.structuredContent.httpStatus !== 200) {
+    fail("authenticated order record was not returned with its actual fill data", "clob_order_record_invalid");
+  }
+  const identityMismatch = await callTool(artifact, statusTool, {
+    orderId: statusOrderId, requestedSize: "10", signerAddress: depositPrepared.wallet.makerAddress, clobAuth: depositClobAuth,
+  }, { fixtures: true, fixtureScenario: "identity-mismatch", expectedSignerAddress: depositPrepared.wallet.makerAddress });
+  if (identityMismatch.structuredContent.errorCode !== "PS_AUTH_WALLET_MISMATCH") {
+    fail("Deposit Wallet address was accepted as the owner EOA ClobAuth signer", "deposit_wallet_identity_invalid");
   }
   for (const [scenario, expectedCode, prepared, signature] of [
     ["snapshot-min-decrease", null, replayPrepared, orderSignature],
@@ -317,7 +417,11 @@ export async function testOfflineArtifact(root = process.cwd()) {
   const geoblocked = await callTool(artifact, submitTool, submitArgs, { fixtures: true, fixtureScenario: "geoblocked" });
   if (geoblocked.structuredContent.errorCode !== "PS_GEOBLOCKED") fail("official blocked geoblock response did not prevent submission", "geoblock_invalid");
   const missingCredentials = await callTool(artifact, submitTool, submitArgs, { fixtures: true, fixtureScenario: "missing-credentials" });
-  if (missingCredentials.structuredContent.errorCode !== "PS_CLOB_AUTH_FAILED") fail("missing CLOB credentials were not reported", "clob_auth_invalid");
+  if (missingCredentials.structuredContent.errorCode !== "PS_CLOB_AUTH_REJECTED"
+    || missingCredentials.structuredContent.httpStatus !== 401
+    || JSON.stringify(missingCredentials.structuredContent).includes("SECRET_SENTINEL")) {
+    fail("L1 credential rejection did not preserve safe HTTP status or exposed a provider body", "clob_auth_invalid");
+  }
   const changedFee = await callTool(artifact, submitTool, submitArgs, { fixtures: true, fixtureScenario: "fee-changed" });
   if (changedFee.structuredContent.errorCode !== "PS_SPENDING_CAP") {
     fail("current fee increase was not bounded by the user-approved all-in spending cap", "spending_cap_invalid");
@@ -1137,7 +1241,7 @@ function validateCallResult(value) {
   if (result.isError !== undefined && typeof result.isError !== "boolean") fail("tools/call isError must be boolean");
 }
 
-export async function runOperation(artifact, operation, { fixtures = false, fixtureScenario } = {}) {
+export async function runOperation(artifact, operation, { fixtures = false, fixtureScenario, expectedSignerAddress, expectedMakerAddress } = {}) {
   const home = await mkdtemp(resolve(tmpdir(), "paybox-plugin-conformance-"));
   try {
     const args = fixtures ? ["--import", resolve(dirname(artifact), "../tests/network-fixtures.mjs"), artifact] : [artifact];
@@ -1146,6 +1250,8 @@ export async function runOperation(artifact, operation, { fixtures = false, fixt
       env: {
         HOME: home, NODE_ENV: "production", NO_COLOR: "1", PATH: process.env.PATH ?? "/usr/local/bin:/usr/bin:/bin",
         ...(fixtureScenario === undefined ? {} : { POLYSCOPE_TEST_SCENARIO: fixtureScenario }),
+        ...(expectedSignerAddress === undefined ? {} : { POLYSCOPE_TEST_EXPECTED_SIGNER: expectedSignerAddress }),
+        ...(expectedMakerAddress === undefined ? {} : { POLYSCOPE_TEST_EXPECTED_MAKER: expectedMakerAddress }),
       },
     }, async (child, closed, stop) => {
       let stdoutBytes = 0;

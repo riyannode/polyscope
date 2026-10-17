@@ -9,9 +9,17 @@ if (scenario === "unexpected-failure") {
   Object.defineProperty(globalThis.crypto, "getRandomValues", { value: () => { throw new Error("fixture unexpected programming failure"); } });
 }
 let orderPosts = 0;
+let apiKeyCreates = 0;
+let apiKeyDerivations = 0;
 process.on("exit", () => {
   if (scenario?.startsWith("snapshot-") && !["snapshot-min-increase", "snapshot-min-zero", "snapshot-tick-invalid", "snapshot-risk-changed"].includes(scenario) && orderPosts !== 1) process.exitCode = 92;
   if (["snapshot-min-increase", "snapshot-min-zero", "snapshot-tick-invalid", "snapshot-risk-changed"].includes(scenario) && orderPosts !== 0) process.exitCode = 93;
+  if (scenario === "submit-valid" && (apiKeyCreates !== 1 || apiKeyDerivations !== 0 || orderPosts !== 1)) process.exitCode = 95;
+  if (scenario === "existing-api-key" && (apiKeyCreates !== 1 || apiKeyDerivations !== 1 || orderPosts !== 1)) process.exitCode = 96;
+  if (scenario === "submit-rejected-l1-auth" && (apiKeyCreates !== 1 || apiKeyDerivations !== 0 || orderPosts !== 0)) process.exitCode = 97;
+  if (scenario === "l1-derive-401" && (apiKeyCreates !== 0 || apiKeyDerivations !== 1 || orderPosts !== 0)) process.exitCode = 98;
+  if (scenario?.startsWith("order-status-") && (apiKeyCreates !== 0 || apiKeyDerivations !== 1 || orderPosts !== 0)) process.exitCode = 99;
+  if (scenario === "identity-mismatch" && (apiKeyCreates !== 0 || apiKeyDerivations !== 0 || orderPosts !== 0)) process.exitCode = 100;
 });
 
 const conditionId = `0x${"1".repeat(64)}`;
@@ -111,21 +119,52 @@ globalThis.fetch = async (input, init = {}) => {
     if (scenario === "price-bound") body.asks = [{ price: "0.51", size: "100" }];
   } else if (url.hostname === "clob.polymarket.com" && url.pathname === `/clob-markets/${conditionId}`) {
     body = { fd: { r: scenario === "fee-changed" ? 0.06 : 0.05, e: 1 } };
-  } else if (url.hostname === "clob.polymarket.com" && url.pathname === "/auth/derive-api-key") {
-    if (scenario === "missing-credentials") return new Response("unauthorized", { status: 401 });
+  } else if (url.hostname === "clob.polymarket.com" && url.pathname === "/time") {
+    if (scenario === "time-unavailable") return new Response("fixture API key=SECRET_SENTINEL", { status: 503 });
+    if (scenario === "time-invalid") return Response.json({ timestamp: 1_800_000_000 });
+    body = 1_800_000_000;
+  } else if (url.hostname === "clob.polymarket.com" && url.pathname === "/auth/api-key" && init.method === "POST") {
+    apiKeyCreates += 1;
+    const expectedSigner = process.env.POLYSCOPE_TEST_EXPECTED_SIGNER;
+    if (expectedSigner && init.headers?.POLY_ADDRESS?.toLowerCase() !== expectedSigner.toLowerCase()) process.exit(84);
+    if (scenario === "submit-rejected-l1-auth" || scenario === "missing-credentials") {
+      return new Response("apiKey=SECRET_SENTINEL; secret=SECRET_SENTINEL; passphrase=SECRET_SENTINEL; signature=SECRET_SENTINEL", { status: 401 });
+    }
+    if (scenario === "existing-api-key") return new Response("already exists", { status: 400 });
     body = { apiKey: "fixture-api-key", secret: "dGVzdA==", passphrase: "fixture-passphrase" };
+  } else if (url.hostname === "clob.polymarket.com" && url.pathname === "/auth/derive-api-key") {
+    apiKeyDerivations += 1;
+    const expectedSigner = process.env.POLYSCOPE_TEST_EXPECTED_SIGNER;
+    if (expectedSigner && init.headers?.POLY_ADDRESS?.toLowerCase() !== expectedSigner.toLowerCase()) process.exit(84);
+    if (scenario === "submit-rejected-l1-auth" || scenario === "missing-credentials") process.exit(83);
+    if (scenario === "l1-derive-401") return new Response("apiKey=SECRET_SENTINEL; secret=SECRET_SENTINEL; passphrase=SECRET_SENTINEL; signature=SECRET_SENTINEL", { status: 401 });
+    if (scenario === "existing-api-key") body = { apiKey: "fixture-api-key", secret: "dGVzdA==", passphrase: "fixture-passphrase" };
+    else if (scenario === "identity-mismatch") process.exit(88);
+    else body = { apiKey: "fixture-api-key", secret: "dGVzdA==", passphrase: "fixture-passphrase" };
   } else if (url.hostname === "clob.polymarket.com" && url.pathname.startsWith("/data/order/")) {
+    const expectedSigner = process.env.POLYSCOPE_TEST_EXPECTED_SIGNER;
+    if (expectedSigner && init.headers?.POLY_ADDRESS?.toLowerCase() !== expectedSigner.toLowerCase()) process.exit(84);
+    if (scenario === "order-status-l2-401") return new Response("apiKey=SECRET_SENTINEL; secret=SECRET_SENTINEL; passphrase=SECRET_SENTINEL; signature=SECRET_SENTINEL", { status: 401 });
+    if (scenario === "order-status-503") return new Response("apiKey=SECRET_SENTINEL; secret=SECRET_SENTINEL", { status: 503 });
+    if (scenario === "order-status-timeout") throw new DOMException("fixture timeout", "TimeoutError");
+    if (scenario === "order-status-found") return Response.json({
+      id: `0x${"a".repeat(64)}`, status: "MATCHED", order_type: "FAK", original_size: "10", size_matched: "2",
+      associate_trades: ["fixture-trade"], asset_id: "123", side: "BUY",
+    });
     return new Response("not found", { status: 404 });
   } else if (url.hostname === "clob.polymarket.com" && url.pathname === "/order" && init.method === "POST") {
     orderPosts += 1;
-    if (!["submit-valid", "submit-deposit-wallet", "restricted-submit", "submit-stale-book", "submit-stale-auth", "submit-future-book", "missing-book-timestamp", "submit-ambiguous", "snapshot-min-decrease", "snapshot-tick-valid"].includes(scenario) || orderPosts !== 1) process.exit(89);
+    if (!["submit-valid", "existing-api-key", "submit-deposit-wallet", "restricted-submit", "submit-stale-book", "submit-future-book", "missing-book-timestamp", "submit-ambiguous", "snapshot-min-decrease", "snapshot-tick-valid"].includes(scenario) || orderPosts !== 1) process.exit(89);
     const postedOrder = JSON.parse(init.body);
     if (postedOrder.orderType !== "FAK" || postedOrder.order.side !== "BUY"
       || postedOrder.order.makerAmount !== "5000000" || postedOrder.order.takerAmount !== "10000000"
       || postedOrder.order.timestamp === undefined || !postedOrder.order.signature) process.exit(90);
     if (scenario === "submit-deposit-wallet" && (postedOrder.order.signature.length <= 132 || postedOrder.order.signatureType !== 3)) process.exit(94);
+    const expectedMaker = process.env.POLYSCOPE_TEST_EXPECTED_MAKER;
+    if (expectedMaker && (postedOrder.order.maker.toLowerCase() !== expectedMaker.toLowerCase()
+      || postedOrder.order.signer.toLowerCase() !== expectedMaker.toLowerCase())) process.exit(85);
     if (scenario === "submit-ambiguous") throw new Error("fixture connection reset after request body");
-    if (["submit-valid", "submit-deposit-wallet", "restricted-submit", "submit-stale-book", "submit-stale-auth", "submit-future-book", "missing-book-timestamp", "snapshot-min-decrease", "snapshot-tick-valid"].includes(scenario)) {
+    if (["submit-valid", "existing-api-key", "submit-deposit-wallet", "restricted-submit", "submit-stale-book", "submit-future-book", "missing-book-timestamp", "snapshot-min-decrease", "snapshot-tick-valid"].includes(scenario)) {
       return new Response(JSON.stringify({ success: true, orderID: `0x${"a".repeat(64)}`, status: "MATCHED", tradeIDs: [] }), {
         status: 200, headers: { "content-type": "application/json" },
       });

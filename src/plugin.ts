@@ -357,6 +357,7 @@ const executionResultSchema = z.object({
   status: orderLifecycleSchema, orderId: z.string().nullable(), orderType: z.literal("FAK"),
   requestedSize: z.string(), filledSize: z.string().nullable(), remainingSize: z.string().nullable(),
   tradeIds: z.array(z.string()), message: z.string(), errorCode: z.string().regex(/^PS_[A-Z_]+$/).nullable().default(null),
+  httpStatus: z.number().int().min(100).max(599).optional(),
 }).strict();
 const geoblockSchema = z.object({ blocked: z.boolean() }).passthrough();
 const positionsResponseSchema = z.array(z.object({
@@ -1397,6 +1398,70 @@ async function validateWalletSignature(prepared: PreparedOrder, signature: Hex) 
 
 type ClobCredentials = z.infer<typeof clobCredentialSchema>;
 
+class ClobRequestError extends Error {
+  constructor(readonly code: string, readonly safeMessage: string, readonly httpStatus?: number) {
+    super(`${code}: ${safeMessage}`);
+    this.name = "ClobRequestError";
+  }
+}
+
+function clobRequestFailure(error: unknown, fallbackCode: string, fallbackMessage: string): {
+  code: string; message: string; httpStatus?: number;
+} {
+  if (error instanceof ClobRequestError) {
+    return {
+      code: error.code,
+      message: error.safeMessage,
+      ...(error.httpStatus === undefined ? {} : { httpStatus: error.httpStatus }),
+    };
+  }
+  if (error instanceof DOMException && error.name === "TimeoutError") {
+    return { code: "PS_PROVIDER_TIMEOUT", message: "Polymarket CLOB request timed out." };
+  }
+  if (error instanceof Error && error.message === "response_too_large") {
+    return { code: "PS_RESPONSE_TOO_LARGE", message: "Polymarket CLOB response exceeded the processing limit." };
+  }
+  if (error instanceof Error) {
+    const match = /^(PS_[A-Z_]+):\s*(.*)$/.exec(error.message);
+    if (match?.[1] !== undefined && match[2] !== undefined) return { code: match[1], message: match[2] };
+  }
+  return { code: fallbackCode, message: fallbackMessage };
+}
+
+function clobTransportFailure(error: unknown): ClobRequestError {
+  const failure = clobRequestFailure(error, "PS_PROVIDER_UNAVAILABLE", "Polymarket CLOB request failed before a response was received.");
+  return new ClobRequestError(failure.code, failure.message, failure.httpStatus);
+}
+
+async function clobServerTimestamp(): Promise<string> {
+  let response: Response;
+  try {
+    response = await fetch(`${CLOB_API}/time`, {
+      headers: { accept: "application/json" }, redirect: "error", signal: AbortSignal.timeout(1_500),
+    });
+  } catch (error) {
+    throw clobTransportFailure(error);
+  }
+  if (!response.ok) {
+    throw new ClobRequestError("PS_CLOB_TIME_UNAVAILABLE", `Polymarket CLOB server time request failed with HTTP ${response.status}.`, response.status);
+  }
+  let body: string;
+  try { body = await boundedResponseText(response, 64); }
+  catch (error) {
+    if (error instanceof Error && error.message === "response_too_large") {
+      throw new ClobRequestError("PS_CLOB_TIME_INVALID", "Polymarket CLOB returned an invalid server timestamp.", response.status);
+    }
+    throw clobTransportFailure(error);
+  }
+  let timestamp: unknown;
+  try { timestamp = JSON.parse(body) as unknown; }
+  catch { throw new ClobRequestError("PS_CLOB_TIME_INVALID", "Polymarket CLOB returned an invalid server timestamp.", response.status); }
+  if (typeof timestamp !== "number" || !Number.isSafeInteger(timestamp) || timestamp <= 0) {
+    throw new ClobRequestError("PS_CLOB_TIME_INVALID", "Polymarket CLOB returned an invalid server timestamp.", response.status);
+  }
+  return String(timestamp);
+}
+
 function l1Headers(auth: z.infer<typeof clobAuthSchema>, signerAddress: string) {
   return {
     POLY_ADDRESS: signerAddress,
@@ -1407,7 +1472,7 @@ function l1Headers(auth: z.infer<typeof clobAuthSchema>, signerAddress: string) 
 }
 
 async function deriveClobCredentials(
-  authInput: z.infer<typeof clobAuthSchema>, signerAddress: string, createOnMissing = false,
+  authInput: z.infer<typeof clobAuthSchema>, signerAddress: string, createOrDerive = false,
 ): Promise<ClobCredentials> {
   const auth = clobAuthSchema.parse(authInput);
   const signer = address(signerAddress);
@@ -1416,24 +1481,50 @@ async function deriveClobCredentials(
     recovered = await recoverTypedDataAddress({
       ...clobAuthTypedData(signer, auth.timestamp, auth.nonce), signature: signatureHex(auth.signature),
     });
-  } catch { throw new Error("PS_AUTH_SIGNATURE_INVALID: ClobAuth signature could not be recovered."); }
-  if (recovered.toLowerCase() !== signer.toLowerCase()) throw new Error("PS_AUTH_WALLET_MISMATCH: ClobAuth signer differs from the selected order signer.");
+  } catch { throw new Error("PS_AUTH_SIGNATURE_INVALID: ClobAuth signature could not be recovered. Prepare and sign a new ClobAuth."); }
+  if (recovered.toLowerCase() !== signer.toLowerCase()) {
+    throw new Error("PS_AUTH_WALLET_MISMATCH: ClobAuth must be signed by the selected owner EOA. Prepare and sign a new ClobAuth for that signer.");
+  }
 
   const read = async (path: "/auth/derive-api-key" | "/auth/api-key", method: "GET" | "POST") => {
-    const response = await fetch(`${CLOB_API}${path}`, {
-      method, headers: { accept: "application/json", ...l1Headers(auth, signer) },
-      redirect: "error", signal: AbortSignal.timeout(1_500),
-    });
-    if (!response.ok) return { status: response.status, data: null };
-    const data: unknown = JSON.parse(await boundedResponseText(response, 32_768));
-    return { status: response.status, data };
+    let response: Response;
+    try {
+      response = await fetch(`${CLOB_API}${path}`, {
+        method, headers: { accept: "application/json", ...l1Headers(auth, signer) },
+        redirect: "error", signal: AbortSignal.timeout(1_500),
+      });
+    } catch (error) {
+      throw clobTransportFailure(error);
+    }
+    if (!response.ok) {
+      const code = response.status === 401 ? "PS_CLOB_AUTH_REJECTED" : "PS_CLOB_AUTH_FAILED";
+      const message = response.status === 401
+        ? "Polymarket rejected ClobAuth; prepare and sign a new ClobAuth, then retry explicitly."
+        : `Polymarket CLOB credential request failed with HTTP ${response.status}.`;
+      throw new ClobRequestError(code, message, response.status);
+    }
+    let body: string;
+    try { body = await boundedResponseText(response, 32_768); }
+    catch (error) {
+      if (error instanceof Error && error.message === "response_too_large") {
+        throw new ClobRequestError("PS_RESPONSE_TOO_LARGE", "Polymarket CLOB credential response exceeded 32 KiB.", response.status);
+      }
+      throw clobTransportFailure(error);
+    }
+    try { return JSON.parse(body) as unknown; }
+    catch { throw new ClobRequestError("PS_CLOB_AUTH_INVALID", "Polymarket returned an invalid credential response.", response.status); }
   };
-  let result = await read("/auth/derive-api-key", "GET");
-  if (result.status === 404 && createOnMissing) result = await read("/auth/api-key", "POST");
-  if (result.status < 200 || result.status >= 300 || result.data === null) {
-    throw new Error(`PS_CLOB_AUTH_FAILED: Polymarket CLOB credential derivation failed with HTTP ${result.status}.`);
+  let data: unknown;
+  if (createOrDerive) {
+    try { data = await read("/auth/api-key", "POST"); }
+    catch (error) {
+      if (!(error instanceof ClobRequestError) || error.httpStatus !== 400) throw error;
+      data = await read("/auth/derive-api-key", "GET");
+    }
+  } else {
+    data = await read("/auth/derive-api-key", "GET");
   }
-  const parsed = clobCredentialSchema.safeParse(result.data);
+  const parsed = clobCredentialSchema.safeParse(data);
   if (!parsed.success) throw new Error("PS_CLOB_AUTH_INVALID: Polymarket returned an invalid credential response.");
   return parsed.data;
 }
@@ -1458,7 +1549,7 @@ async function clobPrivateRequest(
     },
     ...(body === undefined ? {} : { body }), redirect: "error", signal: AbortSignal.timeout(1_500),
   });
-  if (response.status === 204 || response.status === 404) return { status: response.status, data: null };
+  if (response.status === 204 || !response.ok) return { status: response.status, data: null };
   const text = await boundedResponseText(response, 1_000_000);
   let data: unknown;
   try { data = JSON.parse(text) as unknown; }
@@ -1619,11 +1710,6 @@ function validatePreparedOrder(prepared: PreparedOrder): {
 function tradeToolResult(value: unknown) {
   const result = executionResultSchema.parse(value);
   return { content: [{ type: "text" as const, text: result.message }], structuredContent: result };
-}
-
-function stableErrorCode(error: unknown, fallback: string): string {
-  const match = error instanceof Error ? /^(PS_[A-Z_]+)/.exec(error.message) : null;
-  return match?.[1] ?? fallback;
 }
 
 function decimalUnits(value: string, decimals: number): bigint | null {
@@ -2112,19 +2198,19 @@ async function createServer() {
     "prepare_clob_auth",
     {
       title: "Prepare Polymarket CLOB authentication signature",
-      description: "Builds the Polygon ClobAuth EIP-712 payload for the existing account signer. The PayBox agent must call request_wallet_sign with the matching wallet credential and poll get_request.",
+      description: "Fetches the current CLOB server timestamp and builds the Polygon ClobAuth EIP-712 payload for the existing owner EOA signer. The PayBox agent must call request_wallet_sign with the matching wallet credential, poll get_request, then use the signature promptly. No signature or credentials are sent by this tool.",
       inputSchema: z.object({ signerAddress: addressSchema, nonce: z.string().regex(/^(0|[1-9][0-9]{0,77})$/).default("0") }).strict(),
       outputSchema: typedOutputSchema,
-      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: false, openWorldHint: true },
     },
     async ({ signerAddress, nonce }) => {
       if (BigInt(nonce) >= 1n << 256n) throw new Error("PS_AUTH_NONCE_INVALID: Nonce exceeds uint256.");
       const signer = address(signerAddress);
-      const timestamp = String(Math.floor(Date.now() / 1000));
+      const timestamp = await clobServerTimestamp();
       const typedData = wireTypedData(clobAuthTypedData(signer, timestamp, nonce));
       const intent = { op: "typedData" as const, typedData };
       return {
-        content: [{ type: "text", text: "ClobAuth typed data prepared. Nothing was signed or sent to Polymarket." }],
+        content: [{ type: "text", text: "ClobAuth typed data prepared from CLOB server time. Nothing was signed; sign and use it promptly." }],
         structuredContent: {
           signingAddress: signer,
           timestamp,
@@ -2288,7 +2374,7 @@ async function createServer() {
     "validate_clob_auth_signature",
     {
       title: "Validate a PayBox ClobAuth signature",
-      description: "Recovers the signer from the exact ClobAuth payload and checks it against the expected existing PayBox wallet address. This does not derive or return CLOB credentials.",
+      description: "Recovers the signer from the exact ClobAuth payload and checks it against the expected existing PayBox owner EOA. This cryptographic check does not establish timestamp freshness or provider acceptance, and does not derive or return CLOB credentials.",
       inputSchema: z.object({
         signerAddress: addressSchema, timestamp: z.string().regex(/^[0-9]{1,16}$/),
         nonce: z.string().regex(/^(0|[1-9][0-9]{0,77})$/), signature: z.string().regex(/^0x[0-9a-fA-F]{130}$/),
@@ -2310,7 +2396,9 @@ async function createServer() {
       }
       const valid = recovered?.toLowerCase() === expected.toLowerCase();
       return {
-        content: [{ type: "text", text: valid ? "ClobAuth signature matches the expected signer." : "ClobAuth signature is invalid or belongs to a different signer." }],
+        content: [{ type: "text", text: valid
+          ? "ClobAuth signature matches the expected signer. Timestamp freshness and CLOB acceptance are not verified."
+          : "ClobAuth signature is invalid or belongs to a different signer. Prepare and sign a new ClobAuth for the expected owner EOA." }],
         structuredContent: { valid, expectedSignerAddress: expected, recoveredSignerAddress: recovered },
       };
     },
@@ -2390,11 +2478,11 @@ async function createServer() {
           });
         }
       } catch (error) {
-        const message = error instanceof Error && error.message.startsWith("PS_") ? error.message.split(":").slice(1).join(":").trim() : "Polymarket preflight could not be completed; no order was sent.";
+        const failure = clobRequestFailure(error, "PS_PREFLIGHT_FAILED", "Polymarket preflight could not be completed; no order was sent.");
         return tradeToolResult({
           status: "FAILED", orderId: null, orderType: FAK, requestedSize: prepared.order.size,
-          filledSize: null, remainingSize: prepared.order.size, tradeIds: [], message,
-          errorCode: stableErrorCode(error, "PS_PREFLIGHT_FAILED"),
+          filledSize: null, remainingSize: prepared.order.size, tradeIds: [], message: failure.message,
+          errorCode: failure.code, ...(failure.httpStatus === undefined ? {} : { httpStatus: failure.httpStatus }),
         });
       }
 
@@ -2439,7 +2527,7 @@ async function createServer() {
           status: "REJECTED", orderId: null, orderType: FAK, requestedSize: prepared.order.size,
           filledSize: null, remainingSize: prepared.order.size, tradeIds: [],
           message: "Polymarket rejected the FAK request; no accepted order ID was returned.",
-          errorCode: "PS_CLOB_REJECTED",
+          errorCode: "PS_CLOB_REJECTED", httpStatus: posted.status,
         });
         const reconciled = await clobPrivateRequest(credentials, prepared.wallet.signingAddress, "GET", `/data/order/${orderHash}`).catch(() => null);
         const known = reconciled?.status === 200 && reconciled.data !== null
@@ -2488,10 +2576,51 @@ async function createServer() {
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
     },
     async ({ orderId, requestedSize, signerAddress, clobAuth }) => {
-      const credentials = await deriveClobCredentials(clobAuth, signerAddress);
-      const result = await clobPrivateRequest(credentials, signerAddress, "GET", `/data/order/${encodeURIComponent(orderId)}`).catch(() => null);
-      const known = result?.status === 200 && result.data !== null ? orderStatusResult({ orderId, requestedSize, record: result.data }) : null;
-      return tradeToolResult(known ?? { status: "UNKNOWN", orderId, orderType: FAK, requestedSize, filledSize: null, remainingSize: null, tradeIds: [], message: "Polymarket did not return an authoritative order status.", errorCode: "PS_ORDER_STATUS_UNKNOWN" });
+      let credentials: ClobCredentials;
+      try { credentials = await deriveClobCredentials(clobAuth, signerAddress); }
+      catch (error) {
+        const failure = clobRequestFailure(error, "PS_CLOB_AUTH_FAILED", "Polymarket CLOB credentials could not be derived.");
+        return tradeToolResult({
+          status: "FAILED", orderId, orderType: FAK, requestedSize, filledSize: null, remainingSize: null, tradeIds: [],
+          message: failure.message, errorCode: failure.code,
+          ...(failure.httpStatus === undefined ? {} : { httpStatus: failure.httpStatus }),
+        });
+      }
+      let result: { status: number; data: unknown | null };
+      try {
+        result = await clobPrivateRequest(credentials, signerAddress, "GET", `/data/order/${encodeURIComponent(orderId)}`);
+      } catch (error) {
+        const failure = clobRequestFailure(error, "PS_PROVIDER_UNAVAILABLE", "Polymarket order status could not be read.");
+        return tradeToolResult({
+          status: "UNKNOWN", orderId, orderType: FAK, requestedSize, filledSize: null, remainingSize: null, tradeIds: [],
+          message: failure.message, errorCode: failure.code,
+          ...(failure.httpStatus === undefined ? {} : { httpStatus: failure.httpStatus }),
+        });
+      }
+      if (result.status === 401) return tradeToolResult({
+        status: "UNKNOWN", orderId, orderType: FAK, requestedSize, filledSize: null, remainingSize: null, tradeIds: [],
+        message: "Polymarket rejected L2 order-status authentication (HTTP 401); verify the CLOB credentials. Order status is unconfirmed.",
+        errorCode: "PS_CLOB_PRIVATE_AUTH_REJECTED", httpStatus: result.status,
+      });
+      if (result.status === 404) return tradeToolResult({
+        status: "UNKNOWN", orderId, orderType: FAK, requestedSize, filledSize: null, remainingSize: null, tradeIds: [],
+        message: "Polymarket returned HTTP 404 for this order ID; no order record was found.",
+        errorCode: "PS_ORDER_NOT_FOUND", httpStatus: result.status,
+      });
+      if (result.status < 200 || result.status >= 300) return tradeToolResult({
+        status: "UNKNOWN", orderId, orderType: FAK, requestedSize, filledSize: null, remainingSize: null, tradeIds: [],
+        message: result.status >= 500 || result.status === 429
+          ? `Polymarket order-status read failed with HTTP ${result.status}; order status is unconfirmed.`
+          : `Polymarket rejected the order-status read with HTTP ${result.status}; order status is unconfirmed.`,
+        errorCode: result.status >= 500 || result.status === 429 ? "PS_PROVIDER_UNAVAILABLE" : "PS_CLOB_REQUEST_REJECTED",
+        httpStatus: result.status,
+      });
+      const known = result.data === null ? null : orderStatusResult({ orderId, requestedSize, record: result.data });
+      if (known === null) return tradeToolResult({
+        status: "UNKNOWN", orderId, orderType: FAK, requestedSize, filledSize: null, remainingSize: null, tradeIds: [],
+        message: "Polymarket returned no authoritative order record.", errorCode: "PS_ORDER_STATUS_UNKNOWN", httpStatus: result.status,
+      });
+      return tradeToolResult({ ...known, httpStatus: result.status });
     },
   );
 
