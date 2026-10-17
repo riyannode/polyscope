@@ -116,6 +116,7 @@ Add only these exact network hosts to the PayBox allowlist:
 | `clob.polymarket.com` | Order books, fee metadata, authentication, orders, status, and cancellation |
 | `data-api.polymarket.com` | Public positions and PnL |
 | `polymarket.com` | Geoblock preflight endpoint |
+| `polygon.drpc.org` | Read-only Polygon RPC for selected-wallet pUSD, approval, position, and resolution checks |
 | `api.football-data.org` | Soccer fixtures, results, and team history |
 | `v3.football.api-sports.io` | Optional API-Football dated fixtures and venue-specific team statistics |
 | `www.espn.com` | ESPN soccer RSS headlines |

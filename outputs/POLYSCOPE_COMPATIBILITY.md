@@ -1,18 +1,42 @@
 # PolyScope — implementation and compatibility readiness
 
+## Current PR #7 release check
+
+Checked: 2026-10-17 (Asia/Jakarta)
+
+PR: [#7](https://github.com/riyannode/polyscope/pull/7), branch `fix/clob-auth-recovery`, kept OPEN and Draft. The reviewed implementation started at `7553611abb2c1378f30469504009b26876440233`; this release update changes documentation only. Source code is unchanged, and the tracked bundle copy was verified against the fresh build.
+
+The generated MCP catalog contains exactly **16 tools**. The offline suite verified machine-readable JSON `content[].text` for all 16 while retaining schema-valid `structuredContent`, including search-to-quote-to-signing-intent-to-validation-to-submission continuation. EOA signature type 0 and Deposit Wallet type 3 remain covered for FAK and FOK; BUY/SELL, price and fee-inclusive bounds, geoblock, ambiguous submission, and no-retry behavior remain covered. `submit_fak_order` remains registered as the backward-compatible FAK-only entry point.
+
+| Command | Result |
+|---|---|
+| `pnpm install --frozen-lockfile` | PASS — Node.js 24.19.0, pnpm 11.11.0; lockfile unchanged |
+| `pnpm run typecheck` | PASS — `tsc --noEmit` |
+| `pnpm test` | PASS — deterministic double build and offline conformance; all 16 text-only tool paths covered |
+| `pnpm run conformance` | PASS — exactly 16 tools; public market search and news calls passed; quote returned `NO_LIQUIDITY`; unsigned order preparation passed and did not submit |
+| `pnpm run build` | PASS — Node 24 target; artifact is 845,357 bytes |
+| `pnpm audit --prod` | PASS — no known production dependency vulnerabilities |
+| `git diff --check` | PASS — release changes have no whitespace errors |
+
+External provider availability is reported separately from local passes: `football-data.org` and API-Football calls each returned HTTP 403 in conformance, so soccer results were `UNAVAILABLE`. No live signing, financial order, approval, redemption, or deployment was performed.
+
+The current `dist/plugin.mjs` and `outputs/plugin.mjs` are byte-identical at **845,357 bytes**, with SHA-256 `fffaac56fe2780397b78b4251ce9ed9b11c8f2a52b37d76f9e51eb9a86e1292c`. The generated upload artifact is `dist/plugin.mjs`; upload that file directly to PayBox, **not a ZIP**. The code's read-only Polygon RPC endpoint is `https://polygon.drpc.org`, so `polygon.drpc.org` is required in the PayBox network allowlist for wallet readiness and redemption reads.
+
+> **Historical records below:** Earlier PR integration sections preserve their original tool counts, provider observations, bundle sizes, and hashes for traceability. They describe older bundles and are not current PR #7 validation. See the current PR #7 release check below.
+
 Checked: 2026-10-17 (Asia/Jakarta)
 
 Runtime: official PayBox starter 1.0.2, Node.js 24.22.0, pnpm 11.11.0
 
 Integrated base: PR #3 merge commit `0f5866cac685f860f0a79ccb1a9009812ff3b2a4` on `main`.
 
-Decision: **PR3_MERGED; LOCAL_INTEGRATION_CHECKS_PASSED; PAYBOX_SKILL_AUTO_LOADING_UNVERIFIED; LIVE_AGENT_BROWSING_UNVERIFIED; LIVE_TRADING_UNVERIFIED**
+Historical decision at the time of the earlier integration: **PR3_MERGED; LOCAL_INTEGRATION_CHECKS_PASSED; PAYBOX_SKILL_AUTO_LOADING_UNVERIFIED; LIVE_AGENT_BROWSING_UNVERIFIED; LIVE_TRADING_UNVERIFIED**
 
 This report records the integrated PR #3 trading implementation and PR #4 soccer research extension. The hosted acceptance rows below are historical owner-reported evidence, not a retest of this bundle. This integration performs no hosted test, wallet-signing request, order broadcast, deposit, deployment, or PR merge.
 
 ## PR #5 — multi-provider soccer research and independent edge
 
-This branch is based on `main` at `d2c678f8b15d5cfeb7017e3b2a5ca596eb094cdf`, where PR #3 and PR #4 are already merged. The current bundle has **13 MCP tools**; the 12-tool counts and hosted observations in the historical PR #4 report below describe that older bundle, not this branch.
+At that earlier PR #5 integration, the branch was based on `main` at `d2c678f8b15d5cfeb7017e3b2a5ca596eb094cdf`, where PR #3 and PR #4 were already merged. That bundle had **13 MCP tools**; the 12-tool counts and hosted observations in the historical PR #4 report describe an even older bundle. Neither count describes current PR #7.
 
 `research_soccer` keeps football-data.org primary for fixtures, results, and recent form. On an HTTP, network, timeout, invalid JSON, or unusable fixture response it makes one API-Football `/fixtures?date=...&timezone=UTC` fallback request. It does not call API-Football after ordinary primary success, and valid HTTP 200 with no matching fixtures is reported as empty data rather than provider outage. `fallbackProvider.coverage` records the inclusive requested date range, the one queried UTC date, dates not queried, completeness, and continuation instructions. For `days > 0`, the result is partial even when the queried date returns fixtures; no additional API-Football date requests are issued. An explicit `fixtureIdentity.kickoffUtc` outside the explicit requested range is rejected before provider requests. A unique exact match requires the supplied competition, home and away team names, and exact UTC kickoff. A football-data.org numeric fixture ID is never sent to API-Football as an identifier. Exact fallback results may call `/teams/statistics` for the API-Football fixture's own team, league, and season IDs, with a cutoff on the UTC day before kickoff. Fixture and team IDs use API-Football-qualified fields in `fallbackFixtures`; the original `fixtures` array and football-data.org ID meanings are unchanged. The legacy `provider` remains `football-data.org`, while optional `resultProvider` names the source of returned fixtures (`football-data.org` on primary results, `API-Football` on fallback). Top-level `availability` describes aggregate research availability. Per-provider availability and errors remain in `sources`. Fallback fixture evidence is marked single-provider `PARTIAL` or `UNVERIFIED`, with a low categorical confidence rationale. It is not cross-provider verification. Provider status codes, endpoint URLs, observation times, errors, and statistics coverage are retained when available. API-Football xG availability is not assumed; its team averages are goals, not xG. No account credential was available to verify account-specific endpoint access, competition coverage, or quota. The official v3 docs list `/fixtures`, `/teams/statistics`, `/injuries`, `/fixtures/lineups`, `/fixtures/statistics`, and `/predictions`; the free-plan quota is not treated as proof of this account's entitlement. Injuries and lineups remain host-agent/browser research topics.
 
@@ -22,7 +46,7 @@ TheSportsDB free v1 was checked on 2026-10-17: `searchteams.php?t=Arsenal` and `
 
 PayBox automatic loading of repository `SKILL.md` files and hosted agent browsing remain **UNVERIFIED**. API-Football's `x-apisports-key` and football-data.org's `X-Auth-Token` are intended to use PayBox host-scoped secrets, but hosted secret injection was not verified. No live Polymarket submission or wallet signing was performed. The hosted PayBox `primaryType: undefined` signing-window issue remains outside this change.
 
-Final Node/pnpm validation and bundle checksum for this branch are recorded below after the PR #5 implementation is built.
+The Node/pnpm validation and bundle checksum recorded in the historical PR #5 section below describe that earlier implementation only.
 
 ## PayBox hosted acceptance evidence
 
