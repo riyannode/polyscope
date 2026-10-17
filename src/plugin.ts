@@ -2466,7 +2466,7 @@ async function createServer() {
       let snapshot: Awaited<ReturnType<typeof validateExecutionSnapshot>>;
       try {
         [credentials, snapshot] = await Promise.all([
-          deriveClobCredentials(clobAuth, prepared.wallet.signingAddress, true),
+          deriveClobCredentials(clobAuth, prepared.wallet.signingAddress),
           validateExecutionSnapshot(prepared),
         ]);
         if (snapshot.blocked) {

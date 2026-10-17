@@ -250,12 +250,6 @@ export async function testOfflineArtifact(root = process.cwd()) {
   if (freshAuthValidation.structuredContent.valid !== true) {
     fail("fresh ClobAuth signature did not recover to its owner EOA", "clob_auth_signature_invalid");
   }
-  const oldAuthTimestamp = "1";
-  const oldAuthTypedData = {
-    ...clobAuthResult.structuredContent.typedData,
-    message: { ...clobAuthResult.structuredContent.typedData.message, timestamp: oldAuthTimestamp },
-  };
-  const oldClobAuth = { ...clobAuth, timestamp: oldAuthTimestamp, signature: await replaySigner.signTypedData(oldAuthTypedData) };
   const submitArgs = { preparedOrder: replayPrepared, orderSignature, clobAuth };
   const successfulSubmit = await callTool(artifact, submitTool, submitArgs, {
     fixtures: true, fixtureScenario: "submit-valid", expectedSignerAddress: replaySigner.address,
@@ -263,22 +257,22 @@ export async function testOfflineArtifact(root = process.cwd()) {
   if (successfulSubmit.structuredContent.status !== "SUBMITTED" || !successfulSubmit.structuredContent.orderId) {
     fail("a valid signed FAK order without ExecutionApproval did not reach one intercepted CLOB POST", "submit_invalid");
   }
-  const oldAuthSubmit = await callTool(artifact, submitTool, { ...submitArgs, clobAuth: oldClobAuth }, {
+  const l1RejectedSubmit = await callTool(artifact, submitTool, submitArgs, {
     fixtures: true, fixtureScenario: "submit-rejected-l1-auth", expectedSignerAddress: replaySigner.address,
   });
-  if (oldAuthSubmit.structuredContent.status !== "FAILED" || oldAuthSubmit.structuredContent.errorCode !== "PS_CLOB_AUTH_REJECTED"
-    || oldAuthSubmit.structuredContent.httpStatus !== 401
-    || !/prepare and sign a new ClobAuth/i.test(oldAuthSubmit.structuredContent.message)) {
-    fail("rejected ClobAuth did not fail closed with sanitized status and explicit re-sign guidance", "clob_auth_recovery_invalid");
+  if (l1RejectedSubmit.structuredContent.status !== "FAILED" || l1RejectedSubmit.structuredContent.errorCode !== "PS_CLOB_AUTH_REJECTED"
+    || l1RejectedSubmit.structuredContent.httpStatus !== 401
+    || !/prepare and sign a new ClobAuth/i.test(l1RejectedSubmit.structuredContent.message)) {
+    fail("fresh ClobAuth HTTP 401 did not fail closed with explicit re-sign guidance", "clob_auth_recovery_invalid");
   }
-  if (JSON.stringify(oldAuthSubmit.structuredContent).includes("SECRET_SENTINEL")) {
+  if (JSON.stringify(l1RejectedSubmit.structuredContent).includes("SECRET_SENTINEL")) {
     fail("L1 authentication failure exposed provider body data", "clob_auth_sanitization_invalid");
   }
   const existingApiKeySubmit = await callTool(artifact, submitTool, submitArgs, {
     fixtures: true, fixtureScenario: "existing-api-key", expectedSignerAddress: replaySigner.address,
   });
-  if (existingApiKeySubmit.structuredContent.status !== "SUBMITTED") {
-    fail("create HTTP 400 did not fall back once to deriving the existing CLOB API key", "clob_auth_creation_invalid");
+  if (existingApiKeySubmit.structuredContent.status !== "SUBMITTED" || !existingApiKeySubmit.structuredContent.orderId) {
+    fail("existing CLOB account did not derive credentials before its single FAK submission", "clob_auth_creation_invalid");
   }
   const invalidClobAuth = await callTool(artifact, submitTool, {
     ...submitArgs, clobAuth: { ...clobAuth, signature: `0x${"0".repeat(130)}` },

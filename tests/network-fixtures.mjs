@@ -9,17 +9,14 @@ if (scenario === "unexpected-failure") {
   Object.defineProperty(globalThis.crypto, "getRandomValues", { value: () => { throw new Error("fixture unexpected programming failure"); } });
 }
 let orderPosts = 0;
-let apiKeyCreates = 0;
-let apiKeyDerivations = 0;
+const authAndOrderCalls = [];
 process.on("exit", () => {
   if (scenario?.startsWith("snapshot-") && !["snapshot-min-increase", "snapshot-min-zero", "snapshot-tick-invalid", "snapshot-risk-changed"].includes(scenario) && orderPosts !== 1) process.exitCode = 92;
   if (["snapshot-min-increase", "snapshot-min-zero", "snapshot-tick-invalid", "snapshot-risk-changed"].includes(scenario) && orderPosts !== 0) process.exitCode = 93;
-  if (scenario === "submit-valid" && (apiKeyCreates !== 1 || apiKeyDerivations !== 0 || orderPosts !== 1)) process.exitCode = 95;
-  if (scenario === "existing-api-key" && (apiKeyCreates !== 1 || apiKeyDerivations !== 1 || orderPosts !== 1)) process.exitCode = 96;
-  if (scenario === "submit-rejected-l1-auth" && (apiKeyCreates !== 1 || apiKeyDerivations !== 0 || orderPosts !== 0)) process.exitCode = 97;
-  if (scenario === "l1-derive-401" && (apiKeyCreates !== 0 || apiKeyDerivations !== 1 || orderPosts !== 0)) process.exitCode = 98;
-  if (scenario?.startsWith("order-status-") && (apiKeyCreates !== 0 || apiKeyDerivations !== 1 || orderPosts !== 0)) process.exitCode = 99;
-  if (scenario === "identity-mismatch" && (apiKeyCreates !== 0 || apiKeyDerivations !== 0 || orderPosts !== 0)) process.exitCode = 100;
+  if (["submit-valid", "existing-api-key", "submit-deposit-wallet", "submit-ambiguous"].includes(scenario) && authAndOrderCalls.join(",") !== "derive,order") process.exitCode = 95;
+  if (["submit-rejected-l1-auth", "missing-credentials", "l1-derive-401"].includes(scenario) && authAndOrderCalls.join(",") !== "derive") process.exitCode = 97;
+  if (scenario?.startsWith("order-status-") && authAndOrderCalls.join(",") !== "derive") process.exitCode = 99;
+  if (scenario === "identity-mismatch" && authAndOrderCalls.length !== 0) process.exitCode = 100;
 });
 
 const conditionId = `0x${"1".repeat(64)}`;
@@ -124,7 +121,7 @@ globalThis.fetch = async (input, init = {}) => {
     if (scenario === "time-invalid") return Response.json({ timestamp: 1_800_000_000 });
     body = 1_800_000_000;
   } else if (url.hostname === "clob.polymarket.com" && url.pathname === "/auth/api-key" && init.method === "POST") {
-    apiKeyCreates += 1;
+    authAndOrderCalls.push("create");
     const expectedSigner = process.env.POLYSCOPE_TEST_EXPECTED_SIGNER;
     if (expectedSigner && init.headers?.POLY_ADDRESS?.toLowerCase() !== expectedSigner.toLowerCase()) process.exit(84);
     if (scenario === "submit-rejected-l1-auth" || scenario === "missing-credentials") {
@@ -133,10 +130,12 @@ globalThis.fetch = async (input, init = {}) => {
     if (scenario === "existing-api-key") return new Response("already exists", { status: 400 });
     body = { apiKey: "fixture-api-key", secret: "dGVzdA==", passphrase: "fixture-passphrase" };
   } else if (url.hostname === "clob.polymarket.com" && url.pathname === "/auth/derive-api-key") {
-    apiKeyDerivations += 1;
+    authAndOrderCalls.push("derive");
     const expectedSigner = process.env.POLYSCOPE_TEST_EXPECTED_SIGNER;
     if (expectedSigner && init.headers?.POLY_ADDRESS?.toLowerCase() !== expectedSigner.toLowerCase()) process.exit(84);
-    if (scenario === "submit-rejected-l1-auth" || scenario === "missing-credentials") process.exit(83);
+    if (scenario === "submit-rejected-l1-auth" || scenario === "missing-credentials") {
+      return new Response("apiKey=SECRET_SENTINEL; secret=SECRET_SENTINEL; passphrase=SECRET_SENTINEL; signature=SECRET_SENTINEL", { status: 401 });
+    }
     if (scenario === "l1-derive-401") return new Response("apiKey=SECRET_SENTINEL; secret=SECRET_SENTINEL; passphrase=SECRET_SENTINEL; signature=SECRET_SENTINEL", { status: 401 });
     if (scenario === "existing-api-key") body = { apiKey: "fixture-api-key", secret: "dGVzdA==", passphrase: "fixture-passphrase" };
     else if (scenario === "identity-mismatch") process.exit(88);
@@ -154,6 +153,7 @@ globalThis.fetch = async (input, init = {}) => {
     return new Response("not found", { status: 404 });
   } else if (url.hostname === "clob.polymarket.com" && url.pathname === "/order" && init.method === "POST") {
     orderPosts += 1;
+    authAndOrderCalls.push("order");
     if (!["submit-valid", "existing-api-key", "submit-deposit-wallet", "restricted-submit", "submit-stale-book", "submit-future-book", "missing-book-timestamp", "submit-ambiguous", "snapshot-min-decrease", "snapshot-tick-valid"].includes(scenario) || orderPosts !== 1) process.exit(89);
     const postedOrder = JSON.parse(init.body);
     if (postedOrder.orderType !== "FAK" || postedOrder.order.side !== "BUY"
