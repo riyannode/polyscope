@@ -69,11 +69,29 @@ Every successful tool returns a machine-readable JSON object serialized in `cont
 
 ## Architecture
 
-```text
-Agent research → User approval → PayBox EIP-712 signing
-  → PolyScope signed-wire checks → Official SDK / CLOB
-  → Provider result / read-only reconciliation
+```mermaid
+flowchart TD
+    Agent["AI agent in PayBox"] --> Research["1. Research with PolyScope<br/>Discover markets, research soccer, analyze quotes and liquidity"]
+    Research <--> Sources["Research providers<br/>Polymarket Gamma / public CLOB<br/>football-data.org / API-Football"]
+    Research --> Decision{"2. User decision<br/>BUY, SELL, or NO TRADE"}
+    Decision -->|NO TRADE| Stop["Stop without an order"]
+    Decision -->|Approve market, outcome, price and size| Auth["3. PolyScope: prepare_clob_auth<br/>Prepare ClobAuth EIP-712 payload"]
+    Auth --> AuthSign["PayBox signs ClobAuth<br/>Reusable CLOB authentication"]
+    AuthSign --> Prepare["4. PolyScope: prepare_order<br/>Official SDK prepares FAK/FOK order<br/>Returns effective amounts and EIP-712 payload"]
+    Prepare --> OrderSign["5. PayBox approves and signs<br/>The exact prepared order"]
+    OrderSign --> Validate["6. PolyScope: submit_order<br/>Validate signature, approved order type<br/>and exact signed-wire fields"]
+    Validate --> Submit["7. Official SDK<br/>Derive CLOB credentials<br/>Send one order POST"]
+    Submit --> CLOB{"Official Polymarket CLOB<br/>Authoritative provider result"}
+    CLOB -->|Accepted or rejected| Result["Report result to the agent<br/>Acceptance alone does not prove a fill"]
+    CLOB -->|Ambiguous response| Readback["One read-only reconciliation<br/>Never automatically resend the order"]
+    Readback --> Result
 ```
+
+PayBox owns wallet access, approval, and signing. PolyScope connects research to the official Polymarket SDK and checks that the submitted order matches the signed payload. The CLOB determines order acceptance and execution; invalid signatures or mismatched fields stop before submission.
+
+`get_order_status` reads provider-confirmed order state. `cancel_order` requires explicit user confirmation. `get_trading_approvals` and `get_positions` provide account readback alongside this flow. See [all 11 tools](#tools) for their individual roles.
+
+This diagram describes the supported flow. The [live validation status](#live-validation-status) records what has actually been verified: signing succeeded and the hosted submission returned HTTP 403; successful fill and cancellation remain unverified.
 
 - **Runtime:** TypeScript MCP server over stdio, following the PayBox starter 1.0.2 structure.
 - **Research providers:** Polymarket Gamma and CLOB public APIs, football-data.org for primary soccer fixtures/results/form, and API-Football as a bounded fallback after primary provider failure or unusable responses (with optional exact-fixture enrichment on primary success). TheSportsDB is not called automatically.
