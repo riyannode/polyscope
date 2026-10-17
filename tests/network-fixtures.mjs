@@ -13,17 +13,21 @@ if (scenario === "unexpected-failure") {
 let orderPosts = 0;
 let orderReadbacks = 0;
 let cancelDeletes = 0;
+let readinessBalanceReads = 0;
+let readinessAllowanceReads = 0;
+let readinessOperatorReads = 0;
+let readinessGasReads = 0;
 const cancelCalls = [];
 const authAndOrderCalls = [];
 process.on("exit", () => {
   if (scenario?.startsWith("snapshot-") && !["snapshot-min-increase", "snapshot-min-zero", "snapshot-tick-invalid", "snapshot-risk-changed"].includes(scenario) && orderPosts !== 1) process.exitCode = 92;
   if (["snapshot-min-increase", "snapshot-min-zero", "snapshot-tick-invalid", "snapshot-risk-changed"].includes(scenario) && orderPosts !== 0) process.exitCode = 93;
-  if (["submit-valid", "existing-api-key", "submit-deposit-wallet", "submit-ambiguous"].includes(scenario) && authAndOrderCalls.join(",") !== "derive,order") process.exitCode = 95;
+  if (["submit-valid", "existing-api-key", "submit-deposit-wallet", "submit-fok-eoa", "submit-fok-deposit-wallet", "submit-fok-insufficient-depth", "submit-fok-ambiguous-503", "submit-ambiguous"].includes(scenario) && authAndOrderCalls.join(",") !== "derive,order") process.exitCode = 95;
   if (["submit-rejected-l1-auth", "missing-credentials", "l1-derive-401"].includes(scenario) && authAndOrderCalls.join(",") !== "derive") process.exitCode = 97;
   if (scenario?.startsWith("order-status-") && authAndOrderCalls.join(",") !== "derive") process.exitCode = 99;
-  if (["submit-valid", "existing-api-key", "submit-deposit-wallet", "submit-ambiguous", "submit-ambiguous-429", "submit-ambiguous-503", "submit-malformed-success", "submit-malformed-order-id", "submit-reconciled", "submit-l2-401", "submit-400", "submit-403"].includes(scenario)
+  if (["submit-valid", "existing-api-key", "submit-deposit-wallet", "submit-fok-eoa", "submit-fok-deposit-wallet", "submit-fok-insufficient-depth", "submit-fok-ambiguous-503", "submit-ambiguous", "submit-ambiguous-429", "submit-ambiguous-503", "submit-malformed-success", "submit-malformed-order-id", "submit-reconciled", "submit-l2-401", "submit-400", "submit-403"].includes(scenario)
     && (authAndOrderCalls.join(",") !== "derive,order" || orderPosts !== 1)) process.exitCode = 101;
-  if (scenario?.startsWith("submit-ambiguous") || scenario === "submit-malformed-success" || scenario === "submit-malformed-order-id" || scenario === "submit-reconciled") {
+  if (scenario?.startsWith("submit-ambiguous") || scenario === "submit-fok-ambiguous-503" || scenario === "submit-malformed-success" || scenario === "submit-malformed-order-id" || scenario === "submit-reconciled") {
     if (orderPosts !== 1 || orderReadbacks !== 1) process.exitCode = 102;
   }
   const expectedCancelCalls = {
@@ -37,6 +41,11 @@ process.on("exit", () => {
   if (scenario in expectedCancelCalls && (cancelCalls.join(",") !== expectedCancelCalls[scenario]
     || cancelDeletes !== (scenario === "cancel-l1-401" ? 0 : 1))) process.exitCode = 103;
   if (scenario === "identity-mismatch" && authAndOrderCalls.length !== 0) process.exitCode = 100;
+  if (scenario === "readiness-no-context" && (readinessBalanceReads !== 1 || readinessAllowanceReads !== 0 || readinessOperatorReads !== 0 || readinessGasReads !== 0)) process.exitCode = 105;
+  if (["readiness-buy", "readiness-neg-risk", "readiness-v2"].includes(scenario)
+    && (readinessBalanceReads !== 1 || readinessAllowanceReads !== 1 || readinessOperatorReads !== 0 || readinessGasReads !== 0)) process.exitCode = 106;
+  if (scenario === "readiness-sell-missing" && (readinessBalanceReads !== 1 || readinessAllowanceReads !== 0 || readinessOperatorReads !== 1 || readinessGasReads !== 1)) process.exitCode = 107;
+  if (scenario === "submit-type-mismatch" && (authAndOrderCalls.length !== 0 || orderPosts !== 0)) process.exitCode = 113;
 });
 
 const conditionId = `0x${"1".repeat(64)}`;
@@ -122,6 +131,7 @@ globalThis.fetch = async (input, init = {}) => {
       if (entry.method === "eth_chainId") return { jsonrpc: "2.0", id: entry.id, result: "0x89" };
       if (entry.method === "eth_blockNumber") return { jsonrpc: "2.0", id: entry.id, result: "0x100" };
       if (entry.method === "eth_getBalance") {
+        readinessGasReads += 1;
         const address = entry.params[0].toLowerCase();
         const isEmpty = scenario === "readiness-empty";
         const balance = isEmpty || address.endsWith("0002") ? 0n : 1_000_000_000_000_000_000n;
@@ -135,9 +145,15 @@ globalThis.fetch = async (input, init = {}) => {
       if (target === "0xc011a7e12a19f7b1f670d46f03b03f3342e82dfb") {
         decoded = decodeFunctionData({ abi: rpcReadAbis.erc20, data: call.data });
         if (decoded.functionName === "balanceOf") {
+          readinessBalanceReads += 1;
           const owner = decoded.args[0].toLowerCase();
           value = scenario === "readiness-empty" || owner.endsWith("0002") ? 0n : 8_500_000n;
         } else {
+          readinessAllowanceReads += 1;
+          const expectedSpender = scenario === "readiness-neg-risk" ? "0xe2222d279d744050d28e00520010520000310f59"
+            : scenario === "readiness-v2" ? "0xe3333700ca9d93003f00f0f71f8515005f6c00aa"
+              : "0xe111180000d2663c0091e4f400237545b87b996b";
+          if (["readiness-buy", "readiness-neg-risk", "readiness-v2"].includes(scenario) && decoded.args[1].toLowerCase() !== expectedSpender) process.exit(108);
           const allowance = scenario === "readiness-empty" || scenario === "readiness-missing-approvals" ? 0n : 100_000_000n;
           value = allowance;
         }
@@ -146,7 +162,9 @@ globalThis.fetch = async (input, init = {}) => {
         catch { decoded = decodeFunctionData({ abi: rpcReadAbis.ctf, data: call.data }); }
         if (decoded.functionName === "payoutDenominator") value = scenario === "redeem-unresolved" ? 0n : 1n;
         else if (decoded.functionName === "isApprovedForAll") {
-          value = scenario === "readiness-missing-approvals" || scenario === "redeem-missing-approval" ? 0n : 1n;
+          readinessOperatorReads += 1;
+          if (scenario === "readiness-sell-missing" && decoded.args[1].toLowerCase() !== "0xe111180000d2663c0091e4f400237545b87b996b") process.exit(109);
+          value = scenario === "readiness-missing-approvals" || scenario === "readiness-sell-missing" || scenario === "redeem-missing-approval" ? 0n : 1n;
         } else {
           const owner = decoded.args[0].toLowerCase();
           const tokenId = decoded.args[1];
@@ -164,6 +182,7 @@ globalThis.fetch = async (input, init = {}) => {
         if (decoded.functionName === "moduleById") {
           value = "0x00000000000000000000000000000000000000a1";
         } else if (decoded.functionName === "isApprovedForAll") {
+          readinessOperatorReads += 1;
           value = scenario === "readiness-missing-approvals" || scenario === "redeem-missing-approval" ? 0n : 1n;
         } else {
           const owner = decoded.args[0].toLowerCase();
@@ -200,6 +219,8 @@ globalThis.fetch = async (input, init = {}) => {
     if (scenario === "provider-invalid-json") return new Response("{", { headers: { "content-type": "application/json" } });
     if (scenario === "provider-unavailable") return new Response("unavailable", { status: 503 });
     body = scenario === "provider-invalid" ? { id: false } : { ...market };
+    if (scenario === "readiness-neg-risk") body.negRisk = true;
+    if (scenario === "readiness-v2") body.version = "v2";
     if (scenario === "wrong-market") body.id = "2";
     if (scenario === "restricted-prepare" || scenario === "restricted-submit") body.restricted = true;
   } else if (url.hostname === "gamma-api.polymarket.com" && url.pathname === "/public-search") {
@@ -223,6 +244,7 @@ globalThis.fetch = async (input, init = {}) => {
     if (scenario === "submit-future-book") body.timestamp = String(Date.now() + 1);
     if (scenario === "missing-book-timestamp") delete body.timestamp;
     if (scenario === "no-visible-liquidity") body.asks = [];
+    if (scenario === "submit-fok-insufficient-depth") body.asks = [{ price: "0.50", size: "4" }];
     if (scenario === "wrong-book") body.asset_id = "999";
     if (scenario === "invalid-timestamp") body.timestamp = "not-a-timestamp";
     if (scenario === "future-timestamp") body.timestamp = String(Date.now() + 1);
@@ -258,7 +280,7 @@ globalThis.fetch = async (input, init = {}) => {
   } else if (url.hostname === "clob.polymarket.com" && url.pathname.startsWith("/data/order/")) {
     const expectedSigner = process.env.POLYSCOPE_TEST_EXPECTED_SIGNER;
     if (expectedSigner && init.headers?.POLY_ADDRESS?.toLowerCase() !== expectedSigner.toLowerCase()) process.exit(84);
-    if (scenario?.startsWith("submit-ambiguous") || scenario === "submit-malformed-success" || scenario === "submit-malformed-order-id" || scenario === "submit-reconciled") {
+    if (scenario?.startsWith("submit-ambiguous") || scenario === "submit-fok-ambiguous-503" || scenario === "submit-malformed-success" || scenario === "submit-malformed-order-id" || scenario === "submit-reconciled") {
       orderReadbacks += 1;
       if (scenario === "submit-reconciled") return Response.json({
         id: url.pathname.split("/").at(-1), status: "MATCHED", order_type: "FAK", original_size: "10", size_matched: "10",
@@ -281,6 +303,14 @@ globalThis.fetch = async (input, init = {}) => {
       id: `0x${"a".repeat(64)}`, status: "MATCHED", order_type: "FAK", original_size: "10", size_matched: "2",
       associate_trades: ["fixture-trade"], asset_id: "123", side: "BUY",
     });
+    if (scenario === "order-status-fak-partial") return Response.json({
+      id: `0x${"a".repeat(64)}`, status: "CANCELED", order_type: "FAK", original_size: "10", size_matched: "4",
+      associate_trades: ["fixture-trade"], asset_id: "123", side: "BUY",
+    });
+    if (scenario === "order-status-fok-found") return Response.json({
+      id: `0x${"a".repeat(64)}`, status: "MATCHED", order_type: "FOK", original_size: "10", size_matched: "10",
+      associate_trades: ["fixture-trade"], asset_id: "123", side: "BUY",
+    });
     return new Response("not found", { status: 404 });
   } else if (url.hostname === "clob.polymarket.com" && url.pathname === "/order" && init.method === "DELETE") {
     cancelDeletes += 1;
@@ -294,12 +324,17 @@ globalThis.fetch = async (input, init = {}) => {
   } else if (url.hostname === "clob.polymarket.com" && url.pathname === "/order" && init.method === "POST") {
     orderPosts += 1;
     authAndOrderCalls.push("order");
-    if (!["submit-valid", "existing-api-key", "submit-deposit-wallet", "restricted-submit", "submit-stale-book", "submit-future-book", "missing-book-timestamp", "submit-ambiguous", "submit-ambiguous-429", "submit-ambiguous-503", "submit-malformed-success", "submit-malformed-order-id", "submit-reconciled", "submit-l2-401", "submit-400", "submit-403", "snapshot-min-decrease", "snapshot-tick-valid"].includes(scenario) || orderPosts !== 1) process.exit(89);
+    if (!["submit-valid", "existing-api-key", "submit-deposit-wallet", "submit-fok-eoa", "submit-fok-deposit-wallet", "submit-fok-insufficient-depth", "submit-fok-ambiguous-503", "restricted-submit", "submit-stale-book", "submit-future-book", "missing-book-timestamp", "submit-ambiguous", "submit-ambiguous-429", "submit-ambiguous-503", "submit-malformed-success", "submit-malformed-order-id", "submit-reconciled", "submit-l2-401", "submit-400", "submit-403", "snapshot-min-decrease", "snapshot-tick-valid"].includes(scenario) || orderPosts !== 1) process.exit(89);
     const postedOrder = JSON.parse(init.body);
-    if (postedOrder.orderType !== "FAK" || postedOrder.order.side !== "BUY"
-      || postedOrder.order.makerAmount !== "5000000" || postedOrder.order.takerAmount !== "10000000"
+    const fokSell = scenario === "submit-fok-eoa" || scenario === "submit-fok-ambiguous-503";
+    const expectedOrderType = scenario.startsWith("submit-fok") ? "FOK" : "FAK";
+    const expectedSide = fokSell ? "SELL" : "BUY";
+    const expectedMakerAmount = fokSell ? "10000000" : "5000000";
+    const expectedTakerAmount = fokSell ? "4900000" : "10000000";
+    if (postedOrder.orderType !== expectedOrderType || postedOrder.order.side !== expectedSide
+      || postedOrder.order.makerAmount !== expectedMakerAmount || postedOrder.order.takerAmount !== expectedTakerAmount
       || postedOrder.order.timestamp === undefined || !postedOrder.order.signature) process.exit(90);
-    if (scenario === "submit-deposit-wallet" && (postedOrder.order.signature.length <= 132 || postedOrder.order.signatureType !== 3)) process.exit(94);
+    if (["submit-deposit-wallet", "submit-fok-deposit-wallet"].includes(scenario) && (postedOrder.order.signature.length <= 132 || postedOrder.order.signatureType !== 3)) process.exit(94);
     const expectedMaker = process.env.POLYSCOPE_TEST_EXPECTED_MAKER;
     if (expectedMaker && (postedOrder.order.maker.toLowerCase() !== expectedMaker.toLowerCase()
       || postedOrder.order.signer.toLowerCase() !== expectedMaker.toLowerCase())) process.exit(85);
@@ -312,11 +347,13 @@ globalThis.fetch = async (input, init = {}) => {
     if (scenario === "submit-l2-401") return new Response("signature=SECRET_SENTINEL; apiKey=SECRET_SENTINEL", { status: 401 });
     if (scenario === "submit-400") return new Response("signature=SECRET_SENTINEL; apiKey=SECRET_SENTINEL", { status: 400 });
     if (scenario === "submit-403") return new Response("signature=SECRET_SENTINEL; apiKey=SECRET_SENTINEL", { status: 403 });
-    if (["submit-valid", "existing-api-key", "submit-deposit-wallet", "restricted-submit", "submit-stale-book", "submit-future-book", "missing-book-timestamp", "snapshot-min-decrease", "snapshot-tick-valid"].includes(scenario)) {
+    if (["submit-valid", "existing-api-key", "submit-deposit-wallet", "submit-fok-eoa", "submit-fok-deposit-wallet", "restricted-submit", "submit-stale-book", "submit-future-book", "missing-book-timestamp", "snapshot-min-decrease", "snapshot-tick-valid"].includes(scenario)) {
       return new Response(JSON.stringify({ success: true, orderID: `0x${"a".repeat(64)}`, status: "MATCHED", tradeIDs: [] }), {
         status: 200, headers: { "content-type": "application/json" },
       });
     }
+    if (scenario === "submit-fok-insufficient-depth") return Response.json({ success: false, errorMsg: "FOK cannot be fully matched." });
+    if (scenario === "submit-fok-ambiguous-503") return new Response("signature=SECRET_SENTINEL; apiKey=SECRET_SENTINEL", { status: 503 });
     return new Response(JSON.stringify({ success: false, errorMsg: "offline fixture blocks order submission; attempts=1" }), {
       status: 403, headers: { "content-type": "application/json" },
     });

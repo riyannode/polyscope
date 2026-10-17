@@ -42,18 +42,6 @@ const NEG_RISK_CTF_COLLATERAL_ADAPTER = getAddress("0xadA2005600Dec949baf300f4C6
 const POLYMARKET_V2_ROUTER = getAddress("0x12121212006e4CD160D18e3f00711DA5c3372600");
 const BINARY_MODULE = getAddress("0x1000008dD9001B968442c1000017eaE6E0dA00Ba");
 const NEG_RISK_MODULE = getAddress("0x200000900045e3B6259600682756002200028933");
-const TRADING_ALLOWANCE_SPENDERS = [STANDARD_EXCHANGE, NEG_RISK_EXCHANGE, CTF_COLLATERAL_ADAPTER,
-  NEG_RISK_CTF_COLLATERAL_ADAPTER, POLYMARKET_V2_ROUTER, POLYMARKET_EXCHANGE_V3] as const;
-const TRADING_OPERATOR_APPROVALS = [
-  { tokenLedger: "Conditional Tokens" as const, tokenAddress: CONDITIONAL_TOKENS, operator: STANDARD_EXCHANGE },
-  { tokenLedger: "Conditional Tokens" as const, tokenAddress: CONDITIONAL_TOKENS, operator: NEG_RISK_EXCHANGE },
-  { tokenLedger: "Conditional Tokens" as const, tokenAddress: CONDITIONAL_TOKENS, operator: CTF_COLLATERAL_ADAPTER },
-  { tokenLedger: "Conditional Tokens" as const, tokenAddress: CONDITIONAL_TOKENS, operator: NEG_RISK_CTF_COLLATERAL_ADAPTER },
-  { tokenLedger: "Conditional Tokens" as const, tokenAddress: CONDITIONAL_TOKENS, operator: BINARY_MODULE },
-  { tokenLedger: "Conditional Tokens" as const, tokenAddress: CONDITIONAL_TOKENS, operator: NEG_RISK_MODULE },
-  { tokenLedger: "PositionManager" as const, tokenAddress: POSITION_MANAGER, operator: POLYMARKET_V2_ROUTER },
-  { tokenLedger: "PositionManager" as const, tokenAddress: POSITION_MANAGER, operator: POLYMARKET_EXCHANGE_V3 },
-] as const;
 const ESPN_SOCCER_FEED = "https://www.espn.com/espn/rss/soccer/news";
 const FOOTBALL_DATA_API = "https://api.football-data.org/v4";
 const API_FOOTBALL_API = "https://v3.football.api-sports.io";
@@ -366,6 +354,7 @@ const typedOutputSchema = z.object({
   requestWalletSignIntent: requestWalletSignIntentSchema,
 }).strict();
 const walletTypeSchema = z.enum(["EOA", "PROXY", "SAFE", "DEPOSIT_WALLET"]);
+const orderTypeSchema = z.enum(["FAK", "FOK"]);
 const preparedOrderBaseSchema = z.object({
   market: z.object({
     id: z.string().regex(/^[0-9]{1,32}$/), conditionId: z.string().regex(/^0x[0-9a-fA-F]{64}$/), version: z.enum(["v1", "v2"]), outcome: z.string(), negRisk: z.boolean(),
@@ -381,7 +370,7 @@ const preparedOrderBaseSchema = z.object({
     salt: z.string().regex(/^(0|[1-9][0-9]{0,77})$/), timestamp: z.string().regex(/^[0-9]{1,16}$/), assetId: decimalIdSchema, side: sideSchema,
     price: z.string(), size: z.string(), maxNominalPusd: z.string(), maxGrossPusd: z.string(),
     maxFeePusd: z.string(), feeRate: z.string().regex(/^(0|[1-9][0-9]*)(?:\.[0-9]{1,6})?$/),
-    feeExponent: z.number().int().min(0).max(6), orderType: z.literal("FAK"), makerAmount: z.string(),
+    feeExponent: z.number().int().min(0).max(6), orderType: orderTypeSchema, makerAmount: z.string(),
     takerAmount: z.string(), metadata: z.string(), builder: z.string(),
   }).strict(),
 }).strict();
@@ -413,7 +402,7 @@ const orderLifecycleSchema = z.enum([
   "FILLED", "CANCELLED", "FAILED", "UNKNOWN",
 ]);
 const executionResultSchema = z.object({
-  status: orderLifecycleSchema, orderId: z.string().nullable(), orderType: z.literal("FAK"),
+  status: orderLifecycleSchema, orderId: z.string().nullable(), orderType: orderTypeSchema,
   requestedSize: z.string(), filledSize: z.string().nullable(), remainingSize: z.string().nullable(),
   tradeIds: z.array(z.string()), message: z.string(), errorCode: z.string().regex(/^PS_[A-Z_]+$/).nullable().default(null),
   httpStatus: z.number().int().min(100).max(599).optional(),
@@ -423,26 +412,24 @@ const chainBalanceSchema = z.object({
   formatted: z.string().nullable(), decimals: z.number().int(),
   status: z.enum(["NONZERO", "ZERO", "UNKNOWN"]),
 }).strict();
-const allowanceCheckSchema = z.object({
-  token: z.literal("pUSD"),
-  spender: addressSchema, allowanceBaseUnits: z.string().regex(/^(0|[1-9][0-9]*)$/).nullable(),
-  approved: z.boolean().nullable(), status: z.enum(["PRESENT", "MISSING", "UNKNOWN"]),
-}).strict();
 const operatorApprovalSchema = z.object({
   tokenLedger: z.enum(["Conditional Tokens", "PositionManager"]), operator: addressSchema,
   approved: z.boolean().nullable(), status: z.enum(["PRESENT", "MISSING", "UNKNOWN"]),
+}).strict();
+const tradingApprovalSchema = z.object({
+  kind: z.enum(["PUSD_ALLOWANCE", "ERC1155_OPERATOR"]).nullable(),
+  target: addressSchema.nullable(), tokenLedger: z.enum(["Conditional Tokens", "PositionManager"]).nullable(),
+  allowanceBaseUnits: z.string().regex(/^(0|[1-9][0-9]*)$/).nullable(),
+  status: z.enum(["PRESENT", "MISSING", "UNKNOWN"]),
 }).strict();
 const tradingReadinessSchema = z.object({
   status: z.enum(["CHECKS_PRESENT", "ACTION_REQUIRED", "UNKNOWN"]),
   wallet: z.object({ address: addressSchema, type: walletTypeSchema, addressRole: z.literal("ACCOUNT_WALLET") }).strict(),
   chainId: z.literal(137), observedAt: z.string().datetime(),
-  pUsdBalance: chainBalanceSchema, polBalance: chainBalanceSchema,
-  gasReadiness: z.enum(["NONZERO", "ZERO", "UNKNOWN"]),
-  allowances: z.array(allowanceCheckSchema).length(6),
-  operatorApprovals: z.array(operatorApprovalSchema).length(8),
+  pUsdBalance: chainBalanceSchema, polBalance: chainBalanceSchema.nullable(),
+  approval: tradingApprovalSchema,
   eoaTradingEligibility: z.enum(["UNKNOWN", "NOT_APPLICABLE"]),
-  missingRequirements: z.array(z.string()), unknownRequirements: z.array(z.string()),
-  nextActions: z.array(z.string()),
+  reason: z.string(), nextAction: z.string().nullable(),
 }).strict();
 const transactionPreviewSchema = z.object({
   from: addressSchema, to: addressSchema, value: z.literal("0"), data: z.string().regex(/^0x[0-9a-fA-F]+$/),
@@ -666,13 +653,6 @@ function chainBalance(value: bigint | null, decimals: number): z.infer<typeof ch
     formatted: value === null ? null : formatUnits(value, decimals),
     decimals,
     status: value === null ? "UNKNOWN" : value === 0n ? "ZERO" : "NONZERO",
-  };
-}
-
-function allowanceCheck(spender: Address, allowance: bigint | null) {
-  return {
-    token: "pUSD" as const, spender, allowanceBaseUnits: allowance?.toString() ?? null, approved: allowance === null ? null : allowance > 0n,
-    status: allowance === null ? "UNKNOWN" as const : allowance === 0n ? "MISSING" as const : "PRESENT" as const,
   };
 }
 
@@ -1792,7 +1772,7 @@ function mapOrderStatus(status: string | undefined, matched: string | undefined,
 }
 
 function orderStatusResult(input: {
-  orderId: string; requestedSize: string; record: unknown;
+  orderId: string; requestedSize: string; record: unknown; orderType?: "FAK" | "FOK";
 }): z.infer<typeof executionResultSchema> | null {
   const parsed = orderReadSchema.safeParse(input.record);
   if (!parsed.success) return null;
@@ -1800,6 +1780,8 @@ function orderStatusResult(input: {
   const original = record.original_size ?? input.requestedSize;
   const matched = record.size_matched;
   const status = mapOrderStatus(record.status, matched, original);
+  const reportedOrderType = record.order_type?.toUpperCase();
+  const orderType = reportedOrderType === "FAK" || reportedOrderType === "FOK" ? reportedOrderType : input.orderType ?? FAK;
   const filledSize = matched === undefined ? null : matched;
   let remainingSize: string | null = null;
   if (matched !== undefined) {
@@ -1809,11 +1791,11 @@ function orderStatusResult(input: {
     } catch { remainingSize = null; }
   }
   return executionResultSchema.parse({
-    status, orderId: input.orderId, orderType: FAK,
+    status, orderId: input.orderId, orderType,
     requestedSize: input.requestedSize, filledSize, remainingSize,
     tradeIds: record.associate_trades ?? [],
     message: status === "FILLED" ? "Order status read-back reports the requested size filled."
-      : status === "PARTIALLY_FILLED" ? "Order status read-back reports a partial fill; the FAK remainder does not rest."
+      : status === "PARTIALLY_FILLED" ? `Order status read-back reports a partial fill; the ${orderType} remainder does not rest.`
         : status === "OPEN" ? "Order status read-back reports an open order; inspect or cancel it explicitly."
           : `Polymarket order status: ${status}.`,
   });
@@ -2392,11 +2374,12 @@ async function createServer() {
     "prepare_order_signing",
     {
       title: "Prepare a bounded Polymarket BUY or SELL signature",
-      description: "Prepares one unsigned FAK draft for the selected outcome, side, price bound, size, and fee-inclusive cap. Book age is returned for visibility and does not block preparation or submission. Check status: REJECTED has no order or signing intent. BUY priceLimit is the maximum; SELL priceLimit is the minimum. PayBox handles human approval and wallet signing for the Polymarket order.",
+      description: "Prepares one unsigned FAK or FOK draft for the selected outcome, side, price bound, size, and fee-inclusive cap. orderType defaults to FAK. Book age is returned for visibility and local depth does not guarantee FOK execution; Polymarket CLOB determines whether a FOK order fills in full. BUY priceLimit is the maximum; SELL priceLimit is the minimum. PayBox handles human approval and wallet signing for the Polymarket order.",
       inputSchema: z.object({
         marketId: z.string().regex(/^[0-9]{1,32}$/), assetId: decimalIdSchema,
         makerAddress: addressSchema, signingAddress: addressSchema,
         walletType: walletTypeSchema, side: sideSchema,
+        orderType: orderTypeSchema.default(FAK),
         priceLimit: z.string().max(32), size: z.string().max(32), maxNominalPusd: z.string().max(32),
       }).strict(),
       outputSchema: z.discriminatedUnion("status", [
@@ -2415,7 +2398,7 @@ async function createServer() {
       ]),
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: false, openWorldHint: true },
     },
-    async ({ marketId, assetId, makerAddress, signingAddress, walletType, side, priceLimit, size, maxNominalPusd }) => {
+    async ({ marketId, assetId, makerAddress, signingAddress, walletType, side, orderType, priceLimit, size, maxNominalPusd }) => {
       let preparationFreshness: z.infer<typeof preparationFreshnessSchema> = { bookAgeMs: null };
       try {
         const marketUrl = `${GAMMA_API}/markets/${encodeURIComponent(marketId)}`;
@@ -2512,7 +2495,7 @@ async function createServer() {
           },
           order: {
             salt, timestamp, assetId, side, price: priceLimit, size, maxNominalPusd,
-            maxGrossPusd, maxFeePusd, feeRate: feeInfo.rate, feeExponent: feeInfo.exponent, orderType: FAK,
+            maxGrossPusd, maxFeePusd, feeRate: feeInfo.rate, feeExponent: feeInfo.exponent, orderType,
             makerAmount, takerAmount, metadata: ZERO32, builder: ZERO32,
           },
         });
@@ -2520,7 +2503,7 @@ async function createServer() {
         const preparedOrder = preparedOrderSchema.parse({ ...preparedBase, typedData });
         const intent = { op: "typedData" as const, typedData };
         return {
-          content: [{ type: "text", text: `Prepared a bounded ${side} FAK order for PayBox approval and Polymarket signing; no order was submitted.` }],
+          content: [{ type: "text", text: `Prepared a bounded ${side} ${orderType} order for PayBox approval and Polymarket signing; no order was submitted.` }],
           structuredContent: { status: "PREPARED" as const, preparedOrder, requestWalletSignIntent: intent, submitsOrder: false as const, maxNominalIncludesFees: true as const, preparationFreshness },
         };
       } catch (error) {
@@ -2604,25 +2587,21 @@ async function createServer() {
     },
   );
 
-  server.registerTool(
-    "submit_fak_order",
-    {
-      title: "Submit a PayBox-approved Polymarket FAK order",
-      description: "Makes one signed FAK POST attempt per tool invocation after validating the Polymarket order signature, wallet binding, current market identity and exchange constraints, user price and spend bounds, and official geoblock response. Polymarket validates balance, allowance, and account constraints. Ambiguous POST results get at most one order-hash read-back and are never automatically resubmitted; this does not guarantee exactly-once execution.",
-      inputSchema: z.object({
-        preparedOrder: preparedOrderSchema,
-        orderSignature: z.string().regex(/^0x[0-9a-fA-F]{130}$/),
-        clobAuth: clobAuthSchema,
-      }).strict(),
-      outputSchema: executionResultSchema,
-      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
-    },
-    async ({ preparedOrder: inputOrder, orderSignature, clobAuth }) => {
+  const submitOrderHandler = async (args: {
+    preparedOrder: PreparedOrder; orderSignature: string; clobAuth: z.infer<typeof clobAuthSchema>; orderType: "FAK" | "FOK";
+  }) => {
+      const { preparedOrder: inputOrder, orderSignature, clobAuth, orderType } = args;
       const prepared = preparedOrderSchema.parse(inputOrder);
       validatePreparedOrder(prepared);
+      if (prepared.order.orderType !== orderType) return tradeToolResult({
+        status: "REJECTED", orderId: null, orderType, requestedSize: prepared.order.size,
+        filledSize: null, remainingSize: prepared.order.size, tradeIds: [],
+        message: `The submitted ${orderType} does not match the prepared ${prepared.order.orderType}; no order was sent.`,
+        errorCode: "PS_ORDER_TYPE_MISMATCH",
+      });
       const orderValidation = await validateWalletSignature(prepared, signatureHex(orderSignature));
       if (!orderValidation.valid) return tradeToolResult({
-        status: "REJECTED", orderId: null, orderType: FAK, requestedSize: prepared.order.size,
+        status: "REJECTED", orderId: null, orderType, requestedSize: prepared.order.size,
         filledSize: null, remainingSize: prepared.order.size, tradeIds: [],
         message: "The order signature does not recover to the approved PayBox signer; no order was sent.",
         errorCode: "PS_SIGNATURE_INVALID",
@@ -2637,7 +2616,7 @@ async function createServer() {
         ]);
         if (snapshot.blocked) {
           return tradeToolResult({
-            status: "REJECTED", orderId: null, orderType: FAK, requestedSize: prepared.order.size,
+            status: "REJECTED", orderId: null, orderType, requestedSize: prepared.order.size,
             filledSize: null, remainingSize: prepared.order.size, tradeIds: [],
             message: "Polymarket geoblock reports this request as blocked; no order was sent.",
             errorCode: "PS_GEOBLOCKED",
@@ -2646,7 +2625,7 @@ async function createServer() {
       } catch (error) {
         const failure = clobRequestFailure(error, "PS_PREFLIGHT_FAILED", "Polymarket preflight could not be completed; no order was sent.");
         return tradeToolResult({
-          status: "FAILED", orderId: null, orderType: FAK, requestedSize: prepared.order.size,
+          status: "FAILED", orderId: null, orderType, requestedSize: prepared.order.size,
           filledSize: null, remainingSize: prepared.order.size, tradeIds: [], message: failure.message,
           errorCode: failure.code, ...(failure.httpStatus === undefined ? {} : { httpStatus: failure.httpStatus }),
         });
@@ -2670,16 +2649,16 @@ async function createServer() {
           timestamp: prepared.order.timestamp,
           tokenId: prepared.order.assetId,
         },
-        orderType: FAK,
+        orderType,
         owner: credentials.apiKey,
       });
       const reconcileSubmission = async (httpStatus?: number, orderId: string = orderHash, tradeIds: string[] = []) => {
         const reconciled = await clobPrivateRequest(credentials, prepared.wallet.signingAddress, "GET", `/data/order/${orderHash}`).catch(() => null);
         const known = reconciled?.status === 200 && reconciled.data !== null
-          ? orderStatusResult({ orderId: orderHash, requestedSize: prepared.order.size, record: reconciled.data }) : null;
+          ? orderStatusResult({ orderId: orderHash, requestedSize: prepared.order.size, record: reconciled.data, orderType }) : null;
         if (known && known.status !== "UNKNOWN") return tradeToolResult({ ...known, httpStatus: httpStatus ?? reconciled?.status });
         return tradeToolResult({
-          status: "UNKNOWN", orderId, orderType: FAK, requestedSize: prepared.order.size,
+          status: "UNKNOWN", orderId, orderType, requestedSize: prepared.order.size,
           filledSize: null, remainingSize: null, tradeIds,
           message: "Polymarket did not authoritatively confirm the order outcome. Do not resubmit; reconcile the order before taking further action.",
           errorCode: "PS_SUBMISSION_UNKNOWN",
@@ -2696,16 +2675,16 @@ async function createServer() {
       if (posted.status >= 400 && posted.status < 500 && posted.status !== 408 && posted.status !== 429) {
         const failure = clobPrivateHttpFailure(posted.status);
         return tradeToolResult({
-          status: "REJECTED", orderId: null, orderType: FAK, requestedSize: prepared.order.size,
+          status: "REJECTED", orderId: null, orderType, requestedSize: prepared.order.size,
           filledSize: null, remainingSize: prepared.order.size, tradeIds: [],
           message: failure.message, errorCode: failure.code, httpStatus: posted.status,
         });
       }
       if (posted.status === 408 || posted.status === 429 || posted.status >= 500) return reconcileSubmission(posted.status);
       if (response?.success && response.data.success === false) return tradeToolResult({
-        status: "REJECTED", orderId: null, orderType: FAK, requestedSize: prepared.order.size,
+        status: "REJECTED", orderId: null, orderType, requestedSize: prepared.order.size,
         filledSize: null, remainingSize: prepared.order.size, tradeIds: [],
-        message: "Polymarket rejected the FAK order before accepting it.",
+        message: `Polymarket rejected the ${orderType} order before accepting it.`,
         errorCode: "PS_CLOB_REJECTED", httpStatus: posted.status,
       });
       const responseOrderId = response?.success ? response.data.orderID : undefined;
@@ -2714,12 +2693,40 @@ async function createServer() {
         return reconcileSubmission(posted.status, orderId ?? orderHash, response?.success ? response.data.tradeIDs ?? [] : []);
       }
       return tradeToolResult({
-        status: "SUBMITTED", orderId, orderType: FAK, requestedSize: prepared.order.size,
+        status: "SUBMITTED", orderId, orderType, requestedSize: prepared.order.size,
         filledSize: null, remainingSize: null, tradeIds: response.data.tradeIDs ?? [],
-        message: "Polymarket accepted the FAK order. Fill state is not confirmed; call get_order_status for authenticated read-back.",
+        message: `Polymarket accepted the ${orderType} order. Fill state is not confirmed; call get_order_status for authenticated read-back.`,
         errorCode: null,
       });
+  };
+
+  server.registerTool(
+    "submit_order",
+    {
+      title: "Submit a PayBox-approved Polymarket FAK or FOK order",
+      description: "Makes one signed FAK or FOK POST attempt after validating the exact prepared order type, order signature, wallet binding, current market identity and exchange constraints, user price and spend bounds, and official geoblock response. Polymarket CLOB determines whether FOK fills in full; visible book depth is not a guarantee. Ambiguous POST results get at most one order-hash read-back and are never automatically resubmitted.",
+      inputSchema: z.object({
+        preparedOrder: preparedOrderSchema, orderSignature: z.string().regex(/^0x[0-9a-fA-F]{130}$/),
+        clobAuth: clobAuthSchema, orderType: orderTypeSchema,
+      }).strict(),
+      outputSchema: executionResultSchema,
+      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
     },
+    submitOrderHandler,
+  );
+
+  server.registerTool(
+    "submit_fak_order",
+    {
+      title: "Submit a PayBox-approved Polymarket FAK order",
+      description: "Backward-compatible FAK submission wrapper. Makes one signed FAK POST attempt after validating the prepared FAK order and the existing authentication, wallet, spending, market, and geoblock safeguards. Ambiguous POST results get at most one order-hash read-back and are never automatically resubmitted.",
+      inputSchema: z.object({
+        preparedOrder: preparedOrderSchema, orderSignature: z.string().regex(/^0x[0-9a-fA-F]{130}$/), clobAuth: clobAuthSchema,
+      }).strict(),
+      outputSchema: executionResultSchema,
+      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
+    },
+    async (args) => submitOrderHandler({ ...args, orderType: FAK }),
   );
 
   server.registerTool(
@@ -2727,17 +2734,17 @@ async function createServer() {
     {
       title: "Read Polymarket order status and fills",
       description: "Reads one authenticated order record and reports its matched size and trade IDs. No order is placed or retried.",
-      inputSchema: z.object({ orderId: z.string().regex(/^0x[0-9a-fA-F]{64}$/), requestedSize: z.string().max(32), signerAddress: addressSchema, clobAuth: clobAuthSchema }).strict(),
+      inputSchema: z.object({ orderId: z.string().regex(/^0x[0-9a-fA-F]{64}$/), requestedSize: z.string().max(32), signerAddress: addressSchema, clobAuth: clobAuthSchema, orderType: orderTypeSchema.default(FAK) }).strict(),
       outputSchema: executionResultSchema,
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
     },
-    async ({ orderId, requestedSize, signerAddress, clobAuth }) => {
+    async ({ orderId, requestedSize, signerAddress, clobAuth, orderType }) => {
       let credentials: ClobCredentials;
       try { credentials = await deriveClobCredentials(clobAuth, signerAddress); }
       catch (error) {
         const failure = clobRequestFailure(error, "PS_CLOB_AUTH_FAILED", "Polymarket CLOB credentials could not be derived.");
         return tradeToolResult({
-          status: "FAILED", orderId, orderType: FAK, requestedSize, filledSize: null, remainingSize: null, tradeIds: [],
+          status: "FAILED", orderId, orderType, requestedSize, filledSize: null, remainingSize: null, tradeIds: [],
           message: failure.message, errorCode: failure.code,
           ...(failure.httpStatus === undefined ? {} : { httpStatus: failure.httpStatus }),
         });
@@ -2748,30 +2755,30 @@ async function createServer() {
       } catch (error) {
         const failure = clobRequestFailure(error, "PS_PROVIDER_UNAVAILABLE", "Polymarket order status could not be read.");
         return tradeToolResult({
-          status: "UNKNOWN", orderId, orderType: FAK, requestedSize, filledSize: null, remainingSize: null, tradeIds: [],
+          status: "UNKNOWN", orderId, orderType, requestedSize, filledSize: null, remainingSize: null, tradeIds: [],
           message: failure.message, errorCode: failure.code,
           ...(failure.httpStatus === undefined ? {} : { httpStatus: failure.httpStatus }),
         });
       }
       if (result.status === 401) return tradeToolResult({
-        status: "UNKNOWN", orderId, orderType: FAK, requestedSize, filledSize: null, remainingSize: null, tradeIds: [],
+        status: "UNKNOWN", orderId, orderType, requestedSize, filledSize: null, remainingSize: null, tradeIds: [],
         message: "Polymarket rejected L2 order-status authentication (HTTP 401); verify the CLOB credentials. Order status is unconfirmed.",
         errorCode: "PS_CLOB_PRIVATE_AUTH_REJECTED", httpStatus: result.status,
       });
       if (result.status === 404) return tradeToolResult({
-        status: "UNKNOWN", orderId, orderType: FAK, requestedSize, filledSize: null, remainingSize: null, tradeIds: [],
+        status: "UNKNOWN", orderId, orderType, requestedSize, filledSize: null, remainingSize: null, tradeIds: [],
         message: "Polymarket returned HTTP 404 for this order ID; no order record was found.",
         errorCode: "PS_ORDER_NOT_FOUND", httpStatus: result.status,
       });
       if (result.status < 200 || result.status >= 300) return tradeToolResult({
-        status: "UNKNOWN", orderId, orderType: FAK, requestedSize, filledSize: null, remainingSize: null, tradeIds: [],
+        status: "UNKNOWN", orderId, orderType, requestedSize, filledSize: null, remainingSize: null, tradeIds: [],
         message: `${clobPrivateHttpFailure(result.status).message} Order status is unconfirmed.`,
         errorCode: clobPrivateHttpFailure(result.status).code,
         httpStatus: result.status,
       });
-      const known = result.data === null ? null : orderStatusResult({ orderId, requestedSize, record: result.data });
+      const known = result.data === null ? null : orderStatusResult({ orderId, requestedSize, record: result.data, orderType });
       if (known === null) return tradeToolResult({
-        status: "UNKNOWN", orderId, orderType: FAK, requestedSize, filledSize: null, remainingSize: null, tradeIds: [],
+        status: "UNKNOWN", orderId, orderType, requestedSize, filledSize: null, remainingSize: null, tradeIds: [],
         message: "Polymarket returned no authoritative order record.", errorCode: "PS_ORDER_STATUS_UNKNOWN", httpStatus: result.status,
       });
       return tradeToolResult({ ...known, httpStatus: result.status });
@@ -2849,67 +2856,90 @@ async function createServer() {
     "get_trading_readiness",
     {
       title: "Read Polymarket trading readiness",
-      description: "Reads the selected account wallet's pUSD, POL, six pUSD allowances, and eight Conditional Tokens/PositionManager operator approvals used by Polymarket spot CLOB trading on Polygon. The supplied walletAddress is the account wallet whose balances are read; no signer, EOA, Proxy, Safe, or Deposit Wallet balances are substituted or combined. Reports EOA allowlist eligibility as UNKNOWN because no authoritative read-only check is available. Positive balances and approvals do not prove sufficiency for an unspecified order or acceptance by the CLOB. No signing, approval, or transaction is performed.",
-      inputSchema: z.object({ walletAddress: addressSchema, walletType: walletTypeSchema }).strict(),
+      description: "Reads pUSD for the exact selected account wallet. When marketId and side are both supplied, checks only that market route's pUSD allowance for BUY or outcome-token operator approval for SELL. Without both, approval readiness remains UNKNOWN and no approval or POL scans run. Reads POL only for an EOA with a missing approval that requires an on-chain action. EOA eligibility remains UNKNOWN. No signing, approval, or transaction is performed.",
+      inputSchema: z.object({
+        walletAddress: addressSchema, walletType: walletTypeSchema,
+        marketId: z.string().regex(/^[0-9]{1,32}$/).optional(), side: sideSchema.optional(),
+      }).strict(),
       outputSchema: tradingReadinessSchema,
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
     },
-    async ({ walletAddress, walletType }) => {
+    async ({ walletAddress, walletType, marketId, side }) => {
       const accountWallet = getAddress(walletAddress);
-      const [pUsdBalanceValue, polBalanceValue, allowanceValues, operatorApprovalValues] = await Promise.all([
-        readChainValue(() => polygonReadClient.readContract({ address: PUSD_TOKEN, abi: ERC20_READ_ABI, functionName: "balanceOf", args: [accountWallet] })),
-        readChainValue(() => polygonReadClient.getBalance({ address: accountWallet })),
-        Promise.all(TRADING_ALLOWANCE_SPENDERS.map((spender) => readChainValue(() => polygonReadClient.readContract({
-          address: PUSD_TOKEN, abi: ERC20_READ_ABI, functionName: "allowance", args: [accountWallet, spender],
-        })))),
-        Promise.all(TRADING_OPERATOR_APPROVALS.map(({ tokenAddress, operator }) => readChainValue(() => polygonReadClient.readContract({
-          address: tokenAddress, abi: ERC1155_READ_ABI, functionName: "isApprovedForAll", args: [accountWallet, operator],
-        })))),
-      ]);
-      const allowances = TRADING_ALLOWANCE_SPENDERS.map((spender, index) => allowanceCheck(spender, allowanceValues[index] ?? null));
-      const operatorApprovals = TRADING_OPERATOR_APPROVALS.map(({ tokenLedger, operator }, index) =>
-        operatorApproval(tokenLedger, operator, operatorApprovalValues[index] ?? null));
+      const pUsdBalanceValue = await readChainValue(() => polygonReadClient.readContract({
+        address: PUSD_TOKEN, abi: ERC20_READ_ABI, functionName: "balanceOf", args: [accountWallet],
+      }));
       const pUsdBalance = chainBalance(pUsdBalanceValue, 6);
-      const polBalance = chainBalance(polBalanceValue, 18);
-      const missingRequirements: string[] = [];
-      const unknownRequirements: string[] = [];
-      const nextActions: string[] = [];
-      if (pUsdBalance.status === "ZERO") missingRequirements.push("The selected account wallet has zero pUSD; BUY-side collateral funding is absent.");
-      if (pUsdBalance.status === "UNKNOWN") unknownRequirements.push("pUSD balance could not be read from Polygon.");
-      if (polBalance.status === "ZERO" && walletType === "EOA") missingRequirements.push("The selected EOA has zero POL for direct on-chain transactions.");
-      if (polBalance.status === "UNKNOWN") unknownRequirements.push("POL balance could not be read from Polygon.");
-      for (const check of allowances) {
-        if (check.status === "MISSING") missingRequirements.push(`pUSD allowance to ${check.spender} is zero.`);
-        if (check.status === "UNKNOWN") unknownRequirements.push(`pUSD allowance to ${check.spender} could not be read.`);
+      let approval: z.infer<typeof tradingApprovalSchema> = {
+        kind: null, target: null, tokenLedger: null, allowanceBaseUnits: null, status: "UNKNOWN",
+      };
+      let marketRouteKnown = false;
+      if (marketId !== undefined && side !== undefined) {
+        try {
+          const market = gammaMarketSchema.parse(await getJson(`${GAMMA_API}/markets/${encodeURIComponent(marketId)}`));
+          if (String(market.id) === marketId && market.negRisk !== undefined) {
+            const version = market.version === "v2" ? "v2" : "v1";
+            const exchange = version === "v2" ? POLYMARKET_EXCHANGE_V3 : market.negRisk ? NEG_RISK_EXCHANGE : STANDARD_EXCHANGE;
+            if (side === "BUY") {
+              const allowance = await readChainValue(() => polygonReadClient.readContract({
+                address: PUSD_TOKEN, abi: ERC20_READ_ABI, functionName: "allowance", args: [accountWallet, exchange],
+              }));
+              approval = {
+                kind: "PUSD_ALLOWANCE", target: exchange, tokenLedger: null,
+                allowanceBaseUnits: allowance?.toString() ?? null,
+                status: allowance === null ? "UNKNOWN" : allowance > 0n ? "PRESENT" : "MISSING",
+              };
+            } else {
+              const tokenLedger = version === "v2" ? "PositionManager" : "Conditional Tokens";
+              const tokenAddress = version === "v2" ? POSITION_MANAGER : CONDITIONAL_TOKENS;
+              const approved = await readChainValue(() => polygonReadClient.readContract({
+                address: tokenAddress, abi: ERC1155_READ_ABI, functionName: "isApprovedForAll", args: [accountWallet, exchange],
+              }));
+              approval = {
+                kind: "ERC1155_OPERATOR", target: exchange, tokenLedger, allowanceBaseUnits: null,
+                status: approved === null ? "UNKNOWN" : approved ? "PRESENT" : "MISSING",
+              };
+            }
+            marketRouteKnown = true;
+          }
+        } catch { /* Provider and RPC failures remain UNKNOWN in the structured result. */ }
       }
-      for (const check of operatorApprovals) {
-        if (check.status === "MISSING") missingRequirements.push(`${check.tokenLedger} approval for ${check.operator} is missing.`);
-        if (check.status === "UNKNOWN") unknownRequirements.push(`${check.tokenLedger} approval for ${check.operator} could not be read.`);
-      }
-      unknownRequirements.push("No order amount was supplied, so balance and allowance sufficiency for a specific order is unknown.");
-      if (walletType === "EOA") unknownRequirements.push("EOA trading allowlist eligibility has no authoritative read-only check and remains UNKNOWN.");
-      if (allowances.some((check) => check.status === "MISSING") || operatorApprovals.some((check) => check.status === "MISSING")) {
-        nextActions.push("EXTERNAL_ACTION_REQUIRED: Complete Polymarket's official setupTradingApprovals() workflow through an authorized wallet transaction route; PolyScope does not submit approvals.");
-      }
-      if (pUsdBalance.status === "ZERO") nextActions.push("Fund pUSD in this selected account wallet if the intended order requires collateral.");
-      if (polBalance.status === "ZERO" && walletType === "EOA") nextActions.push("Fund this EOA with POL before an on-chain approval or redemption.");
-      if (walletType === "EOA") nextActions.push("Confirm EOA trading eligibility with Polymarket; this tool cannot verify the allowlist read-only.");
-      if (unknownRequirements.some((requirement) => requirement.includes("could not be read"))) {
-        nextActions.push("Retry the read-only checks after verifying the configured Polygon public RPC is available.");
-      }
-      const status = missingRequirements.length > 0 ? "ACTION_REQUIRED"
-        : unknownRequirements.length > 0 ? "UNKNOWN" : "CHECKS_PRESENT";
+      const approvalActionRequired = approval.status === "MISSING";
+      const buyFundingRequired = side === "BUY" && pUsdBalance.status === "ZERO";
+      const polBalance = approvalActionRequired && walletType === "EOA"
+        ? chainBalance(await readChainValue(() => polygonReadClient.getBalance({ address: accountWallet })), 18)
+        : null;
+      const eligibilityUnknown = walletType === "EOA";
+      const status = approvalActionRequired || buyFundingRequired || polBalance?.status === "ZERO" ? "ACTION_REQUIRED"
+        : pUsdBalance.status === "UNKNOWN" || approval.status === "UNKNOWN" || eligibilityUnknown ? "UNKNOWN" : "CHECKS_PRESENT";
+      const reasons: string[] = [];
+      if (buyFundingRequired) reasons.push("The selected account wallet has zero pUSD for this BUY.");
+      if (approvalActionRequired) reasons.push(`The selected market's ${approval.kind === "PUSD_ALLOWANCE" ? "pUSD allowance" : "outcome-token operator approval"} is missing.`);
+      if (polBalance?.status === "ZERO") reasons.push("The selected EOA has zero POL for the required on-chain approval action.");
+      if (polBalance?.status === "UNKNOWN") reasons.push("POL gas balance could not be read for the required EOA approval action.");
+      if (pUsdBalance.status === "UNKNOWN") reasons.push("The selected wallet's pUSD balance could not be read.");
+      if (approval.status === "UNKNOWN") reasons.push(marketId === undefined || side === undefined
+        ? "Provide both marketId and side to check the one relevant approval."
+        : marketRouteKnown ? "The selected market approval could not be read." : "The selected market route could not be verified.");
+      if (eligibilityUnknown) reasons.push("EOA trading eligibility remains UNKNOWN because no authoritative read-only check is available.");
+      if (reasons.length === 0) reasons.push("The selected wallet's pUSD balance and one market/side approval are present; order-size sufficiency is unverified.");
+      const nextAction = approvalActionRequired
+        ? `EXTERNAL_ACTION_REQUIRED: Use Polymarket's official trading-approval procedure through a supported PayBox wallet operation; PolyScope does not approve or broadcast.${polBalance?.status === "ZERO" ? " Fund the selected EOA with POL first." : polBalance?.status === "UNKNOWN" ? " Verify the selected EOA's POL balance before proceeding." : ""}`
+        : buyFundingRequired ? "Fund pUSD in this selected account wallet before the BUY."
+          : polBalance?.status === "ZERO" ? "Fund this selected EOA with POL before its on-chain approval action."
+            : approval.status === "UNKNOWN" && (marketId === undefined || side === undefined) ? "Supply both marketId and side for the exact approval check."
+              : approval.status === "UNKNOWN" ? "Retry after the selected market metadata and Polygon RPC are available."
+                : eligibilityUnknown ? "Confirm EOA eligibility with Polymarket; this tool cannot verify it read-only." : null;
       const structuredContent = tradingReadinessSchema.parse({
         status,
         wallet: { address: accountWallet, type: walletType, addressRole: "ACCOUNT_WALLET" },
         chainId: 137, observedAt: new Date().toISOString(),
-        pUsdBalance, polBalance, gasReadiness: polBalance.status,
-        allowances, operatorApprovals,
+        pUsdBalance, polBalance, approval,
         eoaTradingEligibility: walletType === "EOA" ? "UNKNOWN" : "NOT_APPLICABLE",
-        missingRequirements, unknownRequirements, nextActions,
+        reason: reasons.join(" "), nextAction,
       });
       return {
-        content: [{ type: "text", text: `Read Polygon pUSD, POL, and required trading approvals for account wallet ${accountWallet}.` }],
+        content: [{ type: "text", text: `${status}: ${structuredContent.reason}` }],
         structuredContent,
       };
     },

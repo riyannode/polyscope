@@ -1,6 +1,6 @@
 {
   "name": "polyscope",
-  "description": "AI-assisted Polymarket research and user-approved FAK trading tools for PayBox.",
+  "description": "AI-assisted Polymarket research and user-approved FAK/FOK trading tools for PayBox.",
   "version": "0.1.0",
   "private": true,
   "type": "module",

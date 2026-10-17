@@ -129,7 +129,7 @@ async function callTool(artifact, tool, argumentsValue, options = {}) {
 export async function testOfflineArtifact(root = process.cwd()) {
   const artifact = resolve(root, "dist/plugin.mjs");
   const tools = await listTools(artifact);
-  if (tools.length !== 15) fail(`expected 15 MCP tools, received ${tools.length}`, "tool_catalog_invalid");
+  if (tools.length !== 16) fail(`expected 16 MCP tools, received ${tools.length}`, "tool_catalog_invalid");
   const removedSchemaFields = ["ExecutionApproval", "executionApprovalSignature", "executionApprovalSigningIntent", "marketRestricted", "accountGeoblockChecked"];
   for (const tool of tools) {
     const schemas = JSON.stringify({ inputSchema: tool.inputSchema, outputSchema: tool.outputSchema });
@@ -146,6 +146,11 @@ export async function testOfflineArtifact(root = process.cwd()) {
   }
   const submitTool = tools.find((tool) => tool.name === "submit_fak_order");
   if (!submitTool) fail("submit_fak_order was not returned by tools/list", "tool_catalog_invalid");
+  const submitOrderTool = tools.find((tool) => tool.name === "submit_order");
+  if (!submitOrderTool) fail("submit_order was not returned by tools/list", "tool_catalog_invalid");
+  if (submitOrderTool.inputSchema.properties.orderType?.enum?.join(",") !== "FAK,FOK") {
+    fail("submit_order did not expose the exact FAK/FOK choices", "schema_invalid");
+  }
   if ("executionApprovalSignature" in submitTool.inputSchema.properties) {
     fail("submit schema still requires a PolyScope execution approval signature", "schema_invalid");
   }
@@ -189,6 +194,16 @@ export async function testOfflineArtifact(root = process.cwd()) {
     fail("lack of visible liquidity added a PolyScope preparation rejection or changed the signed limit", "liquidity_policy_invalid");
   }
   const replaySigner = privateKeyToAccount(generatePrivateKey());
+  const fokEoaPreparation = await callTool(artifact, prepareTool, {
+    ...base, makerAddress: replaySigner.address, signingAddress: replaySigner.address,
+    side: "SELL", priceLimit: "0.49", orderType: "FOK",
+  }, { fixtures: true });
+  const fokEoaOrder = fokEoaPreparation.structuredContent.preparedOrder.order;
+  if (fokEoaOrder.orderType !== "FOK" || fokEoaOrder.side !== "SELL" || fokEoaOrder.price !== "0.49"
+    || fokEoaOrder.size !== "10" || fokEoaOrder.makerAmount !== "10000000" || fokEoaOrder.takerAmount !== "4900000"
+    || fokEoaPreparation.structuredContent.preparedOrder.wallet.signatureType !== 0) {
+    fail("EOA FOK preparation changed the selected type, side, exact price, size, amounts, or signature type", "order_policy_invalid");
+  }
   const replayOrder = await callTool(artifact, prepareTool, {
     ...base, makerAddress: replaySigner.address, signingAddress: replaySigner.address,
     side: "BUY", priceLimit: "0.50",
@@ -319,14 +334,64 @@ export async function testOfflineArtifact(root = process.cwd()) {
     nonce: depositAuthResult.structuredContent.nonce,
     signature: await depositSigner.signTypedData(depositAuthResult.structuredContent.typedData),
   };
-  const depositSubmit = await callTool(artifact, submitTool, {
-    preparedOrder: depositPrepared, orderSignature: depositOrderSignature, clobAuth: depositClobAuth,
+  const depositSubmit = await callTool(artifact, submitOrderTool, {
+    preparedOrder: depositPrepared, orderSignature: depositOrderSignature, clobAuth: depositClobAuth, orderType: "FAK",
   }, {
     fixtures: true, fixtureScenario: "submit-deposit-wallet",
     expectedSignerAddress: depositSigner.address, expectedMakerAddress: depositPrepared.wallet.makerAddress,
   });
   if (depositSubmit.structuredContent.status !== "SUBMITTED") {
     fail("valid Deposit Wallet signing data did not reach its single intercepted CLOB POST without Polygon RPC", "deposit_wallet_submit_invalid");
+  }
+  const fokEoaSignature = await replaySigner.signTypedData(fokEoaPreparation.structuredContent.preparedOrder.typedData);
+  const fokEoaSubmit = await callTool(artifact, submitOrderTool, {
+    preparedOrder: fokEoaPreparation.structuredContent.preparedOrder,
+    orderSignature: fokEoaSignature, clobAuth, orderType: "FOK",
+  }, { fixtures: true, fixtureScenario: "submit-fok-eoa", expectedSignerAddress: replaySigner.address, expectedMakerAddress: replaySigner.address });
+  if (fokEoaSubmit.structuredContent.status !== "SUBMITTED" || fokEoaSubmit.structuredContent.orderType !== "FOK") {
+    fail("EOA FOK submission did not preserve FOK through the single CLOB request", "submit_invalid");
+  }
+  const depositFokPreparation = await callTool(artifact, prepareTool, {
+    ...base, makerAddress: "0x0000000000000000000000000000000000000002",
+    signingAddress: depositSigner.address, walletType: "DEPOSIT_WALLET", side: "BUY", priceLimit: "0.50", orderType: "FOK",
+  }, { fixtures: true });
+  const depositFokOrderSignature = await depositSigner.signTypedData(depositFokPreparation.structuredContent.preparedOrder.typedData);
+  const depositFokSubmit = await callTool(artifact, submitOrderTool, {
+    preparedOrder: depositFokPreparation.structuredContent.preparedOrder,
+    orderSignature: depositFokOrderSignature, clobAuth: depositClobAuth, orderType: "FOK",
+  }, { fixtures: true, fixtureScenario: "submit-fok-deposit-wallet", expectedSignerAddress: depositSigner.address,
+    expectedMakerAddress: depositFokPreparation.structuredContent.preparedOrder.wallet.makerAddress });
+  if (depositFokSubmit.structuredContent.status !== "SUBMITTED" || depositFokSubmit.structuredContent.orderType !== "FOK") {
+    fail("Deposit Wallet FOK submission did not preserve its wrapped signature and FOK type", "deposit_wallet_submit_invalid");
+  }
+  const shallowFok = await callTool(artifact, prepareTool, {
+    ...base, side: "BUY", priceLimit: "0.50", orderType: "FOK",
+  }, { fixtures: true, fixtureScenario: "submit-fok-insufficient-depth" });
+  if (shallowFok.structuredContent.status !== "PREPARED" || shallowFok.structuredContent.preparedOrder.order.orderType !== "FOK") {
+    fail("insufficient visible book depth was treated as a local guarantee or changed the FOK preparation", "fok_depth_invalid");
+  }
+  const shallowFokSignature = await replaySigner.signTypedData(shallowFok.structuredContent.preparedOrder.typedData);
+  const shallowFokSubmit = await callTool(artifact, submitOrderTool, {
+    preparedOrder: shallowFok.structuredContent.preparedOrder,
+    orderSignature: shallowFokSignature, clobAuth, orderType: "FOK",
+  }, { fixtures: true, fixtureScenario: "submit-fok-insufficient-depth", expectedSignerAddress: replaySigner.address });
+  if (shallowFokSubmit.structuredContent.status !== "REJECTED" || shallowFokSubmit.structuredContent.orderType !== "FOK") {
+    fail("Polymarket's insufficient-depth FOK rejection was not reported as a FOK rejection", "fok_depth_invalid");
+  }
+  const mismatchedLegacy = await callTool(artifact, submitTool, {
+    preparedOrder: fokEoaPreparation.structuredContent.preparedOrder, orderSignature: fokEoaSignature, clobAuth,
+  }, { fixtures: true, fixtureScenario: "submit-type-mismatch" });
+  if (mismatchedLegacy.structuredContent.status !== "REJECTED" || mismatchedLegacy.structuredContent.orderType !== "FAK"
+    || mismatchedLegacy.structuredContent.errorCode !== "PS_ORDER_TYPE_MISMATCH") {
+    fail("legacy submit_fak_order silently changed a prepared FOK order", "order_type_compatibility_invalid");
+  }
+  const ambiguousFok = await callTool(artifact, submitOrderTool, {
+    preparedOrder: fokEoaPreparation.structuredContent.preparedOrder,
+    orderSignature: fokEoaSignature, clobAuth, orderType: "FOK",
+  }, { fixtures: true, fixtureScenario: "submit-fok-ambiguous-503", expectedSignerAddress: replaySigner.address });
+  if (ambiguousFok.structuredContent.status !== "UNKNOWN" || ambiguousFok.structuredContent.orderType !== "FOK"
+    || ambiguousFok.structuredContent.httpStatus !== 503) {
+    fail("ambiguous FOK POST did not stay UNKNOWN after one submission and one reconciliation read", "ambiguous_submit_invalid");
   }
   const statusTool = tools.find((tool) => tool.name === "get_order_status");
   const cancelTool = tools.find((tool) => tool.name === "cancel_order");
@@ -350,10 +415,11 @@ export async function testOfflineArtifact(root = process.cwd()) {
     fail("L2 authentication failure exposed provider body data", "clob_l2_sanitization_invalid");
   }
   const missingOrder = await callTool(artifact, statusTool, {
-    orderId: statusOrderId, requestedSize: "10", signerAddress: replaySigner.address, clobAuth,
+    orderId: statusOrderId, requestedSize: "10", signerAddress: replaySigner.address, clobAuth, orderType: "FOK",
   }, { fixtures: true, fixtureScenario: "order-status-404", expectedSignerAddress: replaySigner.address });
-  if (missingOrder.structuredContent.errorCode !== "PS_ORDER_NOT_FOUND" || missingOrder.structuredContent.httpStatus !== 404) {
-    fail("HTTP 404 for a nonexistent order was not distinguished from authentication failure", "clob_order_not_found_invalid");
+  if (missingOrder.structuredContent.errorCode !== "PS_ORDER_NOT_FOUND" || missingOrder.structuredContent.httpStatus !== 404
+    || missingOrder.structuredContent.orderType !== "FOK") {
+    fail("HTTP 404 for a nonexistent FOK order did not retain its requested type", "clob_order_not_found_invalid");
   }
   const statusUnavailable = await callTool(artifact, statusTool, {
     orderId: statusOrderId, requestedSize: "10", signerAddress: replaySigner.address, clobAuth,
@@ -373,6 +439,23 @@ export async function testOfflineArtifact(root = process.cwd()) {
   if (foundOrder.structuredContent.status !== "PARTIALLY_FILLED" || foundOrder.structuredContent.filledSize !== "2"
     || foundOrder.structuredContent.remainingSize !== "8" || foundOrder.structuredContent.httpStatus !== 200) {
     fail("authenticated order record was not returned with its actual fill data", "clob_order_record_invalid");
+  }
+  const partialFakRemainder = await callTool(artifact, statusTool, {
+    orderId: statusOrderId, requestedSize: "10", signerAddress: replaySigner.address, clobAuth,
+  }, { fixtures: true, fixtureScenario: "order-status-fak-partial", expectedSignerAddress: replaySigner.address });
+  if (partialFakRemainder.structuredContent.status !== "PARTIALLY_FILLED"
+    || partialFakRemainder.structuredContent.orderType !== "FAK"
+    || partialFakRemainder.structuredContent.filledSize !== "4"
+    || partialFakRemainder.structuredContent.remainingSize !== "6"
+    || !partialFakRemainder.structuredContent.message.includes("remainder does not rest")) {
+    fail("FAK partial fill and CLOB-canceled remainder were not reconciled correctly", "clob_order_record_invalid");
+  }
+  const foundFokOrder = await callTool(artifact, statusTool, {
+    orderId: statusOrderId, requestedSize: "10", signerAddress: replaySigner.address, clobAuth, orderType: "FOK",
+  }, { fixtures: true, fixtureScenario: "order-status-fok-found", expectedSignerAddress: replaySigner.address });
+  if (foundFokOrder.structuredContent.status !== "FILLED" || foundFokOrder.structuredContent.orderType !== "FOK"
+    || foundFokOrder.structuredContent.filledSize !== "10") {
+    fail("authoritative FOK order read-back did not preserve its full-fill result", "clob_order_record_invalid");
   }
   const identityMismatch = await callTool(artifact, statusTool, {
     orderId: statusOrderId, requestedSize: "10", signerAddress: depositPrepared.wallet.makerAddress, clobAuth: depositClobAuth,
@@ -1191,31 +1274,65 @@ export async function testOfflineArtifact(root = process.cwd()) {
   }
   const accountWallet = "0x0000000000000000000000000000000000000001";
   const otherWallet = "0x0000000000000000000000000000000000000002";
-  const readiness = await callTool(artifact, readinessTool, { walletAddress: accountWallet, walletType: "EOA" }, { fixtures: true, fixtureScenario: "readiness-ready" });
+  if (!readinessTool.inputSchema.properties.marketId || readinessTool.inputSchema.required?.includes("marketId")
+    || readinessTool.inputSchema.required?.includes("side")
+    || readinessTool.inputSchema.properties.side?.enum?.join(",") !== "BUY,SELL") {
+    fail("readiness did not expose optional market and side context", "trading_readiness_invalid");
+  }
+  const readiness = await callTool(artifact, readinessTool, { walletAddress: accountWallet, walletType: "EOA" }, { fixtures: true, fixtureScenario: "readiness-no-context" });
   if (readiness.structuredContent.wallet.address.toLowerCase() !== accountWallet.toLowerCase()
     || readiness.structuredContent.wallet.addressRole !== "ACCOUNT_WALLET"
     || readiness.structuredContent.pUsdBalance.baseUnits !== "8500000"
-    || readiness.structuredContent.polBalance.status !== "NONZERO"
-    || readiness.structuredContent.allowances.length !== 6 || readiness.structuredContent.operatorApprovals.length !== 8
+    || readiness.structuredContent.polBalance !== null
+    || readiness.structuredContent.approval.status !== "UNKNOWN"
+    || readiness.structuredContent.status !== "UNKNOWN"
     || readiness.structuredContent.eoaTradingEligibility !== "UNKNOWN"
-    || !readiness.structuredContent.unknownRequirements.some((item) => item.includes("allowlist"))) {
-    fail("readiness did not report on-chain balances, fourteen spot approval checks, wallet scope, and unknown EOA eligibility", "trading_readiness_invalid");
+    || !readiness.structuredContent.reason.includes("marketId and side")) {
+    fail("readiness did not keep unspecified approval checks UNKNOWN or preserve exact wallet scope", "trading_readiness_invalid");
   }
-  const missingApprovals = await callTool(artifact, readinessTool, { walletAddress: accountWallet, walletType: "EOA" }, { fixtures: true, fixtureScenario: "readiness-missing-approvals" });
-  if (missingApprovals.structuredContent.status !== "ACTION_REQUIRED"
-    || missingApprovals.structuredContent.allowances.some((check) => check.status !== "MISSING")
-    || missingApprovals.structuredContent.operatorApprovals.some((check) => check.status !== "MISSING")) {
-    fail("missing CLOB allowances and ERC-1155 approvals were not identified", "trading_readiness_invalid");
+  const readinessBuy = await callTool(artifact, readinessTool, {
+    walletAddress: accountWallet, walletType: "EOA", marketId: "1", side: "BUY",
+  }, { fixtures: true, fixtureScenario: "readiness-buy" });
+  if (readinessBuy.structuredContent.status !== "UNKNOWN"
+    || readinessBuy.structuredContent.approval.kind !== "PUSD_ALLOWANCE"
+    || readinessBuy.structuredContent.approval.target.toLowerCase() !== "0xe111180000d2663c0091e4f400237545b87b996b"
+    || readinessBuy.structuredContent.approval.status !== "PRESENT"
+    || readinessBuy.structuredContent.polBalance !== null) {
+    fail("standard-market BUY readiness did not check only its exchange allowance and retain unknown EOA eligibility", "trading_readiness_invalid");
+  }
+  const negRiskReadiness = await callTool(artifact, readinessTool, {
+    walletAddress: accountWallet, walletType: "SAFE", marketId: "1", side: "BUY",
+  }, { fixtures: true, fixtureScenario: "readiness-neg-risk" });
+  if (negRiskReadiness.structuredContent.approval.target.toLowerCase() !== "0xe2222d279d744050d28e00520010520000310f59"
+    || negRiskReadiness.structuredContent.eoaTradingEligibility !== "NOT_APPLICABLE") {
+    fail("negative-risk BUY readiness did not select its market exchange", "trading_readiness_invalid");
+  }
+  const v2Readiness = await callTool(artifact, readinessTool, {
+    walletAddress: accountWallet, walletType: "PROXY", marketId: "1", side: "BUY",
+  }, { fixtures: true, fixtureScenario: "readiness-v2" });
+  if (v2Readiness.structuredContent.approval.target.toLowerCase() !== "0xe3333700ca9d93003f00f0f71f8515005f6c00aa") {
+    fail("V2 BUY readiness did not select Exchange V3", "trading_readiness_invalid");
+  }
+  const missingApproval = await callTool(artifact, readinessTool, {
+    walletAddress: accountWallet, walletType: "EOA", marketId: "1", side: "SELL",
+  }, { fixtures: true, fixtureScenario: "readiness-sell-missing" });
+  if (missingApproval.structuredContent.status !== "ACTION_REQUIRED"
+    || missingApproval.structuredContent.approval.kind !== "ERC1155_OPERATOR"
+    || missingApproval.structuredContent.approval.target.toLowerCase() !== "0xe111180000d2663c0091e4f400237545b87b996b"
+    || missingApproval.structuredContent.approval.status !== "MISSING"
+    || missingApproval.structuredContent.polBalance.status !== "NONZERO"
+    || !missingApproval.structuredContent.nextAction?.includes("EXTERNAL_ACTION_REQUIRED")) {
+    fail("SELL readiness did not report its one missing operator approval and required EOA gas read", "trading_readiness_invalid");
   }
   const emptyReadiness = await callTool(artifact, readinessTool, { walletAddress: accountWallet, walletType: "EOA" }, { fixtures: true, fixtureScenario: "readiness-empty" });
-  if (emptyReadiness.structuredContent.pUsdBalance.status !== "ZERO" || emptyReadiness.structuredContent.polBalance.status !== "ZERO"
-    || emptyReadiness.structuredContent.status !== "ACTION_REQUIRED") {
-    fail("zero collateral and POL balances were not reported as missing readiness requirements", "trading_readiness_invalid");
+  if (emptyReadiness.structuredContent.pUsdBalance.status !== "ZERO" || emptyReadiness.structuredContent.polBalance !== null
+    || emptyReadiness.structuredContent.status !== "UNKNOWN") {
+    fail("readiness treated zero pUSD without an intended operation as a complete blocker or queried POL without an action", "trading_readiness_invalid");
   }
   const unavailableReadiness = await callTool(artifact, readinessTool, { walletAddress: accountWallet, walletType: "EOA" }, { fixtures: true, fixtureScenario: "chain-read-unavailable" });
   if (unavailableReadiness.structuredContent.status !== "UNKNOWN"
     || unavailableReadiness.structuredContent.pUsdBalance.status !== "UNKNOWN"
-    || unavailableReadiness.structuredContent.polBalance.status !== "UNKNOWN"
+    || unavailableReadiness.structuredContent.polBalance !== null
     || unavailableReadiness.structuredContent.eoaTradingEligibility !== "UNKNOWN") {
     fail("unavailable chain reads or allowlist eligibility were treated as approval", "trading_readiness_invalid");
   }
@@ -1277,13 +1394,14 @@ export async function testOfflineArtifact(root = process.cwd()) {
     fail("unresolved V2 position was offered for redemption", "redemption_preview_invalid");
   }
   const toolNames = new Set(tools.map((tool) => tool.name));
-  for (const name of ["submit_fak_order", "get_order_status", "cancel_order", "get_portfolio", "get_trading_readiness", "prepare_redeem"]) {
+  for (const name of ["submit_order", "submit_fak_order", "get_order_status", "cancel_order", "get_portfolio", "get_trading_readiness", "prepare_redeem"]) {
     if (!toolNames.has(name)) fail(`${name} was not registered`, "tool_catalog_invalid");
   }
   return {
     status: "passed",
     deterministicCases: [
       "BUY FAK preserves exact signed limit, size, precision, and fee-inclusive cap", "lack of visible liquidity does not block bounded FAK preparation", "no ExecutionApproval signature is required", "signed order is accepted for exactly one intercepted CLOB POST", "undocumented 300-second ClobAuth cutoff removed", "undocumented order-timestamp freshness cutoff removed", "SELL FAK preserves exact signed minimum price and size", "market fee descriptor and exact fee calculation",
+      "EOA Type 0 FAK BUY remains compatible through submit_fak_order", "EOA Type 0 FOK SELL reaches one POST with its exact prepared type and amounts", "Deposit Wallet Type 3 FAK BUY uses the shared submit_order handler", "Deposit Wallet Type 3 FOK BUY preserves ERC-7739 wrapping and FOK", "insufficient visible depth does not locally reject FOK; the CLOB's rejection remains FOK", "mismatched legacy FAK submission rejects a prepared FOK without a POST", "ambiguous FOK outcome remains UNKNOWN after one POST and one read-only reconciliation", "FAK partial fill and CLOB-canceled remainder are reflected by status read-back", "FOK full fill is reflected by authoritative status read-back",
       "reject invalid Polymarket order signature", "reject real provider geoblock", "missing CLOB credentials handled", "Deposit Wallet TypedDataSign preparation", "local smart-wallet signer recovery is distinct from deferred CLOB acceptance", "Deposit Wallet ERC-7739 order reaches exactly one intercepted CLOB POST without Polygon RPC",
       "121s book age is informational for preparation", "future, invalid, missing, and stale book timestamps do not block bounded FAK execution", "changed minimum decrease and still-valid tick are accepted", "increased minimum and invalid current tick reject the exact signed order", "zero current minimum is rejected as invalid provider data", "changed risk mode rejects an incompatible exchange domain", "restricted Gamma metadata omitted and does not reject preparation/submission", "market and quote responses omit removed eligibility metadata", "unsigned book metadata does not change EIP-712 signature validation", "51s quote remains labeled stale", "51s book age alone does not block bounded FAK execution", "timeout, HTTP 429/5xx, malformed success, and malformed order IDs reconcile once, retain status, and never repost; authoritative read-back resolves a confirmed fill", "HTTP 400/401/403 POST errors retain sanitized classifications and status", "cancel_order reports structured L1/L2/403 failures, issues one DELETE, and reconciles ambiguous outcomes at most once", "provider-invalid structured diagnostics", "reject unsafe CLOB salt precision", "reject fee-inclusive cap overrun", "reject wrong outcome asset",
       "team-attributed news", "PL/PD/SA/CL fixture mapping", "documented team-form filters with mixed-competition history filtering", "form counts and explanations for 5/5, 5/4, 5/0, and 0/0 histories",
@@ -1298,8 +1416,8 @@ export async function testOfflineArtifact(root = process.cwd()) {
       "API-Football competition IDs, starting-year season selection, wrong league/season rejection, unknown-season no-request diagnostics, and response cap",
       "fallback fixture ambiguity, kickoff conflicts, missing statistics, and source provenance",
       "host-attested identity evidence and exact market mapping consistency required for fallback probability/edge; source URLs are not fetched",
-      "official v2 OPEN portfolio includes REDEEMABLE positions and preserves cursor pagination", "public portfolio address is not wallet proof", "15-tool catalog without an order from analysis",
-      "trading readiness reads pUSD, POL, spot CLOB allowances, and operator approvals for one selected wallet", "missing balances and approvals are reported while EOA allowlist eligibility remains UNKNOWN",
+      "official v2 OPEN portfolio includes REDEEMABLE positions and preserves cursor pagination", "public portfolio address is not wallet proof", "16-tool catalog with one shared FAK/FOK submit tool",
+      "trading readiness checks pUSD and only the selected market/side approval route for standard, negative-risk, and V2 markets; no-context approvals remain UNKNOWN and POL is read only for a missing EOA approval action",
       "redemption requires on-chain resolution and actual position-owner balances", "standard and negative-risk CTF redemption previews use their official adapters", "Polymarket V2 redemption previews use the Router and exact on-chain outcome balance", "read-only tools never sign or broadcast redemption transactions",
       "ClobAuth and Order intents match PayBox's documented typedData object contract",
     ],
