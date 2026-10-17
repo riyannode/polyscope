@@ -154,6 +154,11 @@ export async function testOfflineArtifact(root = process.cwd()) {
   };
   const buy = await callTool(artifact, prepareTool, { ...base, side: "BUY", priceLimit: "0.50" }, { fixtures: true });
   const buyOrder = buy.structuredContent.preparedOrder.order;
+  const orderIntent = buy.structuredContent.requestWalletSignIntent;
+  if (orderIntent?.op !== "typedData" || typeof orderIntent.typedData !== "object"
+    || orderIntent.typedData.primaryType !== "Order" || !orderIntent.typedData.domain || !orderIntent.typedData.types || !orderIntent.typedData.message) {
+    fail("order signing intent did not match PayBox's documented EIP-712 object contract", "wallet_intent_invalid");
+  }
   if ("marketRestricted" in buy.structuredContent.preparedOrder.market
     || "executionApprovalSigningIntent" in buy.structuredContent
     || "accountGeoblockChecked" in buy.structuredContent) {
@@ -216,6 +221,11 @@ export async function testOfflineArtifact(root = process.cwd()) {
   }
   const clobAuthTool = tools.find((tool) => tool.name === "prepare_clob_auth");
   const clobAuthResult = await callTool(artifact, clobAuthTool, { signerAddress: replaySigner.address, nonce: "0" }, { fixtures: true });
+  const authIntent = clobAuthResult.structuredContent.requestWalletSignIntent;
+  if (authIntent?.op !== "typedData" || typeof authIntent.typedData !== "object"
+    || authIntent.typedData.primaryType !== "ClobAuth" || !authIntent.typedData.domain || !authIntent.typedData.types || !authIntent.typedData.message) {
+    fail("ClobAuth signing intent did not match PayBox's documented EIP-712 object contract", "wallet_intent_invalid");
+  }
   const clobAuth = {
     timestamp: clobAuthResult.structuredContent.timestamp,
     nonce: clobAuthResult.structuredContent.nonce,
@@ -448,6 +458,21 @@ export async function testOfflineArtifact(root = process.cwd()) {
     || !apiFootball.sources.some((source) => source.purpose === "TEAM_STATISTICS" && new URL(source.url).searchParams.get("date") === "2026-10-16")) {
     fail("API-Football enrichment did not preserve independent IDs, source samples, and the pre-kickoff cutoff", "soccer_provider_invalid");
   }
+  const enrichmentUrl = new URL(apiFootball.sources.find((source) => source.purpose === "MATCH_ENRICHMENT").url);
+  if (enrichmentUrl.searchParams.get("league") !== "39" || enrichmentUrl.searchParams.get("season") !== "2026"
+    || enrichmentUrl.searchParams.get("date") !== "2026-10-17" || enrichmentUrl.searchParams.get("timezone") !== "UTC") {
+    fail("API-Football enrichment did not scope fixture lookup to the exact league, season, and UTC date", "soccer_provider_invalid");
+  }
+  const crossSeasonEnrichment = await callTool(artifact, researchTool, {
+    league: "PL", fixtureId: "1001", date: "2026-01-17", includeApiFootball: true,
+  }, { fixtures: true, fixtureScenario: "api-football-enrichment-cross-season" });
+  const crossSeasonEnrichmentIdentity = crossSeasonEnrichment.structuredContent.fixtures[0]?.apiFootball?.matchIdentity;
+  const crossSeasonEnrichmentUrl = new URL(crossSeasonEnrichment.structuredContent.fixtures[0]?.apiFootball?.sourceUrl);
+  if (crossSeasonEnrichmentIdentity?.providerSeason !== 2025
+    || crossSeasonEnrichmentUrl.searchParams.get("season") !== "2025"
+    || crossSeasonEnrichmentUrl.searchParams.get("date") !== "2026-01-17") {
+    fail("API-Football enrichment did not reuse the upstream season spanning a calendar-year boundary", "soccer_provider_invalid");
+  }
   const quoteToolForAnalysis = tools.find((tool) => tool.name === "get_quote");
   const analysisQuote = await callTool(artifact, quoteToolForAnalysis, { marketId: "1", assetId: "123", side: "BUY", size: "10", depth: 10 }, { fixtures: true });
   const resolutionRules = "The market resolves to the named team winning the scheduled 90 minutes; extra time and penalties do not count.";
@@ -462,6 +487,29 @@ export async function testOfflineArtifact(root = process.cwd()) {
     || baselineModel.structuredContent.model.inputs.awayMatchesAway !== 2
     || baselineModel.structuredContent.model.sources.length !== 2) {
     fail("independent model did not use and attribute available pre-kickoff venue form when API-Football was not requested", "soccer_edge_invalid");
+  }
+  const fixedAnalysisNow = Date.parse("2026-10-17T04:23:29.396Z");
+  const capturedQuote = { ...analysisQuote.structuredContent, observedAt: "2026-10-17T04:14:42.082Z",
+    bookTimestamp: String(Date.parse("2026-10-17T04:14:42.082Z")), bookAgeMs: 0, freshness: "FRESH" };
+  const agedAnalysis = await callTool(artifact, edgeTool, {
+    fixture: baselineForm.structuredContent.fixtures[0], quote: capturedQuote, outcome: "HOME_WIN",
+    marketResolutionType: "REGULATION_1X2", marketResolutionRules: resolutionRules,
+  }, { fixtures: true, fixtureScenario: "analysis-fixed-clock" });
+  if (agedAnalysis.structuredContent.quoteFreshnessAtCapture !== "FRESH"
+    || agedAnalysis.structuredContent.quoteFreshness !== "STALE"
+    || agedAnalysis.structuredContent.quoteAgeMsAtAnalysis !== fixedAnalysisNow - Date.parse("2026-10-17T04:14:42.082Z")
+    || agedAnalysis.structuredContent.quoteBookTimestamp !== capturedQuote.bookTimestamp
+    || !agedAnalysis.structuredContent.calculationAssumptions.some((item) => item.includes("historical edge estimate"))) {
+    fail("analysis did not recalculate quote freshness or label the aged edge as historical", "soccer_quote_freshness_invalid");
+  }
+  for (const timestamp of [null, "not-a-timestamp", String(fixedAnalysisNow + 1_000)]) {
+    const unknownAnalysis = await callTool(artifact, edgeTool, {
+      fixture: baselineForm.structuredContent.fixtures[0], quote: { ...capturedQuote, bookTimestamp: timestamp }, outcome: "HOME_WIN",
+      marketResolutionType: "REGULATION_1X2", marketResolutionRules: resolutionRules,
+    }, { fixtures: true, fixtureScenario: "analysis-fixed-clock" });
+    if (unknownAnalysis.structuredContent.quoteFreshness !== "UNKNOWN" || unknownAnalysis.structuredContent.quoteAgeMsAtAnalysis !== null) {
+      fail("missing, invalid, or future book timestamps were not reported as unknown at analysis", "soccer_quote_freshness_invalid");
+    }
   }
   const positiveEdge = await callTool(artifact, edgeTool, {
     fixture: enrichedFixture, quote: analysisQuote.structuredContent, outcome: "HOME_WIN",
@@ -541,6 +589,13 @@ export async function testOfflineArtifact(root = process.cwd()) {
   }, { fixtures: true, fixtureScenario: "api-football-403" });
   if (noProvider.structuredContent.availability !== "AVAILABLE" || noProvider.structuredContent.fixtures[0]?.apiFootball?.availability !== "UNAVAILABLE") {
     fail("API-Football authorization failure erased football-data.org baseline evidence", "soccer_provider_invalid");
+  }
+  const conflictingSeason = await callTool(artifact, researchTool, {
+    league: "PL", fixtureId: "1001", date: "2026-10-17", includeApiFootball: true,
+  }, { fixtures: true, fixtureScenario: "api-football-season-conflict" });
+  if (conflictingSeason.structuredContent.fixtures[0]?.apiFootball?.availability !== "UNAVAILABLE"
+    || !conflictingSeason.structuredContent.fixtures[0]?.apiFootball?.reason?.includes("could not be established safely")) {
+    fail("conflicting upstream season metadata was guessed for API-Football enrichment", "soccer_provider_invalid");
   }
   const fallbackIdentity = { homeTeam: "Arsenal", awayTeam: "Chelsea", kickoffUtc: "2026-10-17T19:00:00.000Z" };
   for (const [scenario, status] of [["fallback-http-401", 401], ["fallback-http-403", 403], ["fallback-http-429", 429], ["fallback-http-503", 503]]) {
@@ -636,10 +691,34 @@ export async function testOfflineArtifact(root = process.cwd()) {
     || "fixtureId" in exactFallbackFixture || "homeTeamProviderId" in exactFallbackFixture) {
     fail("exact fallback did not preserve namespaced IDs and single-provider verification status", "soccer_fallback_invalid");
   }
-  if (exactFallbackFixture?.sourceUrl !== "https://v3.football.api-sports.io/fixtures?date=2026-10-17&timezone=UTC"
+  if (exactFallbackFixture?.sourceUrl !== "https://v3.football.api-sports.io/fixtures?league=39&season=2026&date=2026-10-17&timezone=UTC"
     || !exactFallbackFixture.observedAt || exactFallbackFixture.statisticsAvailability !== "AVAILABLE"
     || exactFallbackFixture.sources.length !== 3) {
     fail("API-Football fallback did not preserve fixture/statistics source provenance", "soccer_fallback_invalid");
+  }
+  const crossSeasonFallback = await callTool(artifact, researchTool, {
+    league: "PL", date: "2026-01-17", fixtureIdentity: { homeTeam: "Arsenal", awayTeam: "Chelsea", kickoffUtc: "2026-01-17T19:00:00.000Z" },
+  }, { fixtures: true, fixtureScenario: "fallback-cross-season" });
+  if (crossSeasonFallback.structuredContent.fallbackFixtures?.[0]?.providerSeason !== 2025
+    || new URL(crossSeasonFallback.structuredContent.fallbackProvider.sourceUrl).searchParams.get("season") !== "2025") {
+    fail("API-Football fallback did not use the season start year for a cross-calendar-year fixture", "soccer_fallback_invalid");
+  }
+  const unknownSeasonFallback = await callTool(artifact, researchTool, { league: "PL", date: "2026-06-17" },
+    { fixtures: true, fixtureScenario: "fallback-season-unknown" });
+  if (!unknownSeasonFallback.structuredContent.fallbackProvider.reason?.includes("was not requested")
+    || !unknownSeasonFallback.structuredContent.fallbackProvider.reason?.includes("could not be established safely")) {
+    fail("ambiguous competition season did not produce an explicit no-request diagnostic", "soccer_fallback_invalid");
+  }
+  for (const scenario of ["fallback-api-wrong-league", "fallback-api-wrong-season", "fallback-api-oversized"]) {
+    const result = await callTool(artifact, researchTool, {
+      league: "PL", date: "2026-10-17", fixtureIdentity: fallbackIdentity,
+    }, { fixtures: true, fixtureScenario: scenario });
+    if (result.structuredContent.fallbackFixtures?.length !== 0 || result.structuredContent.fallbackProvider?.availability !== "UNAVAILABLE") {
+      fail(`${scenario} was accepted as a matching fallback fixture`, "soccer_fallback_invalid");
+    }
+    if (scenario === "fallback-api-oversized" && !result.structuredContent.fallbackProvider.reason?.includes("exceeded the 1 MB limit")) {
+      fail("oversized API-Football fallback response did not retain the 1 MB diagnostic", "soccer_fallback_invalid");
+    }
   }
   const fallbackCompetitionFixtures = {
     PL: { homeTeam: "Arsenal", awayTeam: "Chelsea", providerFixtureId: "90001" },
@@ -654,6 +733,11 @@ export async function testOfflineArtifact(root = process.cwd()) {
     if (fallback.structuredContent.fallbackFixtures?.length !== 1
       || fallback.structuredContent.fallbackFixtures[0]?.providerFixtureId !== identity.providerFixtureId) {
       fail(`${league} API-Football fallback did not match its own competition and fixture identity`, "soccer_fallback_invalid");
+    }
+    const query = new URL(fallback.structuredContent.fallbackProvider.sourceUrl).searchParams;
+    if (query.get("league") !== ({ PL: "39", PD: "140", SA: "135", CL: "2" })[league]
+      || query.get("season") !== "2026" || query.get("date") !== "2026-10-17" || query.get("timezone") !== "UTC") {
+      fail(`${league} API-Football request did not use its competition-specific season-scoped endpoint`, "soccer_fallback_invalid");
     }
   }
   const incompleteStatsFallback = await callTool(artifact, researchTool, {
@@ -889,6 +973,17 @@ export async function testOfflineArtifact(root = process.cwd()) {
     || portfolio.structuredContent.hasMore !== true || portfolio.structuredContent.nextCursor !== "fixture-next-page") {
     fail("portfolio did not preserve the representative partial v2 page and unverified address label", "portfolio_pagination_invalid");
   }
+  const redeemableToolDescription = tools.find((tool) => tool.name === "get_portfolio")?.description ?? "";
+  const redeemablePortfolio = await callTool(artifact, portfolioTool, { walletAddress: "0x0000000000000000000000000000000000000001", limit: 10 },
+    { fixtures: true, fixtureScenario: "portfolio-redeemable" });
+  if (!redeemableToolDescription.includes("OPEN may include held REDEEMABLE positions")
+    || new URL(redeemablePortfolio.structuredContent.sourceUrl).searchParams.get("status") !== "OPEN"
+    || redeemablePortfolio.structuredContent.positions[0]?.status !== "REDEEMABLE"
+    || redeemablePortfolio.structuredContent.positions[0]?.redeemable !== true
+    || redeemablePortfolio.structuredContent.hasMore !== true
+    || redeemablePortfolio.structuredContent.nextCursor !== "fixture-next-page") {
+    fail("OPEN portfolio filtering dropped or misrepresented a redeemable position or its pagination", "portfolio_status_invalid");
+  }
   const portfolioNextPage = await callTool(artifact, portfolioTool, {
     walletAddress: "0x0000000000000000000000000000000000000001", limit: 10, cursor: portfolio.structuredContent.nextCursor,
   }, { fixtures: true });
@@ -907,16 +1002,19 @@ export async function testOfflineArtifact(root = process.cwd()) {
       "reject invalid Polymarket order signature", "reject real provider geoblock", "missing CLOB credentials handled", "Deposit Wallet TypedDataSign preparation", "local smart-wallet signer recovery is distinct from deferred CLOB acceptance", "Deposit Wallet ERC-7739 order reaches exactly one intercepted CLOB POST without Polygon RPC",
       "121s book age is informational for preparation", "future, invalid, missing, and stale book timestamps do not block bounded FAK execution", "changed minimum decrease and still-valid tick are accepted", "increased minimum and invalid current tick reject the exact signed order", "zero current minimum is rejected as invalid provider data", "changed risk mode rejects an incompatible exchange domain", "restricted Gamma metadata omitted and does not reject preparation/submission", "market and quote responses omit removed eligibility metadata", "unsigned book metadata does not change EIP-712 signature validation", "51s quote remains labeled stale", "51s book age alone does not block bounded FAK execution", "ambiguous submission is reconciled once and never reposted", "provider-invalid structured diagnostics", "reject unsafe CLOB salt precision", "reject fee-inclusive cap overrun", "reject wrong outcome asset",
       "team-attributed news", "PL/PD/SA/CL fixture mapping", "documented team-form filters with mixed-competition history filtering", "form counts and explanations for 5/5, 5/4, 5/0, and 0/0 histories",
-      "safe team-form HTTP 403 permission and 429 rate-limit diagnostics", "API-Football optional enrichment, independent provider IDs, exact fixture matching, and cutoff date",
+      "safe team-form HTTP 403 permission and 429 rate-limit diagnostics", "API-Football competition-scoped enrichment, upstream cross-year season reuse, independent IDs, exact fixture matching, and cutoff date",
       "provider 403, 204, HTTP 200 error envelope, unavailable/missing stats, mismatched names, kickoff conflicts, and ambiguous duplicates do not replace baseline data", "Poisson probability normalization and venue-specific API-Football and football-data fallback inputs",
       "CLOB multilevel depth-weighted price, fee-inclusive cost, positive and negative edge, partial fill, no liquidity, unsupported market rules, and honest SELL limitation",
+      "analysis recalculates quote freshness, reports invalid or future timestamps as unknown, and labels stale edges as historical",
       "soccer skill continuation for missing xG, missing injury reports, and unavailable browser tools",
       "football-data.org HTTP/network/timeout/invalid-response fallback; valid empty response stays primary-only",
       "fallback date coverage is complete only for queried days; later dates require explicit continuation",
       "API-Football fallback errors, empty data, date discovery, exact identity, and namespaced provider IDs",
+      "API-Football competition IDs, starting-year season selection, wrong league/season rejection, unknown-season no-request diagnostics, and response cap",
       "fallback fixture ambiguity, kickoff conflicts, missing statistics, and source provenance",
       "host-attested identity evidence and exact market mapping consistency required for fallback probability/edge; source URLs are not fetched",
-      "official v2 portfolio rows and cursor pagination completeness", "public portfolio address is not wallet proof", "13-tool catalog without an order from analysis",
+      "official v2 OPEN portfolio includes REDEEMABLE positions and preserves cursor pagination", "public portfolio address is not wallet proof", "13-tool catalog without an order from analysis",
+      "ClobAuth and Order intents match PayBox's documented typedData object contract",
     ],
   };
 }
