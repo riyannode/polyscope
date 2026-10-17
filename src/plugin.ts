@@ -1,119 +1,59 @@
+import { isDeepStrictEqual } from "node:util";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { McpServer } from "@modelcontextprotocol/server";
 import { serveStdio } from "@modelcontextprotocol/server/stdio";
-import { createHmac } from "node:crypto";
 import {
-  bytesToHex,
+  createPublicClient as createPolymarketClient, createSecureClient, OrderSide, OrderType, SignerType,
+  RequestRejectedError, RateLimitError, type Signer, type SignedOrder, type TypedDataPayload,
+} from "@polymarket/client";
+import { deriveApiKey, createApiKey, fetchMarketInfo, prepareLimitOrder, prepareRedeemMarketPositions, prepareRedeemPosition } from "@polymarket/client/actions";
+import { toTokenId } from "@polymarket/bindings";
+import { expectEvmAddress, expectEvmSignature, expectErc1271Signature, expectHexString } from "@polymarket/types";
+import {
   concatHex,
-  createPublicClient,
-  encodeAbiParameters,
-  encodeFunctionData,
   getAddress,
-  hashTypedData,
-  hexToBytes,
-  http,
-  keccak256,
-  parseAbi,
+  hashTypedData, domainSeparator, hashStruct,
   recoverTypedDataAddress,
   toHex,
   type Address,
   type Hex,
 } from "viem";
-import { polygon } from "viem/chains";
 import { XMLParser, XMLValidator } from "fast-xml-parser";
 import * as z from "zod/v4";
+
+// The SDK transport may retry DELETE; each tool invocation permits one mutation per endpoint.
+const sdkHttpScope = new AsyncLocalStorage<{ writes: Set<string>; mutationStatus?: number; responseStatus?: number }>();
+function runSdk<T>(call: () => Promise<T>): Promise<T> {
+  return sdkHttpScope.run({ writes: new Set() }, call);
+}
+const hostFetch = globalThis.fetch;
+globalThis.fetch = async (input, init) => {
+  const scope = sdkHttpScope.getStore();
+  if (!scope) return hostFetch(input, init);
+  const request = new Request(input, init);
+  if (!["GET", "HEAD", "OPTIONS"].includes(request.method)) {
+    const key = `${request.method} ${request.url}`;
+    if (scope.writes.has(key)) throw new Error("PS_MUTATION_RETRY_BLOCKED: Reconcile the original request read-only.");
+    scope.writes.add(key);
+  }
+  const response = await hostFetch(new Request(request, { redirect: "error", signal: AbortSignal.any([request.signal, AbortSignal.timeout(1_500)]) }));
+  scope.responseStatus = response.status;
+  if (!["GET", "HEAD", "OPTIONS"].includes(request.method)) scope.mutationStatus = response.status;
+  return response;
+};
 
 const PROTOCOL_VERSION = "2026-07-28";
 const GAMMA_API = "https://gamma-api.polymarket.com";
 const CLOB_API = "https://clob.polymarket.com";
 const DATA_API = "https://data-api.polymarket.com";
 const GEOBLOCK_API = "https://polymarket.com/api/geoblock";
-const POLYGON_RPC_URL = "https://polygon.drpc.org";
-const POLYGON_ALLOWED_RPC_HOSTS = new Set(["polygon.drpc.org"]);
-const POLYGON_RPC_TIMEOUT_MS = 2_500;
-const PUSD_TOKEN = getAddress("0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB");
-const POSITION_MANAGER = getAddress("0x006F54F7f9A22e0000CC2AB60031000000ae9fEF");
-const CONDITIONAL_TOKENS = getAddress("0x4D97DCd97eC945f40cF65F87097ACe5EA0476045");
-const NEG_RISK_ADAPTER = getAddress("0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296");
-const POLYMARKET_EXCHANGE_V3 = getAddress("0xe3333700cA9d93003F00f0F71f8515005F6c00Aa");
-const STANDARD_EXCHANGE = getAddress("0xE111180000d2663C0091e4f400237545B87B996B");
-const NEG_RISK_EXCHANGE = getAddress("0xe2222d279d744050d28e00520010520000310F59");
-const CTF_COLLATERAL_ADAPTER = getAddress("0xAdA100Db00Ca00073811820692005400218FcE1f");
-const NEG_RISK_CTF_COLLATERAL_ADAPTER = getAddress("0xadA2005600Dec949baf300f4C6120000bDB6eAab");
-const POLYMARKET_V2_ROUTER = getAddress("0x12121212006e4CD160D18e3f00711DA5c3372600");
-const BINARY_MODULE = getAddress("0x1000008dD9001B968442c1000017eaE6E0dA00Ba");
-const NEG_RISK_MODULE = getAddress("0x200000900045e3B6259600682756002200028933");
 const ESPN_SOCCER_FEED = "https://www.espn.com/espn/rss/soccer/news";
 const FOOTBALL_DATA_API = "https://api.football-data.org/v4";
 const API_FOOTBALL_API = "https://v3.football.api-sports.io";
-const ERC20_READ_ABI = parseAbi([
-  "function balanceOf(address account) view returns (uint256)",
-  "function allowance(address owner, address spender) view returns (uint256)",
-]);
-const ERC1155_READ_ABI = parseAbi([
-  "function balanceOf(address account, uint256 id) view returns (uint256)",
-  "function isApprovedForAll(address account, address operator) view returns (bool)",
-]);
-const CTF_RESOLUTION_ABI = parseAbi(["function payoutDenominator(bytes32 conditionId) view returns (uint256)"]);
-const POSITION_MANAGER_READ_ABI = parseAbi([
-  "function moduleById(uint8 moduleId) view returns (address)",
-]);
-const V2_MODULE_READ_ABI = parseAbi(["function hasResult(bytes31 conditionId) view returns (bool)"]);
-const CTF_REDEEM_ABI = parseAbi([
-  "function redeemPositions(address collateralToken, bytes32 parentCollectionId, bytes32 conditionId, uint256[] indexSets)",
-]);
-const V2_REDEEM_ABI = parseAbi(["function redeem(bytes31 conditionId, uint256 outcomeIndex, uint256 amount)"]);
-const polygonRpcUrl = new URL(POLYGON_RPC_URL);
-if (polygonRpcUrl.protocol !== "https:" || !POLYGON_ALLOWED_RPC_HOSTS.has(polygonRpcUrl.hostname)
-  || polygonRpcUrl.username !== "" || polygonRpcUrl.password !== "" || polygonRpcUrl.port !== ""
-  || polygonRpcUrl.pathname !== "/" || polygonRpcUrl.search !== "" || polygonRpcUrl.hash !== "") {
-  throw new Error("PS_CHAIN_RPC_UNSAFE: Polygon RPC endpoint is outside the configured HTTPS host allowlist.");
-}
-const polygonReadClient = createPublicClient({
-  chain: polygon,
-  transport: http(polygonRpcUrl.toString(), { timeout: POLYGON_RPC_TIMEOUT_MS, retryCount: 0 }),
-});
 const NEWS_STALE_AFTER_MS = 24 * 60 * 60 * 1000;
 const MAX_RSS_BYTES = 256 * 1024;
 const RSS_XML_PARSER = new XMLParser({ ignoreAttributes: true, processEntities: false, trimValues: false });
 const ZERO32 = `0x${"0".repeat(64)}` as const;
-const ORDER_TYPE = "Order(uint256 salt,address maker,address signer,uint256 tokenId,uint256 makerAmount,uint256 takerAmount,uint8 side,uint8 signatureType,uint256 timestamp,bytes32 metadata,bytes32 builder)";
-const EIP712_DOMAIN_TYPE = "EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)";
-const ORDER_FIELDS = [
-  { name: "salt", type: "uint256" },
-  { name: "maker", type: "address" },
-  { name: "signer", type: "address" },
-  { name: "tokenId", type: "uint256" },
-  { name: "makerAmount", type: "uint256" },
-  { name: "takerAmount", type: "uint256" },
-  { name: "side", type: "uint8" },
-  { name: "signatureType", type: "uint8" },
-  { name: "timestamp", type: "uint256" },
-  { name: "metadata", type: "bytes32" },
-  { name: "builder", type: "bytes32" },
-] as const;
-const TYPED_DATA_SIGN_FIELDS = [
-  { name: "contents", type: "Order" },
-  { name: "name", type: "string" },
-  { name: "version", type: "string" },
-  { name: "chainId", type: "uint256" },
-  { name: "verifyingContract", type: "address" },
-  { name: "salt", type: "bytes32" },
-] as const;
-const DOMAIN_BY_MARKET = {
-  v2: { version: "3", verifyingContract: "0xe3333700cA9d93003F00f0F71f8515005F6c00Aa" },
-  ctf: {
-    regular: { version: "2", verifyingContract: "0xE111180000d2663C0091e4f400237545B87B996B" },
-    negRisk: { version: "2", verifyingContract: "0xe2222d279d744050d28e00520010520000310F59" },
-  },
-} as const;
-const TICK_RULES = {
-  "0.1": { priceDecimals: 1, amountDecimals: 3 },
-  "0.01": { priceDecimals: 2, amountDecimals: 4 },
-  "0.005": { priceDecimals: 3, amountDecimals: 5 },
-  "0.0025": { priceDecimals: 4, amountDecimals: 6 },
-  "0.001": { priceDecimals: 3, amountDecimals: 5 },
-  "0.0001": { priceDecimals: 4, amountDecimals: 6 },
-} as const;
 const TICK_SIZES = ["0.1", "0.01", "0.005", "0.0025", "0.001", "0.0001"] as const;
 const FAK = "FAK" as const;
 
@@ -121,7 +61,7 @@ const preparationErrorCodeSchema = z.enum([
   "PS_MARKET_IDENTITY", "PS_PROVIDER_INVALID", "PS_PROVIDER_UNAVAILABLE",
   "PS_PROVIDER_TIMEOUT", "PS_RESPONSE_TOO_LARGE", "PS_MARKET_CLOSED", "PS_MARKET_UNSUPPORTED",
   "PS_MARKET_VERSION", "PS_FEE_INVALID", "PS_WALLET_BINDING", "PS_AMOUNT_INVALID", "PS_AMOUNT_PRECISION",
-  "PS_PRICE_INVALID", "PS_SIZE_BELOW_MINIMUM", "PS_SPENDING_CAP",
+  "PS_PRICE_INVALID", "PS_SIZE_BELOW_MINIMUM", "PS_SPENDING_CAP", "PS_CLOB_AUTH_REJECTED", "PS_AUTH_SIGNATURE_INVALID", "PS_AUTH_WALLET_MISMATCH",
 ]);
 const preparationFreshnessSchema = z.object({
   bookAgeMs: z.number().int().nonnegative().nullable(),
@@ -377,16 +317,11 @@ const preparedOrderBaseSchema = z.object({
 const preparedOrderSchema = preparedOrderBaseSchema.extend({ typedData: typedDataSchema }).strict();
 
 type PreparedOrder = z.infer<typeof preparedOrderSchema>;
-type PreparedOrderBase = z.infer<typeof preparedOrderBaseSchema>;
 type TypedPayload = z.infer<typeof typedDataSchema>;
 const clobAuthSchema = z.object({
   timestamp: z.string().regex(/^[0-9]{1,16}$/), nonce: z.string().regex(/^(0|[1-9][0-9]{0,77})$/),
   signature: z.string().regex(/^0x[0-9a-fA-F]{130}$/),
 }).strict();
-const clobMarketInfoSchema = z.object({
-  fd: z.object({ r: z.number().finite().min(0).max(1), e: z.number().int().min(0).max(6) }).passthrough().nullable().optional(),
-}).passthrough();
-const clobCredentialSchema = z.object({ apiKey: z.string().min(1), secret: z.string().min(1), passphrase: z.string().min(1) }).passthrough();
 const orderReadSchema = z.object({
   id: z.string().optional(), status: z.string().optional(), order_type: z.string().optional(),
   original_size: z.string().optional(), size_matched: z.string().optional(), asset_id: z.string().optional(),
@@ -641,37 +576,6 @@ function formatUnits(value: bigint, decimals: number): string {
   const whole = absolute / scale;
   const fraction = (absolute % scale).toString().padStart(decimals, "0").replace(/0+$/, "");
   return `${negative ? "-" : ""}${whole}${fraction.length > 0 ? `.${fraction}` : ""}`;
-}
-
-async function readChainValue<T>(read: () => Promise<T>): Promise<T | null> {
-  try { return await read(); } catch { return null; }
-}
-
-function chainBalance(value: bigint | null, decimals: number): z.infer<typeof chainBalanceSchema> {
-  return {
-    baseUnits: value?.toString() ?? null,
-    formatted: value === null ? null : formatUnits(value, decimals),
-    decimals,
-    status: value === null ? "UNKNOWN" : value === 0n ? "ZERO" : "NONZERO",
-  };
-}
-
-function operatorApproval(tokenLedger: "Conditional Tokens" | "PositionManager", operator: Address, approved: boolean | null) {
-  return {
-    tokenLedger, operator, approved,
-    status: approved === null ? "UNKNOWN" as const : approved ? "PRESENT" as const : "MISSING" as const,
-  };
-}
-
-function decodeV2Position(positionId: string) {
-  const value = BigInt(positionId);
-  const conditionBytes31 = toHex(hexToBytes(`0x${(value >> 8n).toString(16).padStart(62, "0")}`));
-  return {
-    moduleId: Number(value >> 248n),
-    outcomeIndex: Number(value & 0xffn),
-    conditionBytes31,
-    conditionId: `${conditionBytes31}00`,
-  };
 }
 
 function addDays(date: string, days: number): string {
@@ -1333,93 +1237,34 @@ function signatureHex(value: string): Hex {
   return `0x${value.slice(2)}`;
 }
 
-function clobAuthTypedData(signer: Address, timestamp: string, nonce: string) {
+function blockedSigner(signerAddress: string, capture?: (payload: TypedDataPayload) => void): Signer {
+  const blocked = () => { throw new Error("PS_EXTERNAL_SIGNING_REQUIRED: PayBox must sign outside the plugin."); };
   return {
-    domain: { name: "ClobAuthDomain", version: "1", chainId: 137 },
-    types: {
-      ClobAuth: [
-        { name: "address", type: "address" },
-        { name: "timestamp", type: "string" },
-        { name: "nonce", type: "uint256" },
-        { name: "message", type: "string" },
-      ],
-    },
-    primaryType: "ClobAuth",
-    message: {
-      address: signer,
-      timestamp,
-      nonce: BigInt(nonce),
-      message: "This message attests that I control the given wallet",
-    },
-  } as const;
+    getAddress: async () => expectEvmAddress(signerAddress),
+    signTypedData: async (payload) => { capture?.(payload); return blocked(); },
+    signMessage: async () => blocked(), sendTransaction: async () => blocked(),
+  };
 }
 
-function signatureType(type: z.infer<typeof walletTypeSchema>): 0 | 1 | 2 | 3 {
-  switch (type) {
-    case "EOA": return 0;
-    case "PROXY": return 1;
-    case "SAFE": return 2;
-    case "DEPOSIT_WALLET": return 3;
-  }
+async function clobAuthTypedData(signer: Address, timestamp: string | undefined, nonce: string) {
+  if (!Number.isSafeInteger(Number(nonce))) throw new Error("PS_AUTH_NONCE_INVALID: SDK nonce must be a safe nonnegative integer.");
+  let payload: TypedDataPayload | undefined;
+  try {
+    await createSecureClient({ wallet: signer, nonce: Number(nonce), signer: blockedSigner(signer, (value) => { payload = value; }) });
+  } catch (error) { if (!payload) throw error; }
+  if (!payload) throw new Error("PS_PROVIDER_INVALID: SDK did not request authentication signing.");
+  return timestamp === undefined ? payload : { ...payload, message: { ...payload.message, timestamp } };
 }
 
-function orderMessage(prepared: PreparedOrderBase) {
-  const { wallet, order } = prepared;
-  return {
-    salt: BigInt(order.salt),
-    maker: address(wallet.makerAddress),
-    signer: address(wallet.orderSignerAddress),
-    tokenId: BigInt(order.assetId),
-    makerAmount: BigInt(order.makerAmount),
-    takerAmount: BigInt(order.takerAmount),
-    side: order.side === "BUY" ? 0 : 1,
-    signatureType: wallet.signatureType,
-    timestamp: BigInt(order.timestamp),
-    metadata: ZERO32,
-    builder: ZERO32,
-  } as const;
+function standardOrderPayload(prepared: PreparedOrder) {
+  const payload = prepared.typedData;
+  return { ...payload, primaryType: "Order", message: payload.primaryType === "TypedDataSign"
+    ? z.record(z.string(), z.unknown()).parse(payload.message.contents) : payload.message };
 }
 
-function orderDomain(prepared: PreparedOrderBase) {
-  return prepared.market.version === "v2"
-    ? { name: "Polymarket CTF Exchange", version: "3", chainId: 137, verifyingContract: address(DOMAIN_BY_MARKET.v2.verifyingContract) }
-    : {
-        name: "Polymarket CTF Exchange",
-        version: "2",
-        chainId: 137,
-        verifyingContract: address(prepared.market.negRisk ? DOMAIN_BY_MARKET.ctf.negRisk.verifyingContract : DOMAIN_BY_MARKET.ctf.regular.verifyingContract),
-      };
-}
-
-function depositOrderPayload(prepared: PreparedOrderBase) {
-  return {
-    domain: orderDomain(prepared),
-    types: { Order: ORDER_FIELDS, TypedDataSign: TYPED_DATA_SIGN_FIELDS },
-    primaryType: "TypedDataSign",
-    message: {
-      contents: orderMessage(prepared),
-      name: "DepositWallet",
-      version: "1",
-      chainId: 137n,
-      verifyingContract: address(prepared.wallet.makerAddress),
-      salt: ZERO32,
-    },
-  } as const;
-}
-
-function standardOrderPayload(prepared: PreparedOrderBase) {
-  return {
-    domain: orderDomain(prepared),
-    types: { Order: ORDER_FIELDS },
-    primaryType: "Order",
-    message: orderMessage(prepared),
-  } as const;
-}
-
-function signingPayload(prepared: PreparedOrderBase) {
-  return prepared.wallet.type === "DEPOSIT_WALLET"
-    ? depositOrderPayload(prepared)
-    : standardOrderPayload(prepared);
+function signingPayload(prepared: PreparedOrder) { return viemPayload(prepared.typedData); }
+function viemPayload(payload: TypedPayload) {
+  return { ...payload, domain: { ...payload.domain, verifyingContract: payload.domain.verifyingContract === undefined ? undefined : address(payload.domain.verifyingContract) } };
 }
 
 function wireTypedData(payload: unknown): TypedPayload {
@@ -1429,39 +1274,16 @@ function wireTypedData(payload: unknown): TypedPayload {
   return typedDataSchema.parse(serialized);
 }
 
+// The public SDK exposes no finalizer for a signature returned in a fresh sandbox.
 function wrapDepositWalletSignature(prepared: PreparedOrder, signature: Hex): Hex {
-  const order = prepared.order;
-  const exchangeDomain = orderDomain(prepared);
-  const verifyingContract = exchangeDomain.verifyingContract;
-  const appDomainSeparator = keccak256(encodeAbiParameters(
-    [{ type: "bytes32" }, { type: "bytes32" }, { type: "bytes32" }, { type: "uint256" }, { type: "address" }],
-    [
-      keccak256(toHex(EIP712_DOMAIN_TYPE)),
-      keccak256(toHex(exchangeDomain.name)),
-      keccak256(toHex(exchangeDomain.version)),
-      BigInt(exchangeDomain.chainId),
-      verifyingContract,
-    ],
-  ));
-  const contentsHash = keccak256(encodeAbiParameters(
-    [
-      { type: "bytes32" }, { type: "uint256" }, { type: "address" }, { type: "address" },
-      { type: "uint256" }, { type: "uint256" }, { type: "uint256" }, { type: "uint8" },
-      { type: "uint8" }, { type: "uint256" }, { type: "bytes32" }, { type: "bytes32" },
-    ],
-    [
-      keccak256(toHex(ORDER_TYPE)), BigInt(order.salt), address(prepared.wallet.makerAddress),
-      address(prepared.wallet.orderSignerAddress), BigInt(order.assetId), BigInt(order.makerAmount),
-      BigInt(order.takerAmount), order.side === "BUY" ? 0 : 1, prepared.wallet.signatureType,
-      BigInt(order.timestamp), ZERO32, ZERO32,
-    ],
-  ));
+  const payload = standardOrderPayload(prepared);
+  const fields = payload.types.Order;
+  if (!fields) throw new Error("PS_ORDER_INVALID: SDK Order fields are missing.");
+  const orderType = `Order(${fields.map(({ type, name }) => `${type} ${name}`).join(",")})`;
   return concatHex([
-    signature,
-    appDomainSeparator,
-    contentsHash,
-    toHex(ORDER_TYPE),
-    toHex(ORDER_TYPE.length, { size: 2 }),
+    signature, domainSeparator({ domain: viemPayload(payload).domain }),
+    hashStruct({ types: payload.types, primaryType: "Order", data: payload.message }),
+    toHex(orderType), toHex(orderType.length, { size: 2 }),
   ]);
 }
 
@@ -1483,15 +1305,18 @@ function feeMicros(sizeMicros: bigint, priceMicros: bigint, feeRateMicros: bigin
   return ceilDiv(numerator, denominator);
 }
 
-function marketFeeInfo(value: unknown): { rate: string; exponent: number } {
-  const parsed = clobMarketInfoSchema.safeParse(value);
-  if (!parsed.success) throw new Error("PS_FEE_INVALID: Polymarket market fee metadata is invalid.");
-  const descriptor = parsed.data.fd;
-  if (descriptor == null) return { rate: "0", exponent: 0 };
-  const rate = String(descriptor.r);
+async function getMarketFeeInfo(conditionId: string): Promise<{ rate: string; exponent: number }> {
+  const info = await runSdk(() => fetchMarketInfo(createPolymarketClient(), { conditionId })).catch((error: unknown) => {
+    const failure = clobRequestFailure(error, "PS_PROVIDER_INVALID", "Official SDK market metadata could not be read.");
+    throw new ClobRequestError(failure.code, failure.message, failure.httpStatus);
+  });
+  const rate = String(info.feeInfo.rate);
+  if (info.feeInfo.rate < 0 || info.feeInfo.rate > 1 || !Number.isInteger(info.feeInfo.exponent) || info.feeInfo.exponent < 0 || info.feeInfo.exponent > 6) {
+    throw new Error("PS_FEE_INVALID: SDK fee metadata cannot support the exact spending-cap calculation.");
+  }
   try { toUnits(rate, 6, 6); }
-  catch { throw new Error("PS_FEE_INVALID: Polymarket fee rate exceeds supported decimal precision."); }
-  return { rate, exponent: descriptor.e };
+  catch { throw new Error("PS_FEE_INVALID: Fee rate exceeds supported exact decimal precision."); }
+  return { rate, exponent: info.feeInfo.exponent };
 }
 
 function bookAgeMs(timestamp: string | null | undefined, now = Date.now()): number | null {
@@ -1505,9 +1330,7 @@ async function validateWalletSignature(prepared: PreparedOrder, signature: Hex) 
   const expected = address(prepared.wallet.signingAddress);
   let recovered: Address | null = null;
   try {
-    recovered = prepared.wallet.type === "DEPOSIT_WALLET"
-      ? await recoverTypedDataAddress({ ...depositOrderPayload(prepared), signature })
-      : await recoverTypedDataAddress({ ...standardOrderPayload(prepared), signature });
+    recovered = await recoverTypedDataAddress({ ...signingPayload(prepared), signature });
   } catch { recovered = null; }
   if (recovered?.toLowerCase() !== expected.toLowerCase()) {
     return { valid: false, recovered, encoding: prepared.wallet.type === "DEPOSIT_WALLET" ? "ERC-7739" as const : "EIP-712" as const, contractWalletAcceptance: prepared.wallet.type === "EOA" ? "NOT_APPLICABLE" as const : "DEFERRED_TO_CLOB" as const, signedSignature: null };
@@ -1519,7 +1342,7 @@ async function validateWalletSignature(prepared: PreparedOrder, signature: Hex) 
   return { valid: true, recovered, encoding: prepared.wallet.type === "DEPOSIT_WALLET" ? "ERC-7739" as const : "EIP-712" as const, contractWalletAcceptance: "DEFERRED_TO_CLOB" as const, signedSignature };
 }
 
-type ClobCredentials = z.infer<typeof clobCredentialSchema>;
+type ClobCredentials = Awaited<ReturnType<typeof createSecureClient>>;
 
 class ClobRequestError extends Error {
   constructor(readonly code: string, readonly safeMessage: string, readonly httpStatus?: number) {
@@ -1531,6 +1354,10 @@ class ClobRequestError extends Error {
 function clobRequestFailure(error: unknown, fallbackCode: string, fallbackMessage: string): {
   code: string; message: string; httpStatus?: number;
 } {
+  if (error instanceof RequestRejectedError) {
+    const failure = clobPrivateHttpFailure(error.status);
+    return { ...failure, httpStatus: error.status };
+  }
   if (error instanceof ClobRequestError) {
     return {
       code: error.code,
@@ -1538,7 +1365,7 @@ function clobRequestFailure(error: unknown, fallbackCode: string, fallbackMessag
       ...(error.httpStatus === undefined ? {} : { httpStatus: error.httpStatus }),
     };
   }
-  if (error instanceof DOMException && error.name === "TimeoutError") {
+  if (error instanceof Error && (error.name === "TimeoutError" || error.cause instanceof Error && error.cause.name === "TimeoutError")) {
     return { code: "PS_PROVIDER_TIMEOUT", message: "Polymarket CLOB request timed out." };
   }
   if (error instanceof Error && error.message === "response_too_large") {
@@ -1551,133 +1378,83 @@ function clobRequestFailure(error: unknown, fallbackCode: string, fallbackMessag
   return { code: fallbackCode, message: fallbackMessage };
 }
 
-function clobTransportFailure(error: unknown): ClobRequestError {
-  const failure = clobRequestFailure(error, "PS_PROVIDER_UNAVAILABLE", "Polymarket CLOB request failed before a response was received.");
-  return new ClobRequestError(failure.code, failure.message, failure.httpStatus);
-}
-
-async function clobServerTimestamp(): Promise<string> {
-  let response: Response;
-  try {
-    response = await fetch(`${CLOB_API}/time`, {
-      headers: { accept: "application/json" }, redirect: "error", signal: AbortSignal.timeout(1_500),
-    });
-  } catch (error) {
-    throw clobTransportFailure(error);
-  }
-  if (!response.ok) {
-    throw new ClobRequestError("PS_CLOB_TIME_UNAVAILABLE", `Polymarket CLOB server time request failed with HTTP ${response.status}.`, response.status);
-  }
-  let body: string;
-  try { body = await boundedResponseText(response, 64); }
-  catch (error) {
-    if (error instanceof Error && error.message === "response_too_large") {
-      throw new ClobRequestError("PS_CLOB_TIME_INVALID", "Polymarket CLOB returned an invalid server timestamp.", response.status);
+async function deriveClobCredentials(auth: z.infer<typeof clobAuthSchema>, signerAddress: string, wallet = signerAddress): Promise<ClobCredentials> {
+  return runSdk(async () => {
+    const signer = address(signerAddress);
+    const payload = await clobAuthTypedData(signer, auth.timestamp, auth.nonce);
+    let recovered: Address;
+    try { recovered = await recoverTypedDataAddress({ ...payload, signature: signatureHex(auth.signature) }); }
+    catch { throw new Error("PS_AUTH_SIGNATURE_INVALID: Prepare and sign a new ClobAuth for the owner signer."); }
+    if (recovered?.toLowerCase() !== signer.toLowerCase()) throw new Error("PS_AUTH_WALLET_MISMATCH: ClobAuth does not match the owner signer.");
+    const publicClient = createPolymarketClient();
+    const request = { address: expectEvmAddress(signer), nonce: Number(auth.nonce), timestamp: Number(auth.timestamp), signature: expectEvmSignature(auth.signature) };
+    let credentials;
+    try { credentials = await deriveApiKey(publicClient, request); }
+    catch (error) {
+      if (error instanceof RequestRejectedError && error.status === 401) throw new ClobRequestError("PS_CLOB_AUTH_REJECTED", "Polymarket rejected authentication; prepare and sign a new ClobAuth explicitly.", 401);
+      if (!(error instanceof RequestRejectedError) || error.status !== 400) throw error;
+      credentials = await createApiKey(publicClient, request);
     }
-    throw clobTransportFailure(error);
-  }
-  let timestamp: unknown;
-  try { timestamp = JSON.parse(body) as unknown; }
-  catch { throw new ClobRequestError("PS_CLOB_TIME_INVALID", "Polymarket CLOB returned an invalid server timestamp.", response.status); }
-  if (typeof timestamp !== "number" || !Number.isSafeInteger(timestamp) || timestamp <= 0) {
-    throw new ClobRequestError("PS_CLOB_TIME_INVALID", "Polymarket CLOB returned an invalid server timestamp.", response.status);
-  }
-  return String(timestamp);
-}
-
-function l1Headers(auth: z.infer<typeof clobAuthSchema>, signerAddress: string) {
-  return {
-    POLY_ADDRESS: signerAddress,
-    POLY_SIGNATURE: auth.signature,
-    POLY_TIMESTAMP: auth.timestamp,
-    POLY_NONCE: auth.nonce,
-  };
-}
-
-async function deriveClobCredentials(
-  authInput: z.infer<typeof clobAuthSchema>, signerAddress: string, createOrDerive = false,
-): Promise<ClobCredentials> {
-  const auth = clobAuthSchema.parse(authInput);
-  const signer = address(signerAddress);
-  let recovered: Address;
-  try {
-    recovered = await recoverTypedDataAddress({
-      ...clobAuthTypedData(signer, auth.timestamp, auth.nonce), signature: signatureHex(auth.signature),
-    });
-  } catch { throw new Error("PS_AUTH_SIGNATURE_INVALID: ClobAuth signature could not be recovered. Prepare and sign a new ClobAuth."); }
-  if (recovered.toLowerCase() !== signer.toLowerCase()) {
-    throw new Error("PS_AUTH_WALLET_MISMATCH: ClobAuth must be signed by the selected owner EOA. Prepare and sign a new ClobAuth for that signer.");
-  }
-
-  const read = async (path: "/auth/derive-api-key" | "/auth/api-key", method: "GET" | "POST") => {
-    let response: Response;
+    let reauthenticationRequested = false;
     try {
-      response = await fetch(`${CLOB_API}${path}`, {
-        method, headers: { accept: "application/json", ...l1Headers(auth, signer) },
-        redirect: "error", signal: AbortSignal.timeout(1_500),
-      });
+      const client = await createSecureClient({ credentials, wallet, signer: blockedSigner(signer, (payload) => { reauthenticationRequested = payload.primaryType === "ClobAuth"; }) });
+      if (client.account.signerType !== SignerType.OWNER) throw new Error("PS_WALLET_BINDING: SDK session-key wallets require a separate supported signer flow; use the wallet owner.");
+      return client;
     } catch (error) {
-      throw clobTransportFailure(error);
+      if (reauthenticationRequested) throw new ClobRequestError("PS_CLOB_AUTH_REJECTED", "Polymarket requires fresh authentication; prepare and sign a new ClobAuth explicitly.");
+      throw error;
     }
-    if (!response.ok) {
-      const code = response.status === 401 ? "PS_CLOB_AUTH_REJECTED" : "PS_CLOB_AUTH_FAILED";
-      const message = response.status === 401
-        ? "Polymarket rejected ClobAuth; prepare and sign a new ClobAuth, then retry explicitly."
-        : `Polymarket CLOB credential request failed with HTTP ${response.status}.`;
-      throw new ClobRequestError(code, message, response.status);
-    }
-    let body: string;
-    try { body = await boundedResponseText(response, 32_768); }
-    catch (error) {
-      if (error instanceof Error && error.message === "response_too_large") {
-        throw new ClobRequestError("PS_RESPONSE_TOO_LARGE", "Polymarket CLOB credential response exceeded 32 KiB.", response.status);
-      }
-      throw clobTransportFailure(error);
-    }
-    try { return JSON.parse(body) as unknown; }
-    catch { throw new ClobRequestError("PS_CLOB_AUTH_INVALID", "Polymarket returned an invalid credential response.", response.status); }
-  };
-  let data: unknown;
-  if (createOrDerive) {
-    try { data = await read("/auth/api-key", "POST"); }
-    catch (error) {
-      if (!(error instanceof ClobRequestError) || error.httpStatus !== 400) throw error;
-      data = await read("/auth/derive-api-key", "GET");
-    }
-  } else {
-    data = await read("/auth/derive-api-key", "GET");
-  }
-  const parsed = clobCredentialSchema.safeParse(data);
-  if (!parsed.success) throw new Error("PS_CLOB_AUTH_INVALID: Polymarket returned an invalid credential response.");
-  return parsed.data;
-}
-
-function l2Signature(secret: string, timestamp: string, method: string, path: string, body = ""): string {
-  const key = Buffer.from(secret.replace(/-/g, "+").replace(/_/g, "/"), "base64");
-  return createHmac("sha256", key).update(`${timestamp}${method}${path}${body}`).digest("base64").replace(/\+/g, "-").replace(/\//g, "_");
-}
-
-async function clobPrivateRequest(
-  credentials: ClobCredentials, signerAddress: string, method: "GET" | "POST" | "DELETE",
-  path: string, body?: string, signingPath = path,
-): Promise<{ status: number; data: unknown | null }> {
-  const timestamp = String(Math.floor(Date.now() / 1000));
-  const signature = l2Signature(credentials.secret, timestamp, method, signingPath, body ?? "");
-  const response = await fetch(`${CLOB_API}${path}`, {
-    method,
-    headers: {
-      accept: "application/json", "content-type": "application/json",
-      POLY_ADDRESS: signerAddress, POLY_API_KEY: credentials.apiKey, POLY_PASSPHRASE: credentials.passphrase,
-      POLY_SIGNATURE: signature, POLY_TIMESTAMP: timestamp,
-    },
-    ...(body === undefined ? {} : { body }), redirect: "error", signal: AbortSignal.timeout(1_500),
   });
-  if (response.status === 204 || !response.ok) return { status: response.status, data: null };
-  const text = await boundedResponseText(response, 1_000_000);
-  let data: unknown;
-  try { data = JSON.parse(text) as unknown; }
-  catch { return { status: response.status, data: null }; }
-  return { status: response.status, data };
+}
+
+async function sdkResponse(call: () => Promise<unknown>): Promise<{ status: number; data: unknown | null }> {
+  const scope: { writes: Set<string>; mutationStatus?: number; responseStatus?: number } = { writes: new Set() };
+  try {
+    const data = await sdkHttpScope.run(scope, call);
+    if (scope.responseStatus === undefined) throw new Error("PS_PROVIDER_INVALID: SDK response has no observed HTTP status.");
+    return { status: scope.responseStatus, data };
+  }
+  catch (error) {
+    if (error instanceof RequestRejectedError) return { status: error.status, data: null };
+    if (error instanceof RateLimitError) return { status: 429, data: null };
+    if (scope.mutationStatus !== undefined) return { status: scope.mutationStatus, data: null };
+    throw error;
+  }
+}
+
+async function sdkReadOrder(client: ClobCredentials, orderId: string) {
+  return sdkResponse(async () => {
+    const order = await client.fetchOrder({ orderId });
+    return { id: order.id, status: order.status, order_type: order.orderType, original_size: String(order.originalSize),
+      size_matched: String(order.sizeMatched), asset_id: order.assetId, side: order.side, associate_trades: order.associateTrades };
+  });
+}
+
+async function sdkOrderPayload(client: ClobCredentials, order: { assetId: string; side: string; price: string; size: string }) {
+  const workflow = await prepareLimitOrder(client, { assetId: order.assetId, side: order.side === "BUY" ? OrderSide.BUY : OrderSide.SELL, price: order.price, size: order.size });
+  try {
+    const step = await runSdk(() => workflow.next());
+    if (step.done) throw new Error("PS_PROVIDER_INVALID: SDK did not request order signing.");
+    return wireTypedData(step.value.payload);
+  } finally { await workflow.return(undefined!); }
+}
+
+function assertSdkBinding(prepared: PreparedOrder, fresh: TypedPayload) {
+  const original = standardOrderPayload(prepared).message;
+  const current = fresh.primaryType === "TypedDataSign" ? z.record(z.string(), z.unknown()).parse(fresh.message.contents) : fresh.message;
+  current.salt = original.salt; current.timestamp = original.timestamp;
+  const expected = fresh.primaryType === "TypedDataSign" ? { ...fresh, message: { ...fresh.message, contents: current } } : { ...fresh, message: current };
+  if (!isDeepStrictEqual(expected, prepared.typedData)) throw new Error("PS_SIGNATURE_INVALID: Prepared payload differs from the official SDK order.");
+}
+
+function signedSdkOrder(prepared: PreparedOrder, signature: string): SignedOrder {
+  const { order, wallet } = prepared;
+  return {
+    ...order, expiration: 0, maker: expectEvmAddress(wallet.makerAddress), signer: expectEvmAddress(wallet.orderSignerAddress),
+    tokenId: toTokenId(order.assetId), side: order.side === "BUY" ? OrderSide.BUY : OrderSide.SELL,
+    signatureType: wallet.signatureType, orderType: order.orderType === "FAK" ? OrderType.FAK : OrderType.FOK,
+    metadata: expectHexString(order.metadata), builder: expectHexString(order.builder), signature: prepared.wallet.type === "DEPOSIT_WALLET" ? expectErc1271Signature(signature) : expectEvmSignature(signature),
+  };
 }
 
 function clobPrivateHttpFailure(status: number): { code: string; message: string } {
@@ -1712,11 +1489,11 @@ async function validateExecutionSnapshot(prepared: PreparedOrder): Promise<{
   bookUrl.searchParams.set("token_id", order.assetId);
   const [rawMarket, rawBook, rawMarketInfo, rawGeo] = await Promise.all([
     getJson(`${GAMMA_API}/markets/${encodeURIComponent(approvedMarket.id)}`),
-    getJson(bookUrl.toString()), getJson(`${CLOB_API}/clob-markets/${encodeURIComponent(approvedMarket.conditionId)}`), getJson(GEOBLOCK_API),
+    getJson(bookUrl.toString()), getMarketFeeInfo(approvedMarket.conditionId), getJson(GEOBLOCK_API),
   ]);
   const market = gammaMarketSchema.parse(rawMarket);
   const book = bookSchema.parse(rawBook);
-  const feeInfo = marketFeeInfo(rawMarketInfo);
+  const feeInfo = rawMarketInfo;
   const geo = geoblockSchema.parse(rawGeo);
   const outcome = marketOutcomeAssets(market)?.find((item) => item.assetId === order.assetId);
   if (String(market.id) !== approvedMarket.id || market.conditionId?.toLowerCase() !== approvedMarket.conditionId.toLowerCase() || outcome?.name !== approvedMarket.outcome || book.asset_id !== order.assetId || book.market.toLowerCase() !== approvedMarket.conditionId.toLowerCase()) {
@@ -1805,8 +1582,7 @@ function validatePreparedOrder(prepared: PreparedOrder): {
   priceUnits: bigint; sizeUnits: bigint; quoteUnits: bigint; capUnits: bigint; feeRateMicros: bigint; feeExponent: number;
 } {
   const order = prepared.order;
-  const rules = TICK_RULES[prepared.market.tickSize];
-  const priceUnits = toUnits(order.price, 6, rules.priceDecimals);
+  const priceUnits = toUnits(order.price, 6);
   const sizeUnits = toUnits(order.size, 6, 2);
   const capUnits = toUnits(order.maxNominalPusd, 6, 6);
   const quoteUnits = priceUnits * sizeUnits / MICRO;
@@ -1818,7 +1594,6 @@ function validatePreparedOrder(prepared: PreparedOrder): {
   const maxFeeUnits = feeMicros(sizeUnits, feePriceUnits, feeRateMicros, feeExponent);
   const expectedMakerAmount = (order.side === "BUY" ? quoteUnits : sizeUnits).toString();
   const expectedTakerAmount = (order.side === "BUY" ? sizeUnits : quoteUnits).toString();
-  const amountPrecision = 10n ** BigInt(6 - rules.amountDecimals);
   const timestamp = Number(order.timestamp);
 
   if (BigInt(order.salt) > BigInt(Number.MAX_SAFE_INTEGER)) {
@@ -1833,7 +1608,7 @@ function validatePreparedOrder(prepared: PreparedOrder): {
   if (sizeUnits < toUnits(prepared.market.minOrderSize, 6) || sizeUnits <= 0n || capUnits <= 0n || feeRateMicros > MICRO) {
     throw new Error("PS_ORDER_INVALID: Prepared order size, nominal cap, or fee rate is invalid.");
   }
-  if (quoteUnits % amountPrecision !== 0n || priceUnits * sizeUnits % MICRO !== 0n) {
+  if (priceUnits * sizeUnits % MICRO !== 0n) {
     throw new Error("PS_AMOUNT_PRECISION: Prepared order amounts exceed Polymarket precision.");
   }
   if (quoteUnits + maxFeeUnits > capUnits || order.maxGrossPusd !== formatUnits(quoteUnits, 6) || order.maxFeePusd !== formatUnits(maxFeeUnits, 6)) {
@@ -1842,7 +1617,7 @@ function validatePreparedOrder(prepared: PreparedOrder): {
   if (order.makerAmount !== expectedMakerAmount || order.takerAmount !== expectedTakerAmount || order.metadata !== ZERO32 || order.builder !== ZERO32) {
     throw new Error("PS_ORDER_INVALID: Signed amounts or fixed order metadata do not match the approved price and size.");
   }
-  if (prepared.wallet.signatureType !== signatureType(prepared.wallet.type)) {
+  if (![0, 1, 2, 3].includes(prepared.wallet.signatureType)) {
     throw new Error("PS_WALLET_BINDING: Wallet type and Polymarket signature type do not match.");
   }
   const expectedOrderSigner = prepared.wallet.type === "DEPOSIT_WALLET" ? prepared.wallet.makerAddress : prepared.wallet.signingAddress;
@@ -1851,6 +1626,14 @@ function validatePreparedOrder(prepared: PreparedOrder): {
   }
   if (prepared.wallet.type === "EOA" && prepared.wallet.makerAddress.toLowerCase() !== prepared.wallet.signingAddress.toLowerCase()) {
     throw new Error("PS_WALLET_BINDING: EOA maker and signing addresses must match.");
+  }
+  const signed = standardOrderPayload(prepared).message;
+  const approved = { salt: order.salt, timestamp: order.timestamp, tokenId: order.assetId,
+    maker: prepared.wallet.makerAddress, signer: prepared.wallet.orderSignerAddress,
+    makerAmount: order.makerAmount, takerAmount: order.takerAmount, side: order.side === "BUY" ? 0 : 1,
+    signatureType: prepared.wallet.signatureType, metadata: order.metadata, builder: order.builder };
+  if (Object.entries(approved).some(([key, value]) => String(signed[key]).toLowerCase() !== String(value).toLowerCase())) {
+    throw new Error("PS_SIGNATURE_INVALID: SDK signing payload does not bind the exact prepared intent.");
   }
   return { priceUnits, sizeUnits, quoteUnits, capUnits, feeRateMicros, feeExponent };
 }
@@ -2225,7 +2008,7 @@ async function createServer() {
       if (!market.conditionId || book.asset_id !== assetId || book.market.toLowerCase() !== market.conditionId.toLowerCase()) {
         throw new Error("PS_MARKET_IDENTITY: CLOB book identity does not match the selected market and outcome.");
       }
-      const feeInfo = marketFeeInfo(await getJson(`${CLOB_API}/clob-markets/${encodeURIComponent(market.conditionId)}`));
+      const feeInfo = await getMarketFeeInfo(market.conditionId);
       const mappedOutcomes = marketOutcomeAssets(market);
       const selectedOutcome = mappedOutcomes?.find((outcome) => outcome.assetId === assetId);
       if (!selectedOutcome) throw new Error("PS_MARKET_IDENTITY: The asset ID is not mapped to an outcome in this market.");
@@ -2374,7 +2157,7 @@ async function createServer() {
     "prepare_clob_auth",
     {
       title: "Prepare Polymarket CLOB authentication signature",
-      description: "Fetches the current CLOB server timestamp and builds the Polygon ClobAuth EIP-712 payload for the existing owner EOA signer. The PayBox agent must call request_wallet_sign with the matching wallet credential, poll get_request, then use the signature promptly. No signature or credentials are sent by this tool.",
+      description: "Uses the official SDK authentication workflow and its current timestamp to prepare the Polygon ClobAuth EIP-712 payload for the existing owner EOA signer. The PayBox agent must call request_wallet_sign with the matching wallet credential, poll get_request, then reuse that signed ClobAuth across related authenticated calls while Polymarket accepts it. No signature or credentials are sent by this tool.",
       inputSchema: z.object({ signerAddress: addressSchema, nonce: z.string().regex(/^(0|[1-9][0-9]{0,77})$/).default("0") }).strict(),
       outputSchema: typedOutputSchema,
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: false, openWorldHint: true },
@@ -2382,8 +2165,8 @@ async function createServer() {
     async ({ signerAddress, nonce }) => {
       if (BigInt(nonce) >= 1n << 256n) throw new Error("PS_AUTH_NONCE_INVALID: Nonce exceeds uint256.");
       const signer = address(signerAddress);
-      const timestamp = await clobServerTimestamp();
-      const typedData = wireTypedData(clobAuthTypedData(signer, timestamp, nonce));
+      const typedData = wireTypedData(await clobAuthTypedData(signer, undefined, nonce));
+      const timestamp = z.string().parse(typedData.message.timestamp);
       const intent = { op: "typedData" as const, typedData };
       return textToolResult("prepare_clob_auth", {
         signingAddress: signer,
@@ -2399,10 +2182,10 @@ async function createServer() {
     "prepare_order_signing",
     {
       title: "Prepare a bounded Polymarket BUY or SELL signature",
-      description: "Prepares one unsigned FAK or FOK draft for the selected outcome, side, price bound, size, and fee-inclusive cap. orderType defaults to FAK. Book age is returned for visibility and local depth does not guarantee FOK execution; Polymarket CLOB determines whether a FOK order fills in full. BUY priceLimit is the maximum; SELL priceLimit is the minimum. PayBox handles human approval and wallet signing for the Polymarket order.",
+      description: "Accepts reusable signed ClobAuth for the SDK client and prepares one unsigned FAK or FOK draft for the selected outcome, side, price bound, size, and fee-inclusive cap. orderType defaults to FAK. Book age is returned for visibility and local depth does not guarantee FOK execution; Polymarket CLOB determines whether a FOK order fills in full. BUY priceLimit is the maximum; SELL priceLimit is the minimum. PayBox handles human approval and wallet signing for the Polymarket order.",
       inputSchema: z.object({
         marketId: z.string().regex(/^[0-9]{1,32}$/), assetId: decimalIdSchema,
-        makerAddress: addressSchema, signingAddress: addressSchema,
+        makerAddress: addressSchema, signingAddress: addressSchema, clobAuth: clobAuthSchema,
         walletType: walletTypeSchema, side: sideSchema,
         orderType: orderTypeSchema.default(FAK),
         priceLimit: z.string().max(32), size: z.string().max(32), maxNominalPusd: z.string().max(32),
@@ -2423,7 +2206,7 @@ async function createServer() {
       ]),
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: false, openWorldHint: true },
     },
-    async ({ marketId, assetId, makerAddress, signingAddress, walletType, side, orderType, priceLimit, size, maxNominalPusd }) => {
+    async ({ marketId, assetId, makerAddress, signingAddress, clobAuth, walletType, side, orderType, priceLimit, size, maxNominalPusd }) => {
       let preparationFreshness: z.infer<typeof preparationFreshnessSchema> = { bookAgeMs: null };
       try {
         const marketUrl = `${GAMMA_API}/markets/${encodeURIComponent(marketId)}`;
@@ -2451,7 +2234,7 @@ async function createServer() {
         if (book.asset_id !== assetId || book.market.toLowerCase() !== market.conditionId.toLowerCase()) {
           throw new Error("PS_MARKET_IDENTITY: CLOB book identity does not match the selected market and outcome.");
         }
-        const feeInfo = marketFeeInfo(await getJson(`${CLOB_API}/clob-markets/${encodeURIComponent(market.conditionId)}`));
+        const feeInfo = await getMarketFeeInfo(market.conditionId);
         if (market.negRisk !== undefined && market.negRisk !== book.neg_risk) {
           throw new Error("PS_MARKET_VERSION: Market and CLOB book disagree about the negative-risk exchange.");
         }
@@ -2475,12 +2258,10 @@ async function createServer() {
         if (walletType === "EOA" && maker.toLowerCase() !== signing.toLowerCase()) {
           throw new Error("PS_WALLET_BINDING: For an EOA account, maker and signing addresses must match.");
         }
-        const orderSigner = walletType === "DEPOSIT_WALLET" ? maker : signing;
-        const rules = TICK_RULES[book.tick_size];
-        const priceUnits = toUnits(priceLimit, 6, rules.priceDecimals);
+        const priceUnits = toUnits(priceLimit, 6);
         const sizeUnits = toUnits(size, 6, 2);
         const capUnits = toUnits(maxNominalPusd, 6, 6);
-        const tickUnits = toUnits(book.tick_size, 6, rules.priceDecimals);
+        const tickUnits = toUnits(book.tick_size, 6);
         const minSizeUnits = toUnits(book.min_order_size, 6, 6);
         const quoteUnits = (priceUnits * sizeUnits) / 1_000_000n;
         if (priceUnits <= 0n || priceUnits >= 1_000_000n || priceUnits % tickUnits !== 0n) {
@@ -2497,16 +2278,22 @@ async function createServer() {
         if (maxGrossUnits + maxFeeUnits > capUnits) {
           throw new Error("PS_SPENDING_CAP: Fee-inclusive worst-case nominal exceeds the user-approved maximum.");
         }
-        const amountPrecision = 10n ** BigInt(6 - rules.amountDecimals);
-        if (quoteUnits % amountPrecision !== 0n) throw new Error(`PS_AMOUNT_PRECISION: Order quote exceeds this market's ${rules.amountDecimals}-decimal amount precision.`);
-        const saltBytes = crypto.getRandomValues(new Uint8Array(8));
-        const rawSalt = BigInt(bytesToHex(saltBytes));
-        const salt = (rawSalt % BigInt(Number.MAX_SAFE_INTEGER)).toString();
-        const timestamp = String(Date.now());
+        const client = await deriveClobCredentials(clobAuth, signing, maker);
+        if (["EOA", "PROXY", "SAFE", "DEPOSIT_WALLET"][client.account.walletType] !== walletType) throw new Error("PS_WALLET_BINDING: Account type differs from the SDK wallet identity.");
+        const typedData = await sdkOrderPayload(client, { assetId, side, price: priceLimit, size });
+        const sdkMessage = typedData.primaryType === "TypedDataSign" ? z.record(z.string(), z.unknown()).parse(typedData.message.contents) : typedData.message;
+        const sdkFields = z.object({ salt: z.union([z.number(), z.string()]).transform(String), timestamp: z.union([z.number(), z.string()]).transform(String), signer: addressSchema,
+          signatureType: z.number().int(), makerAmount: z.string(), takerAmount: z.string() }).parse(sdkMessage);
+        const orderSigner = sdkFields.signer;
+        const salt = sdkFields.salt;
+        const timestamp = sdkFields.timestamp;
         const maxGrossPusd = formatUnits(maxGrossUnits, 6);
         const maxFeePusd = formatUnits(maxFeeUnits, 6);
-        const makerAmount = (side === "BUY" ? quoteUnits : sizeUnits).toString();
-        const takerAmount = (side === "BUY" ? sizeUnits : quoteUnits).toString();
+        const makerAmount = sdkFields.makerAmount;
+        const takerAmount = sdkFields.takerAmount;
+        if (BigInt(side === "BUY" ? takerAmount : makerAmount) !== sizeUnits || BigInt(side === "BUY" ? makerAmount : takerAmount) !== quoteUnits) {
+          throw new Error("PS_AMOUNT_PRECISION: SDK rounding would change the exact requested size or price; choose a representable intent.");
+        }
         const preparedBase = preparedOrderBaseSchema.parse({
           market: {
             id: marketId, conditionId: market.conditionId, version: protocolVersion, outcome: selectedOutcome.name,
@@ -2516,7 +2303,7 @@ async function createServer() {
           },
           wallet: {
             type: walletType, makerAddress: maker, signingAddress: signing,
-            orderSignerAddress: orderSigner, signatureType: signatureType(walletType),
+            orderSignerAddress: orderSigner, signatureType: sdkFields.signatureType,
           },
           order: {
             salt, timestamp, assetId, side, price: priceLimit, size, maxNominalPusd,
@@ -2524,7 +2311,6 @@ async function createServer() {
             makerAmount, takerAmount, metadata: ZERO32, builder: ZERO32,
           },
         });
-        const typedData = wireTypedData(signingPayload(preparedBase));
         const preparedOrder = preparedOrderSchema.parse({ ...preparedBase, typedData });
         const intent = { op: "typedData" as const, typedData };
         return textToolResult("prepare_order_signing", {
@@ -2534,7 +2320,14 @@ async function createServer() {
       } catch (error) {
         if (!(error instanceof Error)) throw error;
         const code = preparationErrorCodeSchema.safeParse(error.message.split(":", 1)[0]);
-        if (!code.success) throw error;
+        if (!code.success) {
+          if (error.name === "UnexpectedResponseError" || error.name === "TransportError" || error.name === "RequestRejectedError" || error.name === "UserInputError") {
+            const failure = clobRequestFailure(error, "PS_PROVIDER_INVALID", "Official SDK preparation could not complete.");
+            return textToolResult("prepare_order_signing", { status: "REJECTED", errorCode: preparationErrorCodeSchema.safeParse(failure.code).success ? failure.code : "PS_PROVIDER_INVALID",
+              reason: "Official SDK preparation failed; check authentication, wallet identity, and provider availability.", submitsOrder: false, preparationFreshness });
+          }
+          throw error;
+        }
         const reason = error.message.slice(code.data.length + 1).trim();
         return textToolResult("prepare_order_signing", {
           status: "REJECTED" as const, errorCode: code.data, reason,
@@ -2562,7 +2355,7 @@ async function createServer() {
       let recovered: Address | null = null;
       try {
         recovered = await recoverTypedDataAddress({
-          ...clobAuthTypedData(expected, timestamp, nonce),
+          ...await clobAuthTypedData(expected, timestamp, nonce),
           signature: signatureHex(signature),
         });
       } catch {
@@ -2619,18 +2412,19 @@ async function createServer() {
         errorCode: "PS_ORDER_TYPE_MISMATCH",
       });
       const orderValidation = await validateWalletSignature(prepared, signatureHex(orderSignature));
-      if (!orderValidation.valid) return orderResult({
+      if (!orderValidation.valid || orderValidation.signedSignature === null) return orderResult({
         status: "REJECTED", orderId: null, orderType, requestedSize: prepared.order.size,
         filledSize: null, remainingSize: prepared.order.size, tradeIds: [],
         message: "The order signature does not recover to the approved PayBox signer; no order was sent.",
         errorCode: "PS_SIGNATURE_INVALID",
       });
 
+      const signedOrderSignature = orderValidation.signedSignature;
       let credentials: ClobCredentials;
       let snapshot: Awaited<ReturnType<typeof validateExecutionSnapshot>>;
       try {
         [credentials, snapshot] = await Promise.all([
-          deriveClobCredentials(clobAuth, prepared.wallet.signingAddress),
+          deriveClobCredentials(clobAuth, prepared.wallet.signingAddress, prepared.wallet.makerAddress),
           validateExecutionSnapshot(prepared),
         ]);
         if (snapshot.blocked) {
@@ -2650,29 +2444,10 @@ async function createServer() {
         });
       }
 
-      const orderHash = hashTypedData(standardOrderPayload(prepared));
-      const orderBody = JSON.stringify({
-        deferExec: false,
-        order: {
-          builder: prepared.order.builder,
-          expiration: "0",
-          maker: prepared.wallet.makerAddress,
-          makerAmount: prepared.order.makerAmount,
-          metadata: prepared.order.metadata,
-          salt: Number(prepared.order.salt),
-          side: prepared.order.side,
-          signature: orderValidation.signedSignature,
-          signatureType: prepared.wallet.signatureType,
-          signer: prepared.wallet.orderSignerAddress,
-          takerAmount: prepared.order.takerAmount,
-          timestamp: prepared.order.timestamp,
-          tokenId: prepared.order.assetId,
-        },
-        orderType,
-        owner: credentials.apiKey,
-      });
+      assertSdkBinding(prepared, await sdkOrderPayload(credentials, prepared.order));
+      const orderHash = hashTypedData(viemPayload(standardOrderPayload(prepared)));
       const reconcileSubmission = async (httpStatus?: number, orderId: string = orderHash, tradeIds: string[] = []) => {
-        const reconciled = await clobPrivateRequest(credentials, prepared.wallet.signingAddress, "GET", `/data/order/${orderHash}`).catch(() => null);
+        const reconciled = await sdkReadOrder(credentials, orderHash).catch(() => null);
         const known = reconciled?.status === 200 && reconciled.data !== null
           ? orderStatusResult({ orderId: orderHash, requestedSize: prepared.order.size, record: reconciled.data, orderType }) : null;
         if (known && known.status !== "UNKNOWN") return orderResult({ ...known, httpStatus: httpStatus ?? reconciled?.status });
@@ -2686,7 +2461,10 @@ async function createServer() {
       };
       let posted: { status: number; data: unknown | null };
       try {
-        posted = await clobPrivateRequest(credentials, prepared.wallet.signingAddress, "POST", "/order", orderBody, "/order");
+        posted = await sdkResponse(async () => {
+          const result = await credentials.postOrder(signedSdkOrder(prepared, signedOrderSignature));
+          return result.ok ? { success: true, orderID: result.orderId, tradeIDs: result.tradeIds } : { success: false };
+        });
       } catch {
         return reconcileSubmission();
       }
@@ -2770,7 +2548,7 @@ async function createServer() {
       }
       let result: { status: number; data: unknown | null };
       try {
-        result = await clobPrivateRequest(credentials, signerAddress, "GET", `/data/order/${encodeURIComponent(orderId)}`);
+        result = await sdkReadOrder(credentials, orderId);
       } catch (error) {
         const failure = clobRequestFailure(error, "PS_PROVIDER_UNAVAILABLE", "Polymarket order status could not be read.");
         return tradeToolResult({
@@ -2826,7 +2604,7 @@ async function createServer() {
         }, "cancel_order");
       }
       const reconcileCancellation = async (deleteStatus?: number) => {
-        const readback = await clobPrivateRequest(credentials, signerAddress, "GET", `/data/order/${encodeURIComponent(orderId)}`).catch(() => null);
+        const readback = await sdkReadOrder(credentials, orderId).catch(() => null);
         const known = readback?.status === 200 && readback.data !== null
           ? orderStatusResult({ orderId, requestedSize, record: readback.data }) : null;
         if (known && known.status !== "UNKNOWN") return tradeToolResult({ ...known, httpStatus: deleteStatus ?? readback?.status }, "cancel_order");
@@ -2838,10 +2616,9 @@ async function createServer() {
           errorCode: "PS_CANCEL_UNKNOWN", ...(httpStatus === undefined ? {} : { httpStatus }),
         }, "cancel_order");
       };
-      const body = JSON.stringify({ orderID: orderId });
       let canceled: { status: number; data: unknown | null };
       try {
-        canceled = await clobPrivateRequest(credentials, signerAddress, "DELETE", "/order", body);
+        canceled = await sdkResponse(() => credentials.cancelOrder({ orderId }));
       } catch {
         return reconcileCancellation();
       }
@@ -2875,7 +2652,7 @@ async function createServer() {
     "get_trading_readiness",
     {
       title: "Read Polymarket trading readiness",
-      description: "Reads pUSD for the exact selected account wallet. When marketId and side are both supplied, checks only that market route's pUSD allowance for BUY or outcome-token operator approval for SELL. Without both, approval readiness remains UNKNOWN and no approval or POL scans run. Reads POL only for an EOA with a missing approval that requires an on-chain action. EOA eligibility remains UNKNOWN. No signing, approval, or transaction is performed.",
+      description: "Reads official SDK indexed trading-approval state for the supplied public account wallet. Funding, gas and exact order-size sufficiency remain UNKNOWN. Optional marketId/side are retained for compatibility; this is an aggregate SDK approval summary. Never signs, approves, funds, or sends transactions.",
       inputSchema: z.object({
         walletAddress: addressSchema, walletType: walletTypeSchema,
         marketId: z.string().regex(/^[0-9]{1,32}$/).optional(), side: sideSchema.optional(),
@@ -2883,81 +2660,19 @@ async function createServer() {
       outputSchema: tradingReadinessSchema,
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
     },
-    async ({ walletAddress, walletType, marketId, side }) => {
-      const accountWallet = getAddress(walletAddress);
-      const pUsdBalanceValue = await readChainValue(() => polygonReadClient.readContract({
-        address: PUSD_TOKEN, abi: ERC20_READ_ABI, functionName: "balanceOf", args: [accountWallet],
-      }));
-      const pUsdBalance = chainBalance(pUsdBalanceValue, 6);
-      let approval: z.infer<typeof tradingApprovalSchema> = {
-        kind: null, target: null, tokenLedger: null, allowanceBaseUnits: null, status: "UNKNOWN",
-      };
-      let marketRouteKnown = false;
-      if (marketId !== undefined && side !== undefined) {
-        try {
-          const market = gammaMarketSchema.parse(await getJson(`${GAMMA_API}/markets/${encodeURIComponent(marketId)}`));
-          if (String(market.id) === marketId && market.negRisk !== undefined) {
-            const version = market.version === "v2" ? "v2" : "v1";
-            const exchange = version === "v2" ? POLYMARKET_EXCHANGE_V3 : market.negRisk ? NEG_RISK_EXCHANGE : STANDARD_EXCHANGE;
-            if (side === "BUY") {
-              const allowance = await readChainValue(() => polygonReadClient.readContract({
-                address: PUSD_TOKEN, abi: ERC20_READ_ABI, functionName: "allowance", args: [accountWallet, exchange],
-              }));
-              approval = {
-                kind: "PUSD_ALLOWANCE", target: exchange, tokenLedger: null,
-                allowanceBaseUnits: allowance?.toString() ?? null,
-                status: allowance === null ? "UNKNOWN" : allowance > 0n ? "PRESENT" : "MISSING",
-              };
-            } else {
-              const tokenLedger = version === "v2" ? "PositionManager" : "Conditional Tokens";
-              const tokenAddress = version === "v2" ? POSITION_MANAGER : CONDITIONAL_TOKENS;
-              const approved = await readChainValue(() => polygonReadClient.readContract({
-                address: tokenAddress, abi: ERC1155_READ_ABI, functionName: "isApprovedForAll", args: [accountWallet, exchange],
-              }));
-              approval = {
-                kind: "ERC1155_OPERATOR", target: exchange, tokenLedger, allowanceBaseUnits: null,
-                status: approved === null ? "UNKNOWN" : approved ? "PRESENT" : "MISSING",
-              };
-            }
-            marketRouteKnown = true;
-          }
-        } catch { /* Provider and RPC failures remain UNKNOWN in the structured result. */ }
-      }
-      const approvalActionRequired = approval.status === "MISSING";
-      const buyFundingRequired = side === "BUY" && pUsdBalance.status === "ZERO";
-      const polBalance = approvalActionRequired && walletType === "EOA"
-        ? chainBalance(await readChainValue(() => polygonReadClient.getBalance({ address: accountWallet })), 18)
-        : null;
-      const eligibilityUnknown = walletType === "EOA";
-      const status = approvalActionRequired || buyFundingRequired || polBalance?.status === "ZERO" ? "ACTION_REQUIRED"
-        : pUsdBalance.status === "UNKNOWN" || approval.status === "UNKNOWN" || eligibilityUnknown ? "UNKNOWN" : "CHECKS_PRESENT";
-      const reasons: string[] = [];
-      if (buyFundingRequired) reasons.push("The selected account wallet has zero pUSD for this BUY.");
-      if (approvalActionRequired) reasons.push(`The selected market's ${approval.kind === "PUSD_ALLOWANCE" ? "pUSD allowance" : "outcome-token operator approval"} is missing.`);
-      if (polBalance?.status === "ZERO") reasons.push("The selected EOA has zero POL for the required on-chain approval action.");
-      if (polBalance?.status === "UNKNOWN") reasons.push("POL gas balance could not be read for the required EOA approval action.");
-      if (pUsdBalance.status === "UNKNOWN") reasons.push("The selected wallet's pUSD balance could not be read.");
-      if (approval.status === "UNKNOWN") reasons.push(marketId === undefined || side === undefined
-        ? "Provide both marketId and side to check the one relevant approval."
-        : marketRouteKnown ? "The selected market approval could not be read." : "The selected market route could not be verified.");
-      if (eligibilityUnknown) reasons.push("EOA trading eligibility remains UNKNOWN because no authoritative read-only check is available.");
-      if (reasons.length === 0) reasons.push("The selected wallet's pUSD balance and one market/side approval are present; order-size sufficiency is unverified.");
-      const nextAction = approvalActionRequired
-        ? `EXTERNAL_ACTION_REQUIRED: Use Polymarket's official trading-approval procedure through a supported PayBox wallet operation; PolyScope does not approve or broadcast.${polBalance?.status === "ZERO" ? " Fund the selected EOA with POL first." : polBalance?.status === "UNKNOWN" ? " Verify the selected EOA's POL balance before proceeding." : ""}`
-        : buyFundingRequired ? "Fund pUSD in this selected account wallet before the BUY."
-          : polBalance?.status === "ZERO" ? "Fund this selected EOA with POL before its on-chain approval action."
-            : approval.status === "UNKNOWN" && (marketId === undefined || side === undefined) ? "Supply both marketId and side for the exact approval check."
-              : approval.status === "UNKNOWN" ? "Retry after the selected market metadata and Polygon RPC are available."
-                : eligibilityUnknown ? "Confirm EOA eligibility with Polymarket; this tool cannot verify it read-only." : null;
-      const structuredContent = tradingReadinessSchema.parse({
-        status,
-        wallet: { address: accountWallet, type: walletType, addressRole: "ACCOUNT_WALLET" },
+    async ({ walletAddress, walletType }) => {
+      const state = await runSdk(() => createPolymarketClient().fetchTradingApprovalsState({ user: walletAddress })).catch(() => null);
+      return textToolResult("get_trading_readiness", tradingReadinessSchema.parse({
+        status: state && !state.isFullyApproved ? "ACTION_REQUIRED" : "UNKNOWN",
+        wallet: { address: getAddress(walletAddress), type: walletType, addressRole: "ACCOUNT_WALLET" },
         chainId: 137, observedAt: new Date().toISOString(),
-        pUsdBalance, polBalance, approval,
+        pUsdBalance: { baseUnits: null, formatted: null, decimals: 6, status: "UNKNOWN" }, polBalance: null,
+        approval: { kind: null, target: null, tokenLedger: null, allowanceBaseUnits: null,
+          status: state ? state.isFullyApproved ? "PRESENT" : "MISSING" : "UNKNOWN" },
         eoaTradingEligibility: walletType === "EOA" ? "UNKNOWN" : "NOT_APPLICABLE",
-        reason: reasons.join(" "), nextAction,
-      });
-      return textToolResult("get_trading_readiness", structuredContent);
+        reason: state ? "Official SDK indexed trading-approval state; funding, gas, freshness and order-size sufficiency remain UNKNOWN." : "Official SDK trading-approval state is unavailable.",
+        nextAction: state && !state.isFullyApproved ? "EXTERNAL_ACTION_REQUIRED: Review missing approvals in the official Polymarket wallet flow." : null,
+      }));
     },
   );
 
@@ -2965,173 +2680,67 @@ async function createServer() {
     "prepare_redeem",
     {
       title: "Prepare a Polymarket redemption preview",
-      description: "Reads current Gamma market metadata to choose the CTF standard/negative-risk adapter or the Polymarket V2 Router, then checks on-chain resolution, actual ERC-1155 balances, and the route operator approval for the explicitly supplied position-owning account wallet. Returns only an official-contract transaction preview; it never signs, executes, or broadcasts. Execution requires a separate supported PayBox/Polymarket wallet flow and explicit approval.",
+      description: "Uses official SDK indexed positions and redemption workflows for the explicitly supplied owner. Accepts reusable signed ClobAuth and owner signingAddress for the SDK client. Returns an unsigned preview with EXTERNAL_ACTION_REQUIRED; route approval, fresh chain finality, and Polygon PayBox proposal support remain unverified. Never signs, submits approvals, or broadcasts.",
       inputSchema: z.object({
-        walletAddress: addressSchema, walletType: walletTypeSchema,
+        walletAddress: addressSchema, walletType: walletTypeSchema, signingAddress: addressSchema, clobAuth: clobAuthSchema,
         conditionId: z.string().regex(/^0x[0-9a-fA-F]{64}$/),
       }).strict(),
       outputSchema: preparedRedeemSchema,
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
     },
-    async ({ walletAddress, walletType, conditionId }) => {
-      const accountWallet = getAddress(walletAddress);
-      const conditionBytes32 = conditionId as Hex;
-      const conditionBytes31 = toHex(hexToBytes(conditionBytes32).slice(0, 31));
-      const marketOutput = { marketId: null, question: null, version: null, negRisk: null };
-      const base = {
-        conditionId,
-        wallet: { address: accountWallet, type: walletType, addressRole: "POSITION_OWNER" as const },
-        market: marketOutput,
-        resolution: "UNKNOWN" as const,
-        positionLedger: "UNKNOWN" as const,
-        positions: [],
-        routeApproval: null,
-        transactionPreview: [],
-        execution: "NOT_READY" as const,
-        missingRequirements: [],
-        unknownRequirements: [],
-        nextActions: [],
-        errorCode: null,
-      };
-      const respond = (status: z.infer<typeof preparedRedeemSchema>["status"], overrides: Record<string, unknown> = {}) => {
-        const structuredContent = preparedRedeemSchema.parse({ ...base, status, ...overrides });
-        return textToolResult("prepare_redeem", structuredContent);
-      };
-      const marketUrl = new URL(`${GAMMA_API}/markets`);
-      marketUrl.searchParams.set("condition_ids", conditionId);
-      let marketResponse: unknown;
-      try { marketResponse = await getJson(marketUrl.toString()); }
-      catch {
-        return respond("UNKNOWN", {
-          unknownRequirements: ["Polymarket market metadata is currently unavailable."],
-          nextActions: ["Retry after Gamma market metadata is available."],
-          errorCode: "PS_MARKET_DATA_UNAVAILABLE",
-        });
-      }
-      const parsedMarkets = z.array(gammaMarketSchema).safeParse(marketResponse);
-      const market = parsedMarkets.success
-        ? parsedMarkets.data.find((candidate) => candidate.conditionId?.toLowerCase() === conditionId.toLowerCase())
-        : undefined;
-      if (!market) return respond("UNKNOWN", {
-        unknownRequirements: ["No exact Gamma market match was returned for this condition ID."],
-        nextActions: ["Verify the condition ID against the official Polymarket market record."],
-        errorCode: parsedMarkets.success ? "PS_MARKET_NOT_FOUND" : "PS_MARKET_UNSUPPORTED",
-      });
-      const selectedMarket = {
-        marketId: String(market.id), question: market.question ?? null,
-        version: market.version ?? null, negRisk: market.negRisk ?? null,
-      };
-      const finishForMarket = (status: z.infer<typeof preparedRedeemSchema>["status"], overrides: Record<string, unknown> = {}) =>
-        respond(status, { market: selectedMarket, ...overrides });
-      const outcomes = marketOutcomeAssets(market);
-      if ((market.version !== "v1" && market.version !== "v2") || !outcomes || outcomes.length !== 2
-        || (market.version === "v1" && market.negRisk === undefined)) {
-        return finishForMarket("UNSUPPORTED", {
-          nextActions: ["Use an official Polymarket route for this market's position system; PolyScope currently previews binary CTF and V2 positions only."],
-          execution: "UNSUPPORTED", errorCode: "PS_MARKET_UNSUPPORTED",
-        });
-      }
-      const decodedV2 = market.version === "v2" ? outcomes.map((outcome) => decodeV2Position(outcome.assetId)) : null;
-      if (decodedV2 && (decodedV2.some((position) => ![1, 2].includes(position.moduleId) || ![0, 1].includes(position.outcomeIndex)
-        || position.conditionId.toLowerCase() !== conditionId.toLowerCase())
-        || new Set(decodedV2.map((position) => position.moduleId)).size !== 1
-        || new Set(decodedV2.map((position) => position.outcomeIndex)).size !== 2)) {
-        return finishForMarket("UNSUPPORTED", {
-          nextActions: ["The returned V2 position IDs do not form the two outcomes of the requested condition."],
-          execution: "UNSUPPORTED", errorCode: "PS_MARKET_UNSUPPORTED",
-        });
-      }
-      const isV2 = market.version === "v2";
-      const ledgerAddress = isV2 ? POSITION_MANAGER : market.negRisk ? NEG_RISK_ADAPTER : CONDITIONAL_TOKENS;
-      const ledgerName = isV2 ? "PositionManager" as const : market.negRisk ? "NegRisk Adapter" as const : "Conditional Tokens" as const;
-      const approvalLedgerAddress = isV2 ? POSITION_MANAGER : CONDITIONAL_TOKENS;
-      const approvalLedgerName = isV2 ? "PositionManager" as const : "Conditional Tokens" as const;
-      const routeTarget = isV2 ? POLYMARKET_V2_ROUTER
-        : market.negRisk ? NEG_RISK_CTF_COLLATERAL_ADAPTER : CTF_COLLATERAL_ADAPTER;
-      const balances = await Promise.all(outcomes.map((outcome) => readChainValue(() => polygonReadClient.readContract({
-        address: ledgerAddress, abi: ERC1155_READ_ABI, functionName: "balanceOf",
-        args: [accountWallet, BigInt(outcome.assetId)],
-      }))));
-      const routeApproved = await readChainValue(() => polygonReadClient.readContract({
-        address: approvalLedgerAddress, abi: ERC1155_READ_ABI, functionName: "isApprovedForAll",
-        args: [accountWallet, routeTarget],
-      }));
-      let resolutionValue: boolean | null;
-      if (!isV2) {
-        const denominator = await readChainValue(() => polygonReadClient.readContract({
-          address: CONDITIONAL_TOKENS, abi: CTF_RESOLUTION_ABI, functionName: "payoutDenominator",
-          args: [conditionBytes32],
+    async ({ walletAddress, walletType, conditionId, signingAddress, clobAuth }) => {
+      const base = { conditionId, wallet: { address: getAddress(walletAddress), type: walletType, addressRole: "POSITION_OWNER" },
+        market: { marketId: null, question: null, version: null, negRisk: null }, resolution: "UNKNOWN", positionLedger: "UNKNOWN",
+        positions: [], routeApproval: null, transactionPreview: [], execution: "NOT_READY", missingRequirements: [], unknownRequirements: [], nextActions: [], errorCode: null };
+      try {
+        const client = await deriveClobCredentials(clobAuth, signingAddress, walletAddress);
+        if (["EOA", "PROXY", "SAFE", "DEPOSIT_WALLET"][client.account.walletType] !== walletType) throw new Error("PS_WALLET_BINDING: Account type differs from SDK identity.");
+        const page = await runSdk(() => client.listPositions({ user: walletAddress, conditionId, pageSize: 3 }).firstPage());
+        if (page.hasMore || page.items.some((position) => position.wallet.toLowerCase() !== walletAddress.toLowerCase() || position.conditionId.toLowerCase() !== conditionId.toLowerCase())) {
+          throw new Error("PS_MARKET_IDENTITY: Position page is incomplete or differs from the requested owner and condition.");
+        }
+        const held = page.items.filter((position) => toUnits(position.currentSize, 6) > 0n);
+        const positions = held.map((position) => ({ outcome: position.outcome ?? "Unknown", tokenId: position.assetId,
+          balanceBaseUnits: toUnits(position.currentSize, 6).toString(), ownership: "HELD" }));
+        if (!held.length) return textToolResult("prepare_redeem", preparedRedeemSchema.parse({ ...base, status: "NO_POSITION" }));
+        if (held.some((position) => !position.redeemable || position.status !== "REDEEMABLE")) {
+          return textToolResult("prepare_redeem", preparedRedeemSchema.parse({ ...base, status: "UNRESOLVED", positions,
+            unknownRequirements: ["The official indexed position state does not mark every held outcome redeemable."] }));
+        }
+        const markets = await runSdk(() => client.listMarkets({ conditionIds: [conditionId], pageSize: 1 }).firstPage());
+        const market = markets.items[0];
+        if (!market || market.conditionId?.toLowerCase() !== conditionId.toLowerCase()) throw new Error("PS_MARKET_IDENTITY: No exact SDK market match.");
+        const assets = [market.outcomes.yes, market.outcomes.no].map((outcome) => outcome.positionId ?? outcome.tokenId);
+        if (held.some((position) => !assets.includes(position.assetId))) throw new Error("PS_MARKET_IDENTITY: Indexed position asset differs from SDK market outcomes.");
+        if (walletType !== "EOA") return textToolResult("prepare_redeem", preparedRedeemSchema.parse({ ...base,
+          status: "UNSUPPORTED", execution: "EXTERNAL_ACTION_REQUIRED", positions,
+          unknownRequirements: ["The public SDK gasless-wallet workflow requires relayer authorization and signing before direct calls can be exposed; PolyScope supplies neither."],
+          nextActions: ["Use the official authorized wallet redemption flow. No approval, signing or broadcast was requested."],
         }));
-        resolutionValue = denominator === null ? null : denominator > 0n;
-      } else {
-        const moduleId = decodedV2?.[0]?.moduleId;
-        const moduleAddress = moduleId === undefined ? null : await readChainValue(() => polygonReadClient.readContract({
-          address: POSITION_MANAGER, abi: POSITION_MANAGER_READ_ABI, functionName: "moduleById",
-          args: [moduleId],
+        const requests = market.version === "v2" ? held.map((position) => ({ positionId: position.assetId })) : [{ conditionId }];
+        const previews: z.infer<typeof transactionPreviewSchema>[] = [];
+        for (const request of requests) {
+          const workflow = "positionId" in request ? await runSdk(() => prepareRedeemPosition(client, request)) : await runSdk(() => prepareRedeemMarketPositions(client, request));
+          try {
+            const step = await runSdk(() => workflow.next());
+            if (!step.done && step.value.kind === "sendRedeemPositionsTransaction") {
+              previews.push({ from: getAddress(walletAddress), to: step.value.request.to, value: "0", data: step.value.request.data ?? "0x" });
+            }
+          } finally { await workflow.return(undefined!); }
+        }
+        return textToolResult("prepare_redeem", preparedRedeemSchema.parse({ ...base,
+          market: { marketId: market.id, question: market.question ?? null, version: market.version ?? null, negRisk: market.state.negRisk ?? null },
+          positionLedger: market.version === "v2" ? "PositionManager" : market.state.negRisk ? "NegRisk Adapter" : "Conditional Tokens",
+          positions, status: previews.length === requests.length ? "PREPARED" : "UNSUPPORTED", transactionPreview: previews,
+          execution: "EXTERNAL_ACTION_REQUIRED",
+          unknownRequirements: ["Indexed redeemability is not fresh chain finality. Route approval and Polygon transaction-proposal validation are unverified."],
+          nextActions: [previews.length ? "Review SDK-generated unsigned calls in an authorized official wallet flow. No transaction was signed or broadcast."
+            : "The SDK requests a gasless-wallet signature before exposing direct calls. Complete redemption in the official wallet flow."],
         }));
-        const moduleResult = moduleAddress === null || moduleAddress.toLowerCase() === "0x0000000000000000000000000000000000000000"
-          ? null : await readChainValue(() => polygonReadClient.readContract({
-            address: moduleAddress, abi: V2_MODULE_READ_ABI, functionName: "hasResult",
-            args: [decodedV2?.[0]?.conditionBytes31 ?? conditionBytes31],
-          }));
-        resolutionValue = moduleResult;
+      } catch {
+        return textToolResult("prepare_redeem", preparedRedeemSchema.parse({ ...base, status: "UNKNOWN",
+          unknownRequirements: ["Official SDK redemption preparation could not be completed."], errorCode: "PS_MARKET_DATA_UNAVAILABLE" }));
       }
-      const positions = outcomes.map((outcome, index) => ({
-        outcome: outcome.name,
-        tokenId: outcome.assetId,
-        balanceBaseUnits: balances[index]?.toString() ?? null,
-        ownership: balances[index] === null ? "UNKNOWN" as const : balances[index] === 0n ? "NOT_HELD" as const : "HELD" as const,
-      }));
-      const resolution = resolutionValue === null ? "UNKNOWN" as const : resolutionValue ? "RESOLVED" as const : "UNRESOLVED" as const;
-      const routeApprovalOutput = operatorApproval(approvalLedgerName, routeTarget, routeApproved);
-      const missingRequirements: string[] = [];
-      const unknownRequirements: string[] = [];
-      const nextActions: string[] = [];
-      if (resolution === "UNRESOLVED") missingRequirements.push("The selected condition has no on-chain resolution result.");
-      if (positions.every((position) => position.ownership === "NOT_HELD")) missingRequirements.push("The selected account wallet holds no outcome tokens for this condition.");
-      if (positions.some((position) => position.ownership === "UNKNOWN")) unknownRequirements.push("One or more on-chain position balances could not be read.");
-      if (resolution === "UNKNOWN") unknownRequirements.push("On-chain resolution state could not be verified.");
-      if (routeApproved === false) missingRequirements.push(`The selected position wallet has not approved ${routeTarget} on ${approvalLedgerName}.`);
-      if (routeApproved === null) unknownRequirements.push(`The ${approvalLedgerName} operator approval could not be read.`);
-      if (routeApproved === false) nextActions.push("Use the official Polymarket approval flow through a supported PayBox wallet operation; PolyScope does not submit approvals.");
-      if (walletType === "EOA") nextActions.push("A direct EOA redemption transaction requires POL in this same account wallet.");
-      const canPreview = resolutionValue === true && balances.every((balance) => balance !== null)
-        && balances.some((balance) => balance !== null && balance > 0n);
-      const transactionPreview = canPreview ? isV2
-        ? outcomes.flatMap((outcome, index) => {
-          const balance = balances[index];
-          const decoded = decodedV2?.[index];
-          if (balance === null || balance === undefined || balance === 0n || decoded === undefined) return [];
-          return [{
-            from: accountWallet, to: POLYMARKET_V2_ROUTER, value: "0" as const,
-            data: encodeFunctionData({
-              abi: V2_REDEEM_ABI, functionName: "redeem",
-              args: [decoded.conditionBytes31, BigInt(decoded.outcomeIndex), balance],
-            }),
-          }];
-        })
-        : [{
-          from: accountWallet, to: routeTarget, value: "0" as const,
-          data: encodeFunctionData({
-            abi: CTF_REDEEM_ABI, functionName: "redeemPositions",
-            args: [PUSD_TOKEN, ZERO32, conditionBytes32, [1n, 2n]],
-          }),
-        }]
-        : [];
-      if (!canPreview && missingRequirements.length === 0 && unknownRequirements.length === 0) {
-        missingRequirements.push("A resolved position balance is required to construct a redemption preview.");
-      }
-      if (canPreview) nextActions.push("Review the preview and choose an authorized wallet operation capable of signing and broadcasting it; PolyScope does not execute the transaction.");
-      const errorCode = resolutionValue === null || routeApproved === null || balances.some((balance) => balance === null)
-        ? "PS_CHAIN_READ_UNAVAILABLE" : null;
-      const status = !canPreview && resolution === "UNRESOLVED" ? "UNRESOLVED"
-        : !canPreview && positions.every((position) => position.ownership === "NOT_HELD") ? "NO_POSITION"
-          : canPreview ? "PREPARED" : "UNKNOWN";
-      return finishForMarket(status, {
-        resolution, positionLedger: ledgerName, positions, routeApproval: routeApprovalOutput,
-        transactionPreview, execution: canPreview ? "EXTERNAL_ACTION_REQUIRED" : "NOT_READY",
-        missingRequirements, unknownRequirements, nextActions, errorCode,
-      });
     },
   );
 

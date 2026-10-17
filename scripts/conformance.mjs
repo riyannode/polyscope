@@ -1,3 +1,5 @@
+import { prepareLimitOrder } from "@polymarket/client/actions";
+import { createSecureClient } from "@polymarket/client";
 import { createHash } from "node:crypto";
 import { readFile, rm, mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -6,11 +8,73 @@ import { fileURLToPath } from "node:url";
 import { realpathSync } from "node:fs";
 import { createInterface } from "node:readline";
 import { decodeFunctionData, parseAbi } from "viem";
-import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
+import { generatePrivateKey, privateKeyToAccount as accountFromKey } from "viem/accounts";
 
 import { checkEnvironment, ConformanceError, release, reportConformance } from "./report.mjs";
 import { withProcess } from "./process.mjs";
-import { compileSchema, validateSample } from "./schema.mjs";
+import { compileSchema, validateSample as validateSchemaSample } from "./schema.mjs";
+
+const accounts = new Map();
+const authFixtures = new Map();
+const walletFixtures = new Map();
+function privateKeyToAccount(key) { const account = accountFromKey(key); accounts.set(account.address.toLowerCase(), account); return account; }
+const fixtureSigner = privateKeyToAccount(generatePrivateKey());
+async function fixtureWallet(signerAddress) {
+  if (walletFixtures.has(signerAddress)) return walletFixtures.get(signerAddress);
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (input) => {
+    const url = new URL(input instanceof Request ? input.url : input);
+    if (url.hostname === "relayer-v2.polymarket.com" && url.pathname === "/deployed") return Response.json({ deployed: true });
+    if (url.hostname === "clob.polymarket.com" && url.pathname === "/auth/api-keys") return Response.json({ apiKeys: ["fixture-api-key"] });
+    throw new Error("Unexpected SDK fixture wallet request");
+  };
+  try {
+    const blocked = async () => { throw new Error("Fixture must not sign or send"); };
+    const client = await createSecureClient({ credentials: { key: "fixture-api-key", secret: "dGVzdA==", passphrase: "fixture-passphrase" },
+      signer: { getAddress: async () => signerAddress, signMessage: blocked, signTypedData: blocked, sendTransaction: blocked } });
+    walletFixtures.set(signerAddress, client.account.wallet);
+    return client.account.wallet;
+  } finally { globalThis.fetch = originalFetch; }
+}
+async function sdkReferenceOrder(account, wallet) {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (input) => {
+    const url = new URL(input instanceof Request ? input.url : input);
+    if (url.pathname === "/deployed") return Response.json({ deployed: true });
+    if (url.pathname === "/auth/api-keys") return Response.json({ apiKeys: ["fixture-api-key"] });
+    if (url.pathname.startsWith("/markets-by-token/")) return Response.json({ condition_id: `0x${"1".repeat(64)}` });
+    if (url.pathname.startsWith("/clob-markets/")) return Response.json({ fd: { r: 0.05, e: 1 }, mts: 0.01, nr: false, t: [{ t: "123", o: "Yes" }, { t: "124", o: "No" }] });
+    throw new Error("Unexpected SDK reference request");
+  };
+  try {
+    const blocked = async () => { throw new Error("Reference workflow must not send"); };
+    const client = await createSecureClient({ wallet, credentials: { key: "fixture-api-key", secret: "dGVzdA==", passphrase: "fixture-passphrase" },
+      signer: { getAddress: async () => account.address, signTypedData: blocked, signMessage: blocked, sendTransaction: blocked } });
+    const workflow = await prepareLimitOrder(client, { assetId: "123", side: "BUY", price: "0.50", size: "10" });
+    const step = await workflow.next();
+    const typedData = JSON.parse(JSON.stringify(step.value.payload, (_key, value) => typeof value === "bigint" ? value.toString() : value));
+    const signature = await account.signTypedData(step.value.payload);
+    const result = await workflow.next(signature);
+    if (!result.done) throw new Error("SDK reference did not finish unsigned preparation");
+    return { typedData, signature, sdkSignature: result.value.signature };
+  } finally { globalThis.fetch = originalFetch; }
+}
+async function fixtureAuth(args) {
+  if (args.walletType === "DEPOSIT_WALLET" && args.makerAddress === "0x0000000000000000000000000000000000000002") args.makerAddress = await fixtureWallet(args.signingAddress);
+  if (args.clobAuth) return;
+  const signer = accounts.get((args.signingAddress ?? args.signerAddress ?? "").toLowerCase()) ?? fixtureSigner;
+  const timestamp = "1800000000";
+  const nonce = "0";
+  const signature = await signer.signTypedData({ domain: { name: "ClobAuthDomain", version: "1", chainId: 137 },
+    types: { ClobAuth: [{ name: "address", type: "address" }, { name: "timestamp", type: "string" }, { name: "nonce", type: "uint256" }, { name: "message", type: "string" }] }, primaryType: "ClobAuth",
+    message: { address: signer.address, timestamp, nonce: 0n, message: "This message attests that I control the given wallet" } });
+  args.clobAuth = { timestamp, nonce, signature };
+  authFixtures.set(signer.address.toLowerCase(), args.clobAuth);
+}
+function validateSample(tool, args, result) {
+  if (["prepare_order_signing", "prepare_redeem"].includes(tool.name) && !args.clobAuth) args.clobAuth = authFixtures.get((args.signingAddress ?? fixtureSigner.address).toLowerCase());
+  return validateSchemaSample(tool, args, result);
+}
 
 export { ConformanceError, reportConformance };
 const PROTOCOL_VERSION = release.protocolVersion;
@@ -74,39 +138,7 @@ export async function testArtifact(root = process.cwd()) {
   checks.push({ tool: "get_quote", status: "passed", availability: quoteResult.structuredContent.availability, freshness: quoteResult.structuredContent.freshness, bookTimestamp: quoteResult.structuredContent.bookTimestamp, bookAgeMs: quoteResult.structuredContent.bookAgeMs });
   const prepareTool = tools.find((entry) => entry.name === "prepare_order_signing");
   if (!prepareTool) fail("prepare_order_signing was not returned by tools/list", "tool_catalog_invalid");
-  const bookAgeMs = quoteResult.structuredContent.bookAgeMs;
-  if (!Number.isSafeInteger(bookAgeMs) || bookAgeMs < 0) {
-    checks.push({ tool: "prepare_order_signing", status: "skipped", reason: "live CLOB book age is unavailable or invalid; deterministic payload preparation is covered by pnpm test" });
-  } else {
-    const minimumShareMicros = toMicros(quoteResult.structuredContent.minOrderSize);
-    const hundredthShares = (minimumShareMicros + 9_999n) / 10_000n;
-    const signingSize = formatHundredths(hundredthShares);
-    const prepareArguments = {
-      marketId: market.marketId,
-      assetId: outcome.assetId,
-      makerAddress: "0x0000000000000000000000000000000000000001",
-      signingAddress: "0x0000000000000000000000000000000000000001",
-      walletType: "EOA",
-      side: "BUY",
-      priceLimit: formatMicros(1_000_000n - toMicros(quoteResult.structuredContent.tickSize)),
-      size: signingSize,
-      maxNominalPusd: "999999999999999999999999999",
-    };
-    const preparedResponse = await runOperation(artifact, {
-      method: "tools/call", params: { name: prepareTool.name, arguments: prepareArguments },
-    });
-    validateCallResult(preparedResponse.result);
-    if (preparedResponse.result.isError === true) fail("prepare_order_signing returned an unexpected MCP error", "tool_failed");
-    validateSample(prepareTool, prepareArguments, preparedResponse.result);
-    const prepared = preparedResponse.result.structuredContent;
-    if (prepared.status === "REJECTED") fail(`preparation rejected: ${prepared.errorCode}`, "tool_failed");
-    else {
-      if (prepared.submitsOrder !== false || prepared.preparedOrder?.market?.outcome !== outcome.name) {
-        fail("prepared payload did not preserve the selected outcome or no-submit boundary", "result_invalid");
-      }
-      checks.push({ tool: "prepare_order_signing", status: "passed", submitsOrder: false });
-    }
-  }
+  checks.push({ tool: "prepare_order_signing", status: "not_run", reason: "SDK preparation requires signed ClobAuth; live signing is outside local conformance. Fixture coverage runs in pnpm test." });
   return {
     status: "passed",
     sampleCall: checks[0],
@@ -191,7 +223,7 @@ async function testTextOnlyOrderWorkflow(artifact) {
   const auth = { timestamp: clobAuth.timestamp, nonce: clobAuth.nonce, signature: clobAuthSignature };
   const prepared = await callTextOnlyTool(artifact, "prepare_order_signing", {
     marketId: market.marketId, assetId: outcome.assetId,
-    makerAddress: signer.address, signingAddress: signer.address,
+    makerAddress: signer.address, signingAddress: signer.address, clobAuth: auth,
     walletType: "EOA", side: "BUY", priceLimit: "0.50", size: "10", maxNominalPusd: "5.13",
   }, { fixtures: true });
   if (prepared.status !== "PREPARED" || prepared.preparedOrder.order.orderType !== "FAK"
@@ -215,7 +247,7 @@ async function testTextOnlyOrderWorkflow(artifact) {
 
   const fokPrepared = await callTextOnlyTool(artifact, "prepare_order_signing", {
     marketId: market.marketId, assetId: outcome.assetId,
-    makerAddress: signer.address, signingAddress: signer.address,
+    makerAddress: signer.address, signingAddress: signer.address, clobAuth: auth,
     walletType: "EOA", side: "BUY", orderType: "FOK", priceLimit: "0.50", size: "10", maxNominalPusd: "5.13",
   }, { fixtures: true });
   const fokSignature = await signer.signTypedData(fokPrepared.requestWalletSignIntent.typedData);
@@ -230,6 +262,8 @@ async function testTextOnlyOrderWorkflow(artifact) {
 export async function testOfflineArtifact(root = process.cwd()) {
   const artifact = resolve(root, "dist/plugin.mjs");
   const tools = await listTools(artifact);
+  const discovered = await runOperation(artifact, { method: "tools/list", params: {} }, { fixtures: true, fixtureScenario: "discovery-no-network" });
+  if (discovered.result.tools.length !== tools.length) fail("fixture discovery changed the catalog", "tool_catalog_invalid");
   textOnlyToolCoverage.clear();
   if (tools.length !== 16) fail(`expected 16 MCP tools, received ${tools.length}`, "tool_catalog_invalid");
   const removedSchemaFields = ["ExecutionApproval", "executionApprovalSignature", "executionApprovalSigningIntent", "marketRestricted", "accountGeoblockChecked"];
@@ -259,8 +293,8 @@ export async function testOfflineArtifact(root = process.cwd()) {
   }
   const base = {
     marketId: "1", assetId: "123",
-    makerAddress: "0x0000000000000000000000000000000000000001",
-    signingAddress: "0x0000000000000000000000000000000000000001",
+    makerAddress: fixtureSigner.address,
+    signingAddress: fixtureSigner.address,
     walletType: "EOA", size: "10", maxNominalPusd: "5.13",
   };
   const buy = await callTool(artifact, prepareTool, { ...base, side: "BUY", priceLimit: "0.50" }, { fixtures: true });
@@ -347,18 +381,7 @@ export async function testOfflineArtifact(root = process.cwd()) {
     || authIntent.typedData.primaryType !== "ClobAuth" || !authIntent.typedData.domain || !authIntent.typedData.types || !authIntent.typedData.message) {
     fail("ClobAuth signing intent did not match PayBox's documented EIP-712 object contract", "wallet_intent_invalid");
   }
-  if (clobAuthResult.structuredContent.timestamp !== "1800000000") {
-    fail("ClobAuth did not use the CLOB server timestamp", "clob_auth_time_invalid");
-  }
-  for (const [fixtureScenario, expectedCode] of [["time-unavailable", "PS_CLOB_TIME_UNAVAILABLE"], ["time-invalid", "PS_CLOB_TIME_INVALID"]]) {
-    const timeFailure = await runOperation(artifact, {
-      method: "tools/call", params: { name: clobAuthTool.name, arguments: { signerAddress: replaySigner.address, nonce: "0" } },
-    }, { fixtures: true, fixtureScenario });
-    const timeFailureText = JSON.stringify(timeFailure.result);
-    if (timeFailure.result?.isError !== true || !timeFailureText.includes(expectedCode) || timeFailureText.includes("SECRET_SENTINEL")) {
-      fail(`${fixtureScenario} did not fail closed with a sanitized server-time error`, "clob_auth_time_invalid");
-    }
-  }
+  if (Math.abs(Number(clobAuthResult.structuredContent.timestamp) * 1000 - Date.now()) > 5000) fail("SDK ClobAuth timestamp is not current", "clob_auth_time_invalid");
   const clobAuth = {
     timestamp: clobAuthResult.structuredContent.timestamp,
     nonce: clobAuthResult.structuredContent.nonce,
@@ -377,6 +400,19 @@ export async function testOfflineArtifact(root = process.cwd()) {
   });
   if (successfulSubmit.structuredContent.status !== "SUBMITTED" || !successfulSubmit.structuredContent.orderId) {
     fail("a valid signed FAK order without ExecutionApproval did not reach one intercepted CLOB POST", "submit_invalid");
+  }
+  for (const orderType of ["FAK", "FOK"]) {
+    const exact = await callTool(artifact, prepareTool, { ...base, makerAddress: replaySigner.address, signingAddress: replaySigner.address,
+      clobAuth, side: "BUY", priceLimit: "0.50", size: "5", maxNominalPusd: "2.57", orderType }, { fixtures: true });
+    const prepared = exact.structuredContent.preparedOrder;
+    if (prepared.order.size !== "5" || prepared.order.takerAmount !== "5000000" || prepared.order.makerAmount !== "2500000"
+      || prepared.order.maxNominalPusd !== "2.57" || prepared.wallet.signatureType !== 0) fail("SDK changed the exact five-share intent", "order_policy_invalid");
+    const submitted = await callTool(artifact, submitOrderTool, { preparedOrder: prepared, orderType, clobAuth,
+      orderSignature: await replaySigner.signTypedData(prepared.typedData) }, { fixtures: true, fixtureScenario: `submit-exact-five-${orderType.toLowerCase()}`, expectedSignerAddress: replaySigner.address });
+    if (submitted.structuredContent.status !== "SUBMITTED" || submitted.structuredContent.requestedSize !== "5" || submitted.structuredContent.orderType !== orderType) fail("exact five-share SDK submission failed", "order_policy_invalid");
+    const rejected = await callTool(artifact, prepareTool, { ...base, makerAddress: replaySigner.address, signingAddress: replaySigner.address,
+      clobAuth, side: "BUY", priceLimit: "0.50", size: "5", maxNominalPusd: "2.56", orderType }, { fixtures: true });
+    if (rejected.structuredContent.status !== "REJECTED" || rejected.structuredContent.errorCode !== "PS_SPENDING_CAP" || "preparedOrder" in rejected.structuredContent) fail("fee cap caused a silent BUY resize", "order_policy_invalid");
   }
   const l1RejectedSubmit = await callTool(artifact, submitTool, submitArgs, {
     fixtures: true, fixtureScenario: "submit-rejected-l1-auth", expectedSignerAddress: replaySigner.address,
@@ -417,7 +453,7 @@ export async function testOfflineArtifact(root = process.cwd()) {
   }, { fixtures: true });
   const depositPrepared = depositOrder.structuredContent.preparedOrder;
   if (depositPrepared.wallet.signatureType !== 3
-    || depositPrepared.wallet.makerAddress !== "0x0000000000000000000000000000000000000002"
+    || depositPrepared.wallet.makerAddress.toLowerCase() !== (await fixtureWallet(depositSigner.address)).toLowerCase()
     || depositPrepared.wallet.signingAddress.toLowerCase() !== depositSigner.address.toLowerCase()
     || depositPrepared.wallet.orderSignerAddress.toLowerCase() !== depositPrepared.wallet.makerAddress.toLowerCase()) {
     fail("Deposit Wallet owner EOA, maker, order signer, and signature type were not kept distinct and consistent", "deposit_wallet_identity_invalid");
@@ -431,6 +467,12 @@ export async function testOfflineArtifact(root = process.cwd()) {
     || (depositValidation.structuredContent.signedOrderSignature?.length ?? 0) <= depositOrderSignature.length) {
     fail("Deposit Wallet signer recovery or ERC-7739 wrapping was not reported distinctly from CLOB contract acceptance", "deposit_wallet_signature_invalid");
   }
+  const reference = await sdkReferenceOrder(depositSigner, depositPrepared.wallet.makerAddress);
+  const referenceMessage = reference.typedData.message.contents;
+  const referencePrepared = { ...depositPrepared, typedData: reference.typedData,
+    order: { ...depositPrepared.order, salt: referenceMessage.salt, timestamp: referenceMessage.timestamp } };
+  const referenceValidation = await callTool(artifact, validateOrderTool, { preparedOrder: referencePrepared, signature: reference.signature }, { fixtures: true });
+  if (referenceValidation.structuredContent.signedOrderSignature !== reference.sdkSignature) fail("stateless Deposit Wallet finalizer differs from official SDK output", "deposit_wallet_signature_invalid");
   const depositAuthResult = await callTool(artifact, clobAuthTool, { signerAddress: depositSigner.address, nonce: "0" }, { fixtures: true });
   const depositClobAuth = {
     timestamp: depositAuthResult.structuredContent.timestamp,
@@ -543,6 +585,9 @@ export async function testOfflineArtifact(root = process.cwd()) {
     || foundOrder.structuredContent.remainingSize !== "8" || foundOrder.structuredContent.httpStatus !== 200) {
     fail("authenticated order record was not returned with its actual fill data", "clob_order_record_invalid");
   }
+  const createdRead = await callTool(artifact, statusTool, { orderId: statusOrderId, requestedSize: "10", signerAddress: replaySigner.address, clobAuth },
+    { fixtures: true, fixtureScenario: "order-status-created", expectedSignerAddress: replaySigner.address });
+  if (createdRead.structuredContent.httpStatus !== 201) fail("SDK result reported an unobserved success HTTP status", "clob_order_record_invalid");
   const partialFakRemainder = await callTool(artifact, statusTool, {
     orderId: statusOrderId, requestedSize: "10", signerAddress: replaySigner.address, clobAuth,
   }, { fixtures: true, fixtureScenario: "order-status-fak-partial", expectedSignerAddress: replaySigner.address });
@@ -685,9 +730,9 @@ export async function testOfflineArtifact(root = process.cwd()) {
   }, { fixtures: true });
   const depositTypedData = deposit.structuredContent.preparedOrder.typedData;
   if (depositTypedData.primaryType !== "TypedDataSign"
-    || depositTypedData.message.verifyingContract !== "0x0000000000000000000000000000000000000002"
+    || depositTypedData.message.verifyingContract.toLowerCase() !== (await fixtureWallet(fixtureSigner.address)).toLowerCase()
     || depositTypedData.message.contents.signatureType !== 3
-    || deposit.structuredContent.preparedOrder.wallet.orderSignerAddress !== "0x0000000000000000000000000000000000000002") {
+    || deposit.structuredContent.preparedOrder.wallet.orderSignerAddress.toLowerCase() !== (await fixtureWallet(fixtureSigner.address)).toLowerCase()) {
     fail("Deposit Wallet order payload did not use the documented ERC-7739 TypedDataSign shape", "deposit_wallet_payload_invalid");
   }
   const stalePrepare = await callTool(artifact, prepareTool, { ...base, side: "BUY", priceLimit: "0.50" }, {
@@ -1375,126 +1420,42 @@ export async function testOfflineArtifact(root = process.cwd()) {
   if (readinessTool.annotations?.readOnlyHint !== true || redeemTool.annotations?.readOnlyHint !== true) {
     fail("trading readiness and redemption preview must remain read-only", "tool_catalog_invalid");
   }
-  const accountWallet = "0x0000000000000000000000000000000000000001";
-  const otherWallet = "0x0000000000000000000000000000000000000002";
-  if (!readinessTool.inputSchema.properties.marketId || readinessTool.inputSchema.required?.includes("marketId")
-    || readinessTool.inputSchema.required?.includes("side")
-    || readinessTool.inputSchema.properties.side?.enum?.join(",") !== "BUY,SELL") {
-    fail("readiness did not expose optional market and side context", "trading_readiness_invalid");
-  }
-  const readiness = await callTool(artifact, readinessTool, { walletAddress: accountWallet, walletType: "EOA" }, { fixtures: true, fixtureScenario: "readiness-no-context" });
-  if (readiness.structuredContent.wallet.address.toLowerCase() !== accountWallet.toLowerCase()
-    || readiness.structuredContent.wallet.addressRole !== "ACCOUNT_WALLET"
-    || readiness.structuredContent.pUsdBalance.baseUnits !== "8500000"
-    || readiness.structuredContent.polBalance !== null
-    || readiness.structuredContent.approval.status !== "UNKNOWN"
-    || readiness.structuredContent.status !== "UNKNOWN"
-    || readiness.structuredContent.eoaTradingEligibility !== "UNKNOWN"
-    || !readiness.structuredContent.reason.includes("marketId and side")) {
-    fail("readiness did not keep unspecified approval checks UNKNOWN or preserve exact wallet scope", "trading_readiness_invalid");
-  }
-  const readinessBuy = await callTool(artifact, readinessTool, {
-    walletAddress: accountWallet, walletType: "EOA", marketId: "1", side: "BUY",
-  }, { fixtures: true, fixtureScenario: "readiness-buy" });
-  if (readinessBuy.structuredContent.status !== "UNKNOWN"
-    || readinessBuy.structuredContent.approval.kind !== "PUSD_ALLOWANCE"
-    || readinessBuy.structuredContent.approval.target.toLowerCase() !== "0xe111180000d2663c0091e4f400237545b87b996b"
-    || readinessBuy.structuredContent.approval.status !== "PRESENT"
-    || readinessBuy.structuredContent.polBalance !== null) {
-    fail("standard-market BUY readiness did not check only its exchange allowance and retain unknown EOA eligibility", "trading_readiness_invalid");
-  }
-  const negRiskReadiness = await callTool(artifact, readinessTool, {
-    walletAddress: accountWallet, walletType: "SAFE", marketId: "1", side: "BUY",
-  }, { fixtures: true, fixtureScenario: "readiness-neg-risk" });
-  if (negRiskReadiness.structuredContent.approval.target.toLowerCase() !== "0xe2222d279d744050d28e00520010520000310f59"
-    || negRiskReadiness.structuredContent.eoaTradingEligibility !== "NOT_APPLICABLE") {
-    fail("negative-risk BUY readiness did not select its market exchange", "trading_readiness_invalid");
-  }
-  const v2Readiness = await callTool(artifact, readinessTool, {
-    walletAddress: accountWallet, walletType: "PROXY", marketId: "1", side: "BUY",
-  }, { fixtures: true, fixtureScenario: "readiness-v2" });
-  if (v2Readiness.structuredContent.approval.target.toLowerCase() !== "0xe3333700ca9d93003f00f0f71f8515005f6c00aa") {
-    fail("V2 BUY readiness did not select Exchange V3", "trading_readiness_invalid");
-  }
-  const missingApproval = await callTool(artifact, readinessTool, {
-    walletAddress: accountWallet, walletType: "EOA", marketId: "1", side: "SELL",
-  }, { fixtures: true, fixtureScenario: "readiness-sell-missing" });
-  if (missingApproval.structuredContent.status !== "ACTION_REQUIRED"
-    || missingApproval.structuredContent.approval.kind !== "ERC1155_OPERATOR"
-    || missingApproval.structuredContent.approval.target.toLowerCase() !== "0xe111180000d2663c0091e4f400237545b87b996b"
-    || missingApproval.structuredContent.approval.status !== "MISSING"
-    || missingApproval.structuredContent.polBalance.status !== "NONZERO"
-    || !missingApproval.structuredContent.nextAction?.includes("EXTERNAL_ACTION_REQUIRED")) {
-    fail("SELL readiness did not report its one missing operator approval and required EOA gas read", "trading_readiness_invalid");
-  }
-  const emptyReadiness = await callTool(artifact, readinessTool, { walletAddress: accountWallet, walletType: "EOA" }, { fixtures: true, fixtureScenario: "readiness-empty" });
-  if (emptyReadiness.structuredContent.pUsdBalance.status !== "ZERO" || emptyReadiness.structuredContent.polBalance !== null
-    || emptyReadiness.structuredContent.status !== "UNKNOWN") {
-    fail("readiness treated zero pUSD without an intended operation as a complete blocker or queried POL without an action", "trading_readiness_invalid");
-  }
-  const unavailableReadiness = await callTool(artifact, readinessTool, { walletAddress: accountWallet, walletType: "EOA" }, { fixtures: true, fixtureScenario: "chain-read-unavailable" });
-  if (unavailableReadiness.structuredContent.status !== "UNKNOWN"
-    || unavailableReadiness.structuredContent.pUsdBalance.status !== "UNKNOWN"
-    || unavailableReadiness.structuredContent.polBalance !== null
-    || unavailableReadiness.structuredContent.eoaTradingEligibility !== "UNKNOWN") {
-    fail("unavailable chain reads or allowlist eligibility were treated as approval", "trading_readiness_invalid");
-  }
+  const accountWallet = fixtureSigner.address;
   const conditionId = `0x${"1".repeat(64)}`;
-  const redeemArgs = { walletAddress: accountWallet, walletType: "EOA", conditionId };
-  const unresolvedRedeem = await callTool(artifact, redeemTool, redeemArgs, { fixtures: true, fixtureScenario: "redeem-unresolved" });
-  if (unresolvedRedeem.structuredContent.status !== "UNRESOLVED" || unresolvedRedeem.structuredContent.resolution !== "UNRESOLVED"
-    || unresolvedRedeem.structuredContent.transactionPreview.length !== 0) {
-    fail("an unresolved market was offered for redemption", "redemption_preview_invalid");
+  for (const scenario of ["readiness-no-context", "readiness-buy", "readiness-neg-risk", "readiness-v2", "readiness-sdkEmpty"]) {
+    const result = await callTool(artifact, readinessTool, { walletAddress: accountWallet, walletType: "EOA", marketId: "1", side: "BUY" }, { fixtures: true, fixtureScenario: scenario });
+    if (result.structuredContent.status !== "UNKNOWN" || result.structuredContent.approval.status !== "PRESENT"
+      || result.structuredContent.pUsdBalance.status !== "UNKNOWN" || result.structuredContent.polBalance !== null
+      || result.structuredContent.approval.target !== null || result.structuredContent.eoaTradingEligibility !== "UNKNOWN") {
+      fail("SDK approval summary claimed funding, per-market routing, or EOA eligibility", "trading_readiness_invalid");
+    }
   }
-  const wrongOwnerRedeem = await callTool(artifact, redeemTool, { ...redeemArgs, walletAddress: otherWallet }, { fixtures: true, fixtureScenario: "redeem-wrong-owner" });
-  if (wrongOwnerRedeem.structuredContent.status !== "NO_POSITION"
-    || wrongOwnerRedeem.structuredContent.wallet.address.toLowerCase() !== otherWallet.toLowerCase()
-    || wrongOwnerRedeem.structuredContent.positions.some((position) => position.ownership !== "NOT_HELD")
-    || wrongOwnerRedeem.structuredContent.transactionPreview.length !== 0) {
-    fail("redemption did not use the explicit position-owning wallet address", "redemption_preview_invalid");
-  }
-  const insufficientPosition = await callTool(artifact, redeemTool, redeemArgs, { fixtures: true, fixtureScenario: "redeem-insufficient-balance" });
-  if (insufficientPosition.structuredContent.status !== "NO_POSITION" || insufficientPosition.structuredContent.transactionPreview.length !== 0) {
-    fail("zero on-chain outcome-token balances produced a redemption preview", "redemption_preview_invalid");
-  }
-  const preparedRedeem = await callTool(artifact, redeemTool, redeemArgs, { fixtures: true, fixtureScenario: "redeem-resolved" });
-  const ctfPreview = preparedRedeem.structuredContent.transactionPreview[0];
-  const decodedCtfPreview = ctfPreview ? decodeFunctionData({ abi: ctfRedeemAbi, data: ctfPreview.data }) : null;
-  if (preparedRedeem.structuredContent.status !== "PREPARED" || preparedRedeem.structuredContent.execution !== "EXTERNAL_ACTION_REQUIRED"
-    || preparedRedeem.structuredContent.positionLedger !== "Conditional Tokens"
-    || ctfPreview?.to !== "0xAdA100Db00Ca00073811820692005400218FcE1f"
-    || decodedCtfPreview?.functionName !== "redeemPositions"
-    || decodedCtfPreview.args[0].toLowerCase() !== "0xc011a7e12a19f7b1f670d46f03b03f3342e82dfb"
-    || decodedCtfPreview.args[2].toLowerCase() !== conditionId.toLowerCase()
-    || decodedCtfPreview.args[3].length !== 2) {
-    fail("standard CTF redemption did not return the official read-only adapter transaction preview", "redemption_preview_invalid");
-  }
-  const missingRedeemApproval = await callTool(artifact, redeemTool, redeemArgs, { fixtures: true, fixtureScenario: "redeem-missing-approval" });
-  if (missingRedeemApproval.structuredContent.routeApproval?.status !== "MISSING"
-    || missingRedeemApproval.structuredContent.transactionPreview.length !== 1
-    || missingRedeemApproval.structuredContent.execution !== "EXTERNAL_ACTION_REQUIRED") {
-    fail("missing redemption approval was not reported as an external action requirement", "redemption_preview_invalid");
-  }
-  const negRiskRedeem = await callTool(artifact, redeemTool, redeemArgs, { fixtures: true, fixtureScenario: "redeem-negative-risk" });
-  if (negRiskRedeem.structuredContent.market.negRisk !== true
-    || negRiskRedeem.structuredContent.positionLedger !== "NegRisk Adapter"
-    || negRiskRedeem.structuredContent.routeApproval?.tokenLedger !== "Conditional Tokens"
-    || negRiskRedeem.structuredContent.transactionPreview[0]?.to !== "0xadA2005600Dec949baf300f4C6120000bDB6eAab") {
-    fail("negative-risk redemption did not separate its position ledger from the approved collateral adapter", "redemption_preview_invalid");
-  }
-  const v2ConditionId = `0x01${"11".repeat(30)}00`;
-  const v2Redeem = await callTool(artifact, redeemTool, { ...redeemArgs, conditionId: v2ConditionId }, { fixtures: true, fixtureScenario: "redeem-v2-resolved" });
-  const v2Preview = v2Redeem.structuredContent.transactionPreview[0];
-  const decodedV2Preview = v2Preview ? decodeFunctionData({ abi: v2RedeemAbi, data: v2Preview.data }) : null;
-  if (v2Redeem.structuredContent.status !== "PREPARED" || v2Redeem.structuredContent.positionLedger !== "PositionManager"
-    || v2Preview?.to !== "0x12121212006e4CD160D18e3f00711DA5c3372600"
-    || decodedV2Preview?.functionName !== "redeem" || decodedV2Preview.args[1] !== 0n
-    || decodedV2Preview.args[2] !== 10_000_000n) {
-    fail("Polymarket V2 redemption did not select the Router or use the actual outcome balance", "redemption_preview_invalid");
-  }
-  const unresolvedV2Redeem = await callTool(artifact, redeemTool, { ...redeemArgs, conditionId: v2ConditionId }, { fixtures: true, fixtureScenario: "redeem-v2-unresolved" });
-  if (unresolvedV2Redeem.structuredContent.status !== "UNRESOLVED" || unresolvedV2Redeem.structuredContent.transactionPreview.length !== 0) {
-    fail("unresolved V2 position was offered for redemption", "redemption_preview_invalid");
+  const sdkMissing = await callTool(artifact, readinessTool, { walletAddress: accountWallet, walletType: "EOA" }, { fixtures: true, fixtureScenario: "readiness-sell-missing" });
+  if (sdkMissing.structuredContent.status !== "ACTION_REQUIRED" || sdkMissing.structuredContent.approval.status !== "MISSING") fail("SDK sdkMissing approvals were not reported", "trading_readiness_invalid");
+  const sdkUnavailable = await callTool(artifact, readinessTool, { walletAddress: accountWallet, walletType: "EOA" }, { fixtures: true, fixtureScenario: "chain-read-unavailable" });
+  if (sdkUnavailable.structuredContent.approval.status !== "UNKNOWN") fail("sdkUnavailable SDK approvals were treated as present", "trading_readiness_invalid");
+  const redeemArgs = { walletAddress: accountWallet, signingAddress: accountWallet, walletType: "EOA", conditionId };
+  const sdkUnresolved = await callTool(artifact, redeemTool, redeemArgs, { fixtures: true, fixtureScenario: "redeem-unresolved" });
+  if (sdkUnresolved.structuredContent.status !== "UNRESOLVED" || sdkUnresolved.structuredContent.transactionPreview.length) fail("nonredeemable indexed positions produced a preview", "redemption_preview_invalid");
+  const sdkWrongOwner = await callTool(artifact, redeemTool, { ...redeemArgs, walletAddress: "0x0000000000000000000000000000000000000002" }, { fixtures: true, fixtureScenario: "redeem-wrong-owner" });
+  if (sdkWrongOwner.structuredContent.transactionPreview.length || sdkWrongOwner.structuredContent.status !== "UNKNOWN") fail("redemption accepted a wallet not bound to the SDK account", "redemption_preview_invalid");
+  const sdkEmpty = await callTool(artifact, redeemTool, redeemArgs, { fixtures: true, fixtureScenario: "redeem-insufficient-balance" });
+  if (sdkEmpty.structuredContent.status !== "NO_POSITION" || sdkEmpty.structuredContent.transactionPreview.length) fail("sdkMissing indexed positions produced a preview", "redemption_preview_invalid");
+  const gaslessPreview = await callTool(artifact, redeemTool, { ...redeemArgs, walletAddress: await fixtureWallet(fixtureSigner.address), walletType: "DEPOSIT_WALLET" },
+    { fixtures: true, fixtureScenario: "redeem-gasless" });
+  if (gaslessPreview.structuredContent.status !== "UNSUPPORTED" || gaslessPreview.structuredContent.execution !== "EXTERNAL_ACTION_REQUIRED" || gaslessPreview.structuredContent.transactionPreview.length) fail("gasless redemption invented direct-call or relayer support", "redemption_preview_invalid");
+  const wrongRedeemAsset = await callTool(artifact, redeemTool, redeemArgs, { fixtures: true, fixtureScenario: "redeem-wrong-asset" });
+  if (wrongRedeemAsset.structuredContent.status !== "UNKNOWN" || wrongRedeemAsset.structuredContent.transactionPreview.length) fail("redemption accepted a position asset outside SDK market outcomes", "redemption_preview_invalid");
+  for (const scenario of ["redeem-resolved", "redeem-negative-risk", "redeem-missing-approval", "redeem-v2-resolved", "redeem-v2-both"]) {
+    const v2 = scenario.startsWith("redeem-v2");
+    const result = await callTool(artifact, redeemTool, { ...redeemArgs, conditionId: v2 ? `0x01${"11".repeat(30)}00` : conditionId }, { fixtures: true, fixtureScenario: scenario });
+    const preview = result.structuredContent.transactionPreview;
+    const expectedCount = scenario === "redeem-v2-both" ? 2 : 1;
+    if (result.structuredContent.status !== "PREPARED" || preview.length !== expectedCount || result.structuredContent.execution !== "EXTERNAL_ACTION_REQUIRED"
+      || result.structuredContent.routeApproval !== null || "io.paybox/transactionProposal" in result.structuredContent) fail(`${scenario}: SDK unsigned preview or unsupported PayBox boundary changed`, "redemption_preview_invalid");
+    const decoded = decodeFunctionData({ abi: v2 ? v2RedeemAbi : ctfRedeemAbi, data: preview[0].data });
+    if (decoded.functionName !== (v2 ? "redeem" : "redeemPositions")) fail("SDK redemption call has the wrong route ABI", "redemption_preview_invalid");
+    if (v2 && decoded.args[2] !== 10_000_000n) fail("SDK redemption changed the actual position amount", "redemption_preview_invalid");
   }
   const toolNames = new Set(tools.map((tool) => tool.name));
   const textOnlyUncovered = [...toolNames].filter((name) => !textOnlyToolCoverage.has(name));
@@ -1505,6 +1466,9 @@ export async function testOfflineArtifact(root = process.cwd()) {
   return {
     status: "passed",
     deterministicCases: [
+      "official SDK exact five-share FAK/FOK submission, no BUY resize, fee-inclusive cap rejection",
+      "Deposit Wallet stateless finalizer matches the official SDK byte-for-byte",
+      "discovery makes no network calls; successful order-read HTTP status is observed, not inferred",
       "BUY FAK preserves exact signed limit, size, precision, and fee-inclusive cap", "lack of visible liquidity does not block bounded FAK preparation", "no ExecutionApproval signature is required", "signed order is accepted for exactly one intercepted CLOB POST", "undocumented 300-second ClobAuth cutoff removed", "undocumented order-timestamp freshness cutoff removed", "SELL FAK preserves exact signed minimum price and size", "market fee descriptor and exact fee calculation",
       "EOA Type 0 FAK BUY remains compatible through submit_fak_order", "EOA Type 0 FOK SELL reaches one POST with its exact prepared type and amounts", "Deposit Wallet Type 3 FAK BUY uses the shared submit_order handler", "Deposit Wallet Type 3 FOK BUY preserves ERC-7739 wrapping and FOK", "insufficient visible depth does not locally reject FOK; the CLOB's rejection remains FOK", "mismatched legacy FAK submission rejects a prepared FOK without a POST", "ambiguous FOK outcome remains UNKNOWN after one POST and one read-only reconciliation", "FAK partial fill and CLOB-canceled remainder are reflected by status read-back", "FOK full fill is reflected by authoritative status read-back",
       "reject invalid Polymarket order signature", "reject real provider geoblock", "missing CLOB credentials handled", "Deposit Wallet TypedDataSign preparation", "local smart-wallet signer recovery is distinct from deferred CLOB acceptance", "Deposit Wallet ERC-7739 order reaches exactly one intercepted CLOB POST without Polygon RPC",
@@ -1523,8 +1487,8 @@ export async function testOfflineArtifact(root = process.cwd()) {
       "fallback fixture ambiguity, kickoff conflicts, missing statistics, and source provenance",
       "host-attested identity evidence and exact market mapping consistency required for fallback probability/edge; source URLs are not fetched",
       "official v2 OPEN portfolio includes REDEEMABLE positions and preserves cursor pagination", "public portfolio address is not wallet proof", "16-tool catalog with one shared FAK/FOK submit tool",
-      "trading readiness checks pUSD and only the selected market/side approval route for standard, negative-risk, and V2 markets; no-context approvals remain UNKNOWN and POL is read only for a missing EOA approval action",
-      "redemption requires on-chain resolution and actual position-owner balances", "standard and negative-risk CTF redemption previews use their official adapters", "Polymarket V2 redemption previews use the Router and exact on-chain outcome balance", "read-only tools never sign or broadcast redemption transactions",
+      "official SDK indexed trading approval state; funding, gas, per-order readiness and eligibility stay UNKNOWN; no RPC scanner or approval writes",
+      "redemption requires exact SDK owner/condition identity and indexed redeemability; indexed state is not fresh chain finality", "standard and negative-risk CTF redemption previews use their official adapters", "SDK V2 redemption previews retain each held outcome and exact chain-read amount without signing or broadcasting", "read-only tools never sign or broadcast redemption transactions",
       "ClobAuth and Order intents match PayBox's documented typedData object contract",
     ],
   };
@@ -1618,6 +1582,7 @@ function validateCallResult(value) {
 }
 
 export async function runOperation(artifact, operation, { fixtures = false, fixtureScenario, expectedSignerAddress, expectedMakerAddress } = {}) {
+  if (fixtures && operation.method === "tools/call" && ["prepare_order_signing", "prepare_redeem"].includes(operation.params.name)) await fixtureAuth(operation.params.arguments);
   const home = await mkdtemp(resolve(tmpdir(), "paybox-plugin-conformance-"));
   try {
     const args = fixtures ? ["--import", resolve(dirname(artifact), "../tests/network-fixtures.mjs"), artifact] : [artifact];
