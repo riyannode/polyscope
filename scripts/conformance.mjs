@@ -126,7 +126,7 @@ async function callTool(artifact, tool, argumentsValue, options = {}) {
 export async function testOfflineArtifact(root = process.cwd()) {
   const artifact = resolve(root, "dist/plugin.mjs");
   const tools = await listTools(artifact);
-  if (tools.length !== 12) fail(`expected 12 MCP tools, received ${tools.length}`, "tool_catalog_invalid");
+  if (tools.length !== 13) fail(`expected 13 MCP tools, received ${tools.length}`, "tool_catalog_invalid");
   const removedSchemaFields = ["ExecutionApproval", "executionApprovalSignature", "executionApprovalSigningIntent", "marketRestricted", "accountGeoblockChecked"];
   for (const tool of tools) {
     const schemas = JSON.stringify({ inputSchema: tool.inputSchema, outputSchema: tool.outputSchema });
@@ -410,6 +410,8 @@ export async function testOfflineArtifact(root = process.cwd()) {
   for (const phrase of ["Form returned, xG missing", "Injury information missing", "Browser unavailable", "original URL", "manager statements", "head-to-head history"]) {
     if (!soccerSkill.includes(phrase)) fail(`soccer research skill is missing expected workflow guidance: ${phrase}`, "soccer_skill_invalid");
   }
+  const edgeTool = tools.find((tool) => tool.name === "analyze_soccer_edge");
+  if (!edgeTool) fail("analyze_soccer_edge was not returned by tools/list", "tool_catalog_invalid");
   for (const league of ["PL", "PD", "SA", "CL"]) {
     const research = await callTool(artifact, researchTool, { league, date: "2026-10-17", days: 0, limit: 3 }, { fixtures: true });
     if (research.structuredContent.availability !== "AVAILABLE" || research.structuredContent.fixtures[0]?.leagueProviderId !== league) {
@@ -434,6 +436,398 @@ export async function testOfflineArtifact(root = process.cwd()) {
     })) {
       fail(`${league} team-form requests did not use a numeric competition ID without the failing date filter`, "soccer_team_filter_invalid");
     }
+  }
+  const enriched = await callTool(artifact, researchTool, {
+    league: "PL", fixtureId: "1001", date: "2026-10-17", includeApiFootball: true,
+  }, { fixtures: true });
+  const enrichedFixture = enriched.structuredContent.fixtures[0];
+  const apiFootball = enrichedFixture?.apiFootball;
+  if (apiFootball?.availability !== "AVAILABLE" || apiFootball.matchIdentity?.providerFixtureId !== "90001"
+    || apiFootball.matchIdentity.homeTeamProviderId !== "501" || enrichedFixture.homeTeamProviderId === "501"
+    || apiFootball.homeStats?.playedAtHome !== 8 || apiFootball.awayStats?.playedAway !== 6
+    || !apiFootball.sources.some((source) => source.purpose === "TEAM_STATISTICS" && new URL(source.url).searchParams.get("date") === "2026-10-16")) {
+    fail("API-Football enrichment did not preserve independent IDs, source samples, and the pre-kickoff cutoff", "soccer_provider_invalid");
+  }
+  const quoteToolForAnalysis = tools.find((tool) => tool.name === "get_quote");
+  const analysisQuote = await callTool(artifact, quoteToolForAnalysis, { marketId: "1", assetId: "123", side: "BUY", size: "10", depth: 10 }, { fixtures: true });
+  const resolutionRules = "The market resolves to the named team winning the scheduled 90 minutes; extra time and penalties do not count.";
+  const baselineForm = await callTool(artifact, researchTool, { league: "PL", fixtureId: "1001", date: "2026-10-17" }, { fixtures: true });
+  const baselineModel = await callTool(artifact, edgeTool, {
+    fixture: baselineForm.structuredContent.fixtures[0], quote: analysisQuote.structuredContent, outcome: "HOME_WIN",
+    marketResolutionType: "REGULATION_1X2", marketResolutionRules: resolutionRules,
+  }, { fixtures: true });
+  if (baselineModel.structuredContent.probabilityStatus !== "AVAILABLE"
+    || baselineModel.structuredContent.model.inputs.statisticsProvider !== "football-data.org"
+    || baselineModel.structuredContent.model.inputs.homeMatchesAtHome !== 3
+    || baselineModel.structuredContent.model.inputs.awayMatchesAway !== 2
+    || baselineModel.structuredContent.model.sources.length !== 2) {
+    fail("independent model did not use and attribute available pre-kickoff venue form when API-Football was not requested", "soccer_edge_invalid");
+  }
+  const positiveEdge = await callTool(artifact, edgeTool, {
+    fixture: enrichedFixture, quote: analysisQuote.structuredContent, outcome: "HOME_WIN",
+    marketResolutionType: "REGULATION_1X2", marketResolutionRules: resolutionRules,
+  }, { fixtures: true });
+  const probabilities = positiveEdge.structuredContent.model;
+  if (positiveEdge.structuredContent.probabilityStatus !== "AVAILABLE"
+    || Math.abs((probabilities.homeWin + probabilities.draw + probabilities.awayWin) - 1) > 1e-12
+    || probabilities.expectedHomeGoals !== 1.675 || probabilities.expectedAwayGoals !== 0.975
+    || positiveEdge.structuredContent.edgeStatus !== "AVAILABLE"
+    || positiveEdge.structuredContent.depthWeightedExecutionPrice !== analysisQuote.structuredContent.averagePrice
+    || positiveEdge.structuredContent.effectiveBuyCostPerShare !== "0.5125") {
+    fail("independent Poisson probabilities or fee-inclusive edge did not match deterministic inputs", "soccer_edge_invalid");
+  }
+  const favorableQuote = await callTool(artifact, quoteToolForAnalysis, { marketId: "1", assetId: "123", side: "BUY", size: "10", depth: 10 }, { fixtures: true, fixtureScenario: "analysis-favorable" });
+  const positiveNetEdge = await callTool(artifact, edgeTool, {
+    fixture: enrichedFixture, quote: favorableQuote.structuredContent, outcome: "HOME_WIN",
+    marketResolutionType: "REGULATION_1X2", marketResolutionRules: resolutionRules,
+  }, { fixtures: true });
+  if (Number(positiveNetEdge.structuredContent.netEdgePerShare) <= 0) {
+    fail("positive model-based edge was not represented as a positive numeric result", "soccer_edge_invalid");
+  }
+  const multilevelQuote = await callTool(artifact, quoteToolForAnalysis, { marketId: "1", assetId: "123", side: "BUY", size: "10", depth: 10 }, { fixtures: true, fixtureScenario: "analysis-multilevel" });
+  const multilevelEdge = await callTool(artifact, edgeTool, {
+    fixture: enrichedFixture, quote: multilevelQuote.structuredContent, outcome: "HOME_WIN",
+    marketResolutionType: "REGULATION_1X2", marketResolutionRules: resolutionRules,
+  }, { fixtures: true });
+  if (multilevelQuote.structuredContent.bestAsk !== "0.5" || multilevelQuote.structuredContent.averagePrice !== "0.55"
+    || multilevelEdge.structuredContent.depthWeightedExecutionPrice !== "0.55"
+    || multilevelEdge.structuredContent.effectiveBuyCostPerShare !== "0.56225") {
+    fail("edge calculation used the best ask or midpoint instead of fee-inclusive depth-weighted execution cost", "soccer_edge_invalid");
+  }
+  const negativeEdge = await callTool(artifact, edgeTool, {
+    fixture: enrichedFixture, quote: analysisQuote.structuredContent, outcome: "AWAY_WIN",
+    marketResolutionType: "REGULATION_1X2", marketResolutionRules: resolutionRules,
+  }, { fixtures: true });
+  if (negativeEdge.structuredContent.edgeStatus !== "AVAILABLE" || Number(negativeEdge.structuredContent.netEdgePerShare) >= 0) {
+    fail("negative model-based edge was not represented as a numeric analysis result", "soccer_edge_invalid");
+  }
+  const partialQuote = await callTool(artifact, quoteToolForAnalysis, {
+    marketId: "1", assetId: "123", side: "BUY", size: "10", depth: 10,
+  }, { fixtures: true, fixtureScenario: "analysis-partial-depth" });
+  const partialEdge = await callTool(artifact, edgeTool, {
+    fixture: enrichedFixture, quote: partialQuote.structuredContent, outcome: "HOME_WIN",
+    marketResolutionType: "REGULATION_1X2", marketResolutionRules: resolutionRules,
+  }, { fixtures: true });
+  if (partialEdge.structuredContent.edgeStatus !== "AVAILABLE" || partialEdge.structuredContent.fillableShares !== "4"
+    || partialEdge.structuredContent.unfilledShares !== "6"
+    || !partialEdge.structuredContent.model.uncertainty.some((item) => item.includes("partial fill"))) {
+    fail("edge calculation did not limit expected value to visible partial FAK fillability", "soccer_edge_invalid");
+  }
+  const emptyQuote = await callTool(artifact, quoteToolForAnalysis, { marketId: "1", assetId: "123", side: "BUY", size: "10", depth: 10 }, { fixtures: true, fixtureScenario: "no-visible-liquidity" });
+  const emptyEdge = await callTool(artifact, edgeTool, {
+    fixture: enrichedFixture, quote: emptyQuote.structuredContent, outcome: "HOME_WIN",
+    marketResolutionType: "REGULATION_1X2", marketResolutionRules: resolutionRules,
+  }, { fixtures: true });
+  if (emptyEdge.structuredContent.edgeStatus !== "UNAVAILABLE" || emptyEdge.structuredContent.netEdgePerShare !== null) {
+    fail("edge calculation invented an executable price when the CLOB had no visible liquidity", "soccer_edge_invalid");
+  }
+  const sellQuote = await callTool(artifact, quoteToolForAnalysis, { marketId: "1", assetId: "123", side: "SELL", size: "10", depth: 10 }, { fixtures: true });
+  const sellEdge = await callTool(artifact, edgeTool, {
+    fixture: enrichedFixture, quote: sellQuote.structuredContent, outcome: "HOME_WIN",
+    marketResolutionType: "REGULATION_1X2", marketResolutionRules: resolutionRules,
+  }, { fixtures: true });
+  if (sellEdge.structuredContent.edgeStatus !== "UNAVAILABLE" || !sellEdge.structuredContent.edgeReason?.includes("SELL edge is not calculated")) {
+    fail("SELL edge was calculated without an existing position and sale-proceeds basis", "soccer_edge_invalid");
+  }
+  const unsupportedEdge = await callTool(artifact, edgeTool, {
+    fixture: enrichedFixture, quote: analysisQuote.structuredContent, outcome: "HOME_WIN",
+    marketResolutionType: "OTHER", marketResolutionRules: "The market resolves to qualify after possible extra time and penalties.",
+  }, { fixtures: true });
+  if (unsupportedEdge.structuredContent.edgeStatus !== "UNSUPPORTED_MARKET" || unsupportedEdge.structuredContent.netEdgePerShare !== null) {
+    fail("unsupported market resolution was assigned a misleading edge", "soccer_edge_invalid");
+  }
+  const noProvider = await callTool(artifact, researchTool, {
+    league: "PL", fixtureId: "1001", date: "2026-10-17", includeApiFootball: true,
+  }, { fixtures: true, fixtureScenario: "api-football-403" });
+  if (noProvider.structuredContent.availability !== "AVAILABLE" || noProvider.structuredContent.fixtures[0]?.apiFootball?.availability !== "UNAVAILABLE") {
+    fail("API-Football authorization failure erased football-data.org baseline evidence", "soccer_provider_invalid");
+  }
+  const fallbackIdentity = { homeTeam: "Arsenal", awayTeam: "Chelsea", kickoffUtc: "2026-10-17T19:00:00.000Z" };
+  for (const [scenario, status] of [["fallback-http-401", 401], ["fallback-http-403", 403], ["fallback-http-429", 429], ["fallback-http-503", 503]]) {
+    const fallback = await callTool(artifact, researchTool, { league: "PL", date: "2026-10-17", fixtureIdentity: fallbackIdentity }, { fixtures: true, fixtureScenario: scenario });
+    if (fallback.structuredContent.fallbackProvider?.availability !== "AVAILABLE"
+      || fallback.structuredContent.sources.find((source) => source.provider === "football-data.org")?.httpStatus !== status
+      || fallback.structuredContent.fallbackFixtures?.[0]?.providerFixtureId !== "90001") {
+      fail(`football-data.org HTTP ${status} did not preserve its diagnostic and return API-Football fallback evidence`, "soccer_fallback_invalid");
+    }
+  }
+  for (const scenario of ["fallback-invalid-json", "fallback-invalid-shape", "fallback-network", "fallback-timeout"]) {
+    const fallback = await callTool(artifact, researchTool, { league: "PL", date: "2026-10-17", fixtureIdentity: fallbackIdentity }, { fixtures: true, fixtureScenario: scenario });
+    if (fallback.structuredContent.fallbackProvider?.availability !== "AVAILABLE"
+      || fallback.structuredContent.sources.find((source) => source.provider === "football-data.org")?.availability !== "UNAVAILABLE") {
+      fail(`${scenario} did not trigger a diagnostic API-Football fallback`, "soccer_fallback_invalid");
+    }
+  }
+  const ordinarySuccess = await callTool(artifact, researchTool, { league: "PL", date: "2026-10-17" }, { fixtures: true, fixtureScenario: "no-unneeded-api" });
+  if (ordinarySuccess.structuredContent.availability !== "AVAILABLE" || ordinarySuccess.structuredContent.fallbackProvider !== undefined
+    || ordinarySuccess.structuredContent.resultProvider !== "football-data.org" || ordinarySuccess.structuredContent.provider !== "football-data.org") {
+    fail("normal football-data.org success did not remain primary-only", "soccer_fallback_invalid");
+  }
+  const startDateFallback = await callTool(artifact, researchTool, { league: "PL", date: "2026-10-17", days: 0, fixtureIdentity: fallbackIdentity },
+    { fixtures: true, fixtureScenario: "fallback-http-503" });
+  const startDateCoverage = startDateFallback.structuredContent.fallbackProvider?.coverage;
+  if (startDateFallback.structuredContent.availability !== "AVAILABLE" || startDateFallback.structuredContent.provider !== "football-data.org"
+    || startDateFallback.structuredContent.resultProvider !== "API-Football" || startDateFallback.structuredContent.coverage !== "FALLBACK_MATCHES"
+    || startDateCoverage?.requestedDateFrom !== "2026-10-17" || startDateCoverage?.requestedDateTo !== "2026-10-17"
+    || startDateCoverage?.queriedDate !== "2026-10-17" || startDateCoverage?.datesNotQueried.length !== 0 || startDateCoverage?.status !== "COMPLETE") {
+    fail("single-day API-Football fallback did not report complete date coverage and effective provider", "soccer_fallback_invalid");
+  }
+  const partialRangeFallback = await callTool(artifact, researchTool, { league: "PL", date: "2026-10-17", days: 7 },
+    { fixtures: true, fixtureScenario: "fallback-http-503" });
+  const partialRangeCoverage = partialRangeFallback.structuredContent.fallbackProvider?.coverage;
+  if (partialRangeFallback.structuredContent.availability !== "AVAILABLE" || partialRangeFallback.structuredContent.resultProvider !== "API-Football"
+    || partialRangeFallback.structuredContent.coverage !== "PARTIAL_FALLBACK_MATCHES" || partialRangeCoverage?.status !== "PARTIAL"
+    || partialRangeCoverage?.requestedDateFrom !== "2026-10-17" || partialRangeCoverage?.requestedDateTo !== "2026-10-24"
+    || partialRangeCoverage?.queriedDate !== "2026-10-17" || partialRangeCoverage?.datesNotQueried.length !== 7
+    || !partialRangeCoverage?.continuationInstruction.includes("2026-10-24")) {
+    fail("multi-day API-Football fallback implied full range coverage or omitted continuation guidance", "soccer_fallback_invalid");
+  }
+  const laterDateFixture = await callTool(artifact, researchTool, { league: "PL", date: "2026-10-17", days: 7 },
+    { fixtures: true, fixtureScenario: "fallback-later-date" });
+  const laterDateCoverage = laterDateFixture.structuredContent.fallbackProvider?.coverage;
+  if (laterDateFixture.structuredContent.fallbackFixtures?.some((fixture) => fixture.providerFixtureId === "90024")
+    || laterDateCoverage?.datesNotQueried.at(-1) !== "2026-10-24" || laterDateCoverage?.status !== "PARTIAL"
+    || !laterDateCoverage.continuationInstruction.includes("2026-10-24")) {
+    fail("later-date fixture omission was not represented as partial fallback coverage with continuation", "soccer_fallback_invalid");
+  }
+  const laterExactIdentity = { homeTeam: "Arsenal", awayTeam: "Chelsea", kickoffUtc: "2026-10-24T19:00:00.000Z" };
+  const laterExactFallback = await callTool(artifact, researchTool, { league: "PL", date: "2026-10-17", days: 7, fixtureIdentity: laterExactIdentity },
+    { fixtures: true, fixtureScenario: "fallback-later-date" });
+  if (laterExactFallback.structuredContent.fallbackFixtures?.[0]?.providerFixtureId !== "90024"
+    || laterExactFallback.structuredContent.fallbackFixtures[0]?.kickoffUtc !== laterExactIdentity.kickoffUtc
+    || laterExactFallback.structuredContent.fallbackProvider?.coverage.status !== "PARTIAL") {
+    fail("exact identity on a later in-range date was not matched while retaining partial range coverage", "soccer_fallback_invalid");
+  }
+  const outOfRangeIdentity = await runOperation(artifact, {
+    method: "tools/call", params: { name: researchTool.name, arguments: {
+      league: "PL", date: "2026-10-17", days: 7,
+      fixtureIdentity: { ...laterExactIdentity, kickoffUtc: "2026-10-25T19:00:00.000Z" },
+    } },
+  }, { fixtures: true, fixtureScenario: "fallback-range-conflict" });
+  if (outOfRangeIdentity.result?.isError !== true
+    || !JSON.stringify(outOfRangeIdentity.result.content).includes("PS_FIXTURE_IDENTITY_DATE_OUT_OF_RANGE")) {
+    fail("out-of-range fixture identity did not fail before provider research", "soccer_fallback_invalid");
+  }
+  const emptyPrimary = await callTool(artifact, researchTool, { league: "PL", date: "2026-10-17" }, { fixtures: true, fixtureScenario: "fallback-empty" });
+  if (emptyPrimary.structuredContent.fallbackProvider !== undefined || emptyPrimary.structuredContent.fallbackFixtures !== undefined) {
+    fail("valid empty football-data.org results incorrectly triggered API-Football fallback", "soccer_fallback_invalid");
+  }
+  const fallbackFailure = await callTool(artifact, researchTool, { league: "PL", date: "2026-10-17" }, { fixtures: true, fixtureScenario: "fallback-api-403" });
+  if (fallbackFailure.structuredContent.fallbackProvider?.availability !== "UNAVAILABLE"
+    || !fallbackFailure.structuredContent.fallbackProvider.reason?.includes("HTTP 403")
+    || fallbackFailure.structuredContent.sources[0]?.httpStatus !== 503
+    || fallbackFailure.structuredContent.sources[1]?.httpStatus !== 403) {
+    fail("API-Football fallback failure was not retained as a separate provider diagnostic", "soccer_fallback_invalid");
+  }
+  for (const [scenario, reason] of [["fallback-api-204", "HTTP 204"], ["fallback-api-invalid-json", "invalid JSON"],
+    ["fallback-api-invalid-shape", "unexpected fixtures response shape"], ["fallback-api-empty", "no fixtures"], ["fallback-api-error", "endpoint error"]]) {
+    const fallback = await callTool(artifact, researchTool, { league: "PL", date: "2026-10-17" }, { fixtures: true, fixtureScenario: scenario });
+    if (fallback.structuredContent.fallbackProvider?.availability !== "UNAVAILABLE"
+      || !fallback.structuredContent.fallbackProvider.reason?.includes(reason)) {
+      fail(`${scenario} fallback failure was not reported accurately`, "soccer_fallback_invalid");
+    }
+  }
+  const exactFallback = await callTool(artifact, researchTool, {
+    league: "PL", fixtureId: "1001", date: "2026-10-17", fixtureIdentity: fallbackIdentity,
+  }, { fixtures: true, fixtureScenario: "fallback-exact-failure" });
+  const exactFallbackFixture = exactFallback.structuredContent.fallbackFixtures?.[0];
+  if (exactFallbackFixture?.provider !== "API-Football" || exactFallbackFixture.providerFixtureId !== "90001"
+    || exactFallbackFixture.verificationStatus !== "PARTIAL" || exactFallbackFixture.providerHomeTeamId !== "501" || exactFallbackFixture.homeStats?.providerTeamId !== "501"
+    || "fixtureId" in exactFallbackFixture || "homeTeamProviderId" in exactFallbackFixture) {
+    fail("exact fallback did not preserve namespaced IDs and single-provider verification status", "soccer_fallback_invalid");
+  }
+  if (exactFallbackFixture?.sourceUrl !== "https://v3.football.api-sports.io/fixtures?date=2026-10-17&timezone=UTC"
+    || !exactFallbackFixture.observedAt || exactFallbackFixture.statisticsAvailability !== "AVAILABLE"
+    || exactFallbackFixture.sources.length !== 3) {
+    fail("API-Football fallback did not preserve fixture/statistics source provenance", "soccer_fallback_invalid");
+  }
+  const fallbackCompetitionFixtures = {
+    PL: { homeTeam: "Arsenal", awayTeam: "Chelsea", providerFixtureId: "90001" },
+    PD: { homeTeam: "Real Madrid", awayTeam: "Barcelona", providerFixtureId: "90002" },
+    SA: { homeTeam: "Inter", awayTeam: "Milan", providerFixtureId: "90003" },
+    CL: { homeTeam: "Paris Saint-Germain", awayTeam: "Bayern Munich", providerFixtureId: "90004" },
+  };
+  for (const [league, identity] of Object.entries(fallbackCompetitionFixtures)) {
+    const fallback = await callTool(artifact, researchTool, {
+      league, date: "2026-10-17", fixtureIdentity: { homeTeam: identity.homeTeam, awayTeam: identity.awayTeam, kickoffUtc: "2026-10-17T19:00:00.000Z" },
+    }, { fixtures: true, fixtureScenario: "fallback-http-503" });
+    if (fallback.structuredContent.fallbackFixtures?.length !== 1
+      || fallback.structuredContent.fallbackFixtures[0]?.providerFixtureId !== identity.providerFixtureId) {
+      fail(`${league} API-Football fallback did not match its own competition and fixture identity`, "soccer_fallback_invalid");
+    }
+  }
+  const incompleteStatsFallback = await callTool(artifact, researchTool, {
+    league: "PL", fixtureId: "1001", date: "2026-10-17", fixtureIdentity: fallbackIdentity,
+  }, { fixtures: true, fixtureScenario: "fallback-api-stats-403" });
+  if (incompleteStatsFallback.structuredContent.fallbackFixtures?.[0]?.providerFixtureId !== "90001"
+    || incompleteStatsFallback.structuredContent.fallbackFixtures?.[0]?.statisticsAvailability !== "UNAVAILABLE"
+    || !incompleteStatsFallback.structuredContent.fallbackFixtures?.[0]?.statisticsReason?.includes("HTTP 403")) {
+    fail("missing API-Football statistics erased fixture evidence or its provider error", "soccer_fallback_invalid");
+  }
+  const noIdentityFallback = await callTool(artifact, researchTool, {
+    league: "PL", fixtureId: "1001", date: "2026-10-17",
+  }, { fixtures: true, fixtureScenario: "fallback-exact-failure" });
+  if (noIdentityFallback.structuredContent.fallbackFixtures?.some((fixture) => fixture.verificationStatus === "VERIFIED" || fixture.homeStats !== null)
+    || noIdentityFallback.structuredContent.fallbackProvider?.verificationStatus !== "UNVERIFIED") {
+    fail("football-data.org numeric fixture ID was guessed as an API-Football match", "soccer_fallback_invalid");
+  }
+  const ambiguousFallback = await callTool(artifact, researchTool, {
+    league: "PL", date: "2026-10-17", fixtureIdentity: fallbackIdentity,
+  }, { fixtures: true, fixtureScenario: "fallback-ambiguous" });
+  if (ambiguousFallback.structuredContent.fallbackProvider?.verificationStatus !== "CONFLICTED"
+    || ambiguousFallback.structuredContent.fallbackFixtures?.length !== 0) {
+    fail("ambiguous API-Football fixtures were accepted as an exact match", "soccer_fallback_invalid");
+  }
+  const kickoffConflictFallback = await callTool(artifact, researchTool, {
+    league: "PL", date: "2026-10-17", fixtureIdentity: fallbackIdentity,
+  }, { fixtures: true, fixtureScenario: "fallback-kickoff-conflict" });
+  if (kickoffConflictFallback.structuredContent.fallbackFixtures?.length !== 0
+    || kickoffConflictFallback.structuredContent.fallbackProvider?.verificationStatus !== "UNVERIFIED"
+    || !kickoffConflictFallback.structuredContent.fallbackProvider.reason?.includes("exact UTC kickoff")) {
+    fail("conflicting API-Football kickoff was accepted as the requested exact fixture", "soccer_fallback_invalid");
+  }
+  const fallbackQuote = await callTool(artifact, quoteToolForAnalysis, { marketId: "1", assetId: "123", side: "BUY", size: "10", depth: 10 }, { fixtures: true });
+  const fallbackFixtureForAnalysis = exactFallback.structuredContent.fallbackFixtures[0];
+  const unverifiedFallbackModel = await callTool(artifact, edgeTool, {
+    fixture: fallbackFixtureForAnalysis, quote: fallbackQuote.structuredContent, outcome: "HOME_WIN",
+    marketResolutionType: "REGULATION_1X2", marketResolutionRules: resolutionRules,
+  }, { fixtures: true });
+  if (unverifiedFallbackModel.structuredContent.probabilityStatus !== "UNAVAILABLE"
+    || unverifiedFallbackModel.structuredContent.model.homeWin !== null
+    || unverifiedFallbackModel.structuredContent.edgeStatus !== "UNAVAILABLE"
+    || unverifiedFallbackModel.structuredContent.netEdgePerShare !== null
+    || unverifiedFallbackModel.structuredContent.estimatedExpectedValuePusd !== null
+    || unverifiedFallbackModel.structuredContent.evidenceAssessment?.claimAuthority !== "HOST_AGENT"
+    || unverifiedFallbackModel.structuredContent.evidenceAssessment?.identityClaimMatchesFixture !== false
+    || unverifiedFallbackModel.structuredContent.evidenceAssessment?.sourceVerification !== "NOT_PERFORMED_BY_POLYSCOPE") {
+    fail("API-Football-only identity without independent verification produced probabilities or edge", "soccer_edge_invalid");
+  }
+  const identityEvidence = [{ provider: "Official competition fixture page", url: "https://competition.example.test/fixtures/arsenal-chelsea",
+    observedAt: "2026-10-17T12:00:00.000Z", publishedAt: null, verificationStatus: "VERIFIED", confidenceCategory: "MODERATE",
+    confidenceReason: "The official competition page independently names both teams and the UTC kickoff.", competition: "Premier League",
+    homeTeam: "Arsenal", awayTeam: "Chelsea", kickoffUtc: "2026-10-17T19:00:00.000Z" }];
+  const marketMapping = { provider: "Polymarket Gamma", url: "https://gamma-api.polymarket.com/markets/1",
+    observedAt: fallbackQuote.structuredContent.observedAt, marketId: fallbackQuote.structuredContent.marketId,
+    question: fallbackQuote.structuredContent.question, outcome: fallbackQuote.structuredContent.outcome,
+    competition: "Premier League", homeTeam: "Arsenal FC", awayTeam: "Chelsea", kickoffUtc: "2026-10-17T19:00:00.000Z",
+    outcomeMapping: "HOME_WIN", resolutionType: "REGULATION_1X2", resolutionRules };
+  const verifiedFallbackModel = await callTool(artifact, edgeTool, {
+    fixture: fallbackFixtureForAnalysis, quote: fallbackQuote.structuredContent, outcome: "HOME_WIN",
+    marketResolutionType: "REGULATION_1X2", marketResolutionRules: resolutionRules, identityEvidence, marketMapping,
+  }, { fixtures: true });
+  if (verifiedFallbackModel.structuredContent.probabilityStatus !== "AVAILABLE"
+    || verifiedFallbackModel.structuredContent.edgeStatus !== "AVAILABLE"
+    || verifiedFallbackModel.structuredContent.evidenceAssessment?.claimAuthority !== "HOST_AGENT"
+    || verifiedFallbackModel.structuredContent.evidenceAssessment?.sourceVerification !== "NOT_PERFORMED_BY_POLYSCOPE"
+    || verifiedFallbackModel.structuredContent.evidenceAssessment?.identityClaimMatchesFixture !== true
+    || verifiedFallbackModel.structuredContent.evidenceAssessment?.marketClaimMatchesSuppliedQuoteAndFixture !== true
+    || verifiedFallbackModel.structuredContent.identityEvidence?.[0]?.attestationAuthority !== "HOST_AGENT"
+    || verifiedFallbackModel.structuredContent.marketMapping?.attestationAuthority !== "HOST_AGENT"
+    || verifiedFallbackModel.structuredContent.identityEvidence?.[0]?.publishedAt !== null
+    || verifiedFallbackModel.structuredContent.model.sources.some((source) => source.provider === "Official competition fixture page")) {
+    fail("host-attested fallback evidence was presented as PolyScope source verification or model statistics", "soccer_edge_invalid");
+  }
+  if (verifiedFallbackModel.structuredContent.identityEvidence?.[0]?.url !== "https://competition.example.test/fixtures/arsenal-chelsea") {
+    fail("fabricated identity URL was not preserved as a host-attested claim", "soccer_edge_invalid");
+  }
+  const mismappedFallbackModel = await callTool(artifact, edgeTool, {
+    fixture: fallbackFixtureForAnalysis, quote: fallbackQuote.structuredContent, outcome: "HOME_WIN",
+    marketResolutionType: "REGULATION_1X2", marketResolutionRules: resolutionRules, identityEvidence,
+    marketMapping: { ...marketMapping, marketId: "2" },
+  }, { fixtures: true });
+  if (mismappedFallbackModel.structuredContent.probabilityStatus !== "AVAILABLE"
+    || mismappedFallbackModel.structuredContent.edgeStatus !== "UNAVAILABLE"
+    || mismappedFallbackModel.structuredContent.netEdgePerShare !== null
+    || mismappedFallbackModel.structuredContent.evidenceAssessment?.marketClaimMatchesSuppliedQuoteAndFixture !== false) {
+    fail("market identity mismatch produced a market-specific edge", "soccer_edge_invalid");
+  }
+  const apiOnlyIdentityEvidence = [{ ...identityEvidence[0], provider: "API-Football" }];
+  const sameProviderVerification = await callTool(artifact, edgeTool, {
+    fixture: fallbackFixtureForAnalysis, quote: fallbackQuote.structuredContent, outcome: "HOME_WIN",
+    marketResolutionType: "REGULATION_1X2", marketResolutionRules: resolutionRules,
+    identityEvidence: apiOnlyIdentityEvidence, marketMapping,
+  }, { fixtures: true });
+  if (sameProviderVerification.structuredContent.probabilityStatus !== "UNAVAILABLE"
+    || sameProviderVerification.structuredContent.edgeStatus !== "UNAVAILABLE") {
+    fail("API-Football evidence was incorrectly treated as independent fixture corroboration", "soccer_edge_invalid");
+  }
+  const missingStatsFixture = incompleteStatsFallback.structuredContent.fallbackFixtures[0];
+  const missingStatsModel = await callTool(artifact, edgeTool, {
+    fixture: missingStatsFixture, quote: fallbackQuote.structuredContent, outcome: "HOME_WIN",
+    marketResolutionType: "REGULATION_1X2", marketResolutionRules: resolutionRules, identityEvidence, marketMapping,
+  }, { fixtures: true });
+  if (missingStatsModel.structuredContent.probabilityStatus !== "UNAVAILABLE"
+    || missingStatsModel.structuredContent.model.homeWin !== null || missingStatsModel.structuredContent.edgeStatus !== "UNAVAILABLE"
+    || missingStatsModel.structuredContent.netEdgePerShare !== null || missingStatsModel.structuredContent.estimatedExpectedValuePusd !== null) {
+    fail("missing fallback venue statistics produced fabricated probability or edge values", "soccer_edge_invalid");
+  }
+  const ambiguousProvider = await callTool(artifact, researchTool, {
+    league: "PL", fixtureId: "1001", date: "2026-10-17", includeApiFootball: true,
+  }, { fixtures: true, fixtureScenario: "api-football-ambiguous" });
+  if (ambiguousProvider.structuredContent.fixtures[0]?.apiFootball?.availability !== "UNAVAILABLE"
+    || !ambiguousProvider.structuredContent.fixtures[0]?.apiFootball?.reason?.includes("multiple fixtures")) {
+    fail("ambiguous cross-provider fixture matches were silently joined", "soccer_provider_invalid");
+  }
+  const mismatchProvider = await callTool(artifact, researchTool, {
+    league: "PL", fixtureId: "1001", date: "2026-10-17", includeApiFootball: true,
+  }, { fixtures: true, fixtureScenario: "api-football-mismatch" });
+  if (mismatchProvider.structuredContent.fixtures[0]?.apiFootball?.availability !== "UNAVAILABLE") {
+    fail("nonmatching provider fixture was accepted as an enrichment", "soccer_provider_invalid");
+  }
+  const providerApiError = await callTool(artifact, researchTool, {
+    league: "PL", fixtureId: "1001", date: "2026-10-17", includeApiFootball: true,
+  }, { fixtures: true, fixtureScenario: "api-football-api-error" });
+  if (providerApiError.structuredContent.availability !== "AVAILABLE"
+    || !providerApiError.structuredContent.fixtures[0]?.apiFootball?.reason?.includes("endpoint error")) {
+    fail("API-Football's HTTP 200 error envelope was reported as a valid empty fixture set", "soccer_provider_invalid");
+  }
+  const providerNoContent = await callTool(artifact, researchTool, {
+    league: "PL", fixtureId: "1001", date: "2026-10-17", includeApiFootball: true,
+  }, { fixtures: true, fixtureScenario: "api-football-204" });
+  if (providerNoContent.structuredContent.availability !== "AVAILABLE"
+    || !providerNoContent.structuredContent.fixtures[0]?.apiFootball?.reason?.includes("HTTP 204")) {
+    fail("API-Football HTTP 204 was conflated with an authentication failure", "soccer_provider_invalid");
+  }
+  const kickoffConflict = await callTool(artifact, researchTool, {
+    league: "PL", fixtureId: "1001", date: "2026-10-17", includeApiFootball: true,
+  }, { fixtures: true, fixtureScenario: "api-football-kickoff-conflict" });
+  if (kickoffConflict.structuredContent.availability !== "AVAILABLE"
+    || kickoffConflict.structuredContent.fixtures[0]?.apiFootball?.availability !== "UNAVAILABLE") {
+    fail("conflicting cross-provider kickoff times were silently joined", "soccer_provider_invalid");
+  }
+  const unavailableStats = await callTool(artifact, researchTool, {
+    league: "PL", fixtureId: "1001", date: "2026-10-17", includeApiFootball: true,
+  }, { fixtures: true, fixtureScenario: "api-football-stats-403" });
+  if (unavailableStats.structuredContent.availability !== "AVAILABLE"
+    || unavailableStats.structuredContent.fixtures[0]?.apiFootball?.availability !== "UNAVAILABLE"
+    || unavailableStats.structuredContent.fixtures[0]?.apiFootball?.matchIdentity?.providerFixtureId !== "90001") {
+    fail("API-Football statistics failure discarded the matched fixture or baseline research", "soccer_provider_invalid");
+  }
+  const emptyStats = await callTool(artifact, researchTool, {
+    league: "PL", fixtureId: "1001", date: "2026-10-17", includeApiFootball: true,
+  }, { fixtures: true, fixtureScenario: "api-football-empty-stats" });
+  if (emptyStats.structuredContent.availability !== "AVAILABLE"
+    || emptyStats.structuredContent.fixtures[0]?.apiFootball?.availability !== "UNAVAILABLE"
+    || !emptyStats.structuredContent.fixtures[0]?.apiFootball?.reason?.includes("positive venue sample counts")) {
+    fail("missing API-Football venue statistics were presented as usable research", "soccer_provider_invalid");
+  }
+  const unavailableModel = await callTool(artifact, edgeTool, {
+    fixture: unavailableStats.structuredContent.fixtures[0], quote: analysisQuote.structuredContent, outcome: "HOME_WIN",
+    marketResolutionType: "REGULATION_1X2", marketResolutionRules: resolutionRules,
+  }, { fixtures: true });
+  if (unavailableModel.structuredContent.probabilityStatus !== "AVAILABLE"
+    || unavailableModel.structuredContent.model.inputs.statisticsProvider !== "football-data.org") {
+    fail("baseline venue form was not used when optional API-Football statistics failed", "soccer_edge_invalid");
+  }
+  const noHistory = await callTool(artifact, researchTool, { league: "PL", fixtureId: "7776", date: "2026-10-20" }, { fixtures: true });
+  const unavailableModelResult = await callTool(artifact, edgeTool, {
+    fixture: noHistory.structuredContent.fixtures[0], quote: analysisQuote.structuredContent, outcome: "HOME_WIN",
+    marketResolutionType: "REGULATION_1X2", marketResolutionRules: resolutionRules,
+  }, { fixtures: true });
+  if (unavailableModelResult.structuredContent.probabilityStatus !== "UNAVAILABLE"
+    || unavailableModelResult.structuredContent.model.homeWin !== null
+    || unavailableModelResult.structuredContent.edgeStatus !== "UNAVAILABLE") {
+    fail("missing all statistical inputs generated a probability or edge", "soccer_edge_invalid");
   }
   const mixedCompetitionForm = await callTool(artifact, researchTool, { league: "PL", fixtureId: "560611", date: "2026-10-17", days: 0, limit: 3 }, { fixtures: true });
   const mixedFixture = mixedCompetitionForm.structuredContent.fixtures[0];
@@ -513,7 +907,16 @@ export async function testOfflineArtifact(root = process.cwd()) {
       "reject invalid Polymarket order signature", "reject real provider geoblock", "missing CLOB credentials handled", "Deposit Wallet TypedDataSign preparation", "local smart-wallet signer recovery is distinct from deferred CLOB acceptance", "Deposit Wallet ERC-7739 order reaches exactly one intercepted CLOB POST without Polygon RPC",
       "121s book age is informational for preparation", "future, invalid, missing, and stale book timestamps do not block bounded FAK execution", "changed minimum decrease and still-valid tick are accepted", "increased minimum and invalid current tick reject the exact signed order", "zero current minimum is rejected as invalid provider data", "changed risk mode rejects an incompatible exchange domain", "restricted Gamma metadata omitted and does not reject preparation/submission", "market and quote responses omit removed eligibility metadata", "unsigned book metadata does not change EIP-712 signature validation", "51s quote remains labeled stale", "51s book age alone does not block bounded FAK execution", "ambiguous submission is reconciled once and never reposted", "provider-invalid structured diagnostics", "reject unsafe CLOB salt precision", "reject fee-inclusive cap overrun", "reject wrong outcome asset",
       "team-attributed news", "PL/PD/SA/CL fixture mapping", "documented team-form filters with mixed-competition history filtering", "form counts and explanations for 5/5, 5/4, 5/0, and 0/0 histories",
-      "safe team-form HTTP 403 permission and 429 rate-limit diagnostics", "soccer skill continuation for missing xG, missing injury reports, and unavailable browser tools", "provider failure remains unavailable", "official v2 portfolio rows and cursor pagination completeness", "public portfolio address is not wallet proof", "trade tools registered without submission",
+      "safe team-form HTTP 403 permission and 429 rate-limit diagnostics", "API-Football optional enrichment, independent provider IDs, exact fixture matching, and cutoff date",
+      "provider 403, 204, HTTP 200 error envelope, unavailable/missing stats, mismatched names, kickoff conflicts, and ambiguous duplicates do not replace baseline data", "Poisson probability normalization and venue-specific API-Football and football-data fallback inputs",
+      "CLOB multilevel depth-weighted price, fee-inclusive cost, positive and negative edge, partial fill, no liquidity, unsupported market rules, and honest SELL limitation",
+      "soccer skill continuation for missing xG, missing injury reports, and unavailable browser tools",
+      "football-data.org HTTP/network/timeout/invalid-response fallback; valid empty response stays primary-only",
+      "fallback date coverage is complete only for queried days; later dates require explicit continuation",
+      "API-Football fallback errors, empty data, date discovery, exact identity, and namespaced provider IDs",
+      "fallback fixture ambiguity, kickoff conflicts, missing statistics, and source provenance",
+      "host-attested identity evidence and exact market mapping consistency required for fallback probability/edge; source URLs are not fetched",
+      "official v2 portfolio rows and cursor pagination completeness", "public portfolio address is not wallet proof", "13-tool catalog without an order from analysis",
     ],
   };
 }
