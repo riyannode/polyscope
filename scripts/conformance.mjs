@@ -126,6 +126,14 @@ async function callTool(artifact, tool, argumentsValue, options = {}) {
 export async function testOfflineArtifact(root = process.cwd()) {
   const artifact = resolve(root, "dist/plugin.mjs");
   const tools = await listTools(artifact);
+  if (tools.length !== 12) fail(`expected 12 MCP tools, received ${tools.length}`, "tool_catalog_invalid");
+  const removedSchemaFields = ["ExecutionApproval", "executionApprovalSignature", "executionApprovalSigningIntent", "marketRestricted", "accountGeoblockChecked"];
+  for (const tool of tools) {
+    const schemas = JSON.stringify({ inputSchema: tool.inputSchema, outputSchema: tool.outputSchema });
+    if (removedSchemaFields.some((field) => schemas.includes(field))) {
+      fail(`${tool.name} schema contains a removed trading-policy field`, "tool_catalog_invalid");
+    }
+  }
   const prepareTool = tools.find((tool) => tool.name === "prepare_order_signing");
   if (!prepareTool) fail("prepare_order_signing was not returned by tools/list", "tool_catalog_invalid");
   const searchTool = tools.find((tool) => tool.name === "search_markets");
@@ -390,11 +398,18 @@ export async function testOfflineArtifact(root = process.cwd()) {
   validateSample(prepareTool, { ...base, assetId: "999", side: "BUY", priceLimit: "0.50" }, wrongAsset.result);
   if (wrongAsset.result.structuredContent.status !== "REJECTED" || wrongAsset.result.structuredContent.errorCode !== "PS_MARKET_IDENTITY") fail("order preparation accepted an asset not mapped to the market outcome", "market_identity_invalid");
   const newsTool = tools.find((tool) => tool.name === "get_soccer_news");
+  const continuationInstruction = "These tools provide API evidence, not exhaustive research. When statistics, injuries, lineups or other relevant information are missing, continue with the host's web search/browser tools before writing the final analysis.";
+  if (!newsTool?.description.includes(continuationInstruction)) fail("soccer-news browser continuation instruction is missing from the MCP tool definition", "tool_catalog_invalid");
   const news = await callTool(artifact, newsTool, { teams: ["Arsenal"], limit: 5 }, { fixtures: true });
   if (news.structuredContent.items.length !== 1 || news.structuredContent.items[0].matchedTeams[0] !== "Arsenal") {
     fail("soccer news included a headline unrelated to the requested team", "news_attribution_invalid");
   }
   const researchTool = tools.find((tool) => tool.name === "research_soccer");
+  if (!researchTool?.description.includes(continuationInstruction)) fail("soccer-research browser continuation instruction is missing from the MCP tool definition", "tool_catalog_invalid");
+  const soccerSkill = await readFile(resolve(root, "skills/polyscope-soccer-research/SKILL.md"), "utf8");
+  for (const phrase of ["Form returned, xG missing", "Injury information missing", "Browser unavailable", "original URL", "manager statements", "head-to-head history"]) {
+    if (!soccerSkill.includes(phrase)) fail(`soccer research skill is missing expected workflow guidance: ${phrase}`, "soccer_skill_invalid");
+  }
   for (const league of ["PL", "PD", "SA", "CL"]) {
     const research = await callTool(artifact, researchTool, { league, date: "2026-10-17", days: 0, limit: 3 }, { fixtures: true });
     if (research.structuredContent.availability !== "AVAILABLE" || research.structuredContent.fixtures[0]?.leagueProviderId !== league) {
@@ -406,7 +421,9 @@ export async function testOfflineArtifact(root = process.cwd()) {
     const exactForm = await callTool(artifact, researchTool, { league, fixtureId, date: "2026-10-17", days: 0, limit: 3 }, { fixtures: true });
     const fixture = exactForm.structuredContent.fixtures[0];
     const teamFormSources = exactForm.structuredContent.sources.filter((source) => source.purpose === "TEAM_FORM");
-    if (fixture?.formCoverage !== "COMPLETE_LAST_5" || fixture.homeRecentResults.length !== 5 || fixture.awayRecentResults.length !== 5) {
+    if (fixture?.formCoverage !== "COMPLETE_LAST_5" || fixture.formReason !== null
+      || fixture.homeFormResultCount !== 5 || fixture.awayFormResultCount !== 5
+      || fixture.homeRecentResults.length !== 5 || fixture.awayRecentResults.length !== 5) {
       fail(`${league} form was not reported as complete with exactly five results per team`, "soccer_form_invalid");
     }
     if (teamFormSources.length !== 2 || teamFormSources.some((source) => {
@@ -422,7 +439,9 @@ export async function testOfflineArtifact(root = process.cwd()) {
   const mixedFixture = mixedCompetitionForm.structuredContent.fixtures[0];
   const brentfordSource = mixedCompetitionForm.structuredContent.sources.find((source) => source.purpose === "TEAM_FORM" && source.teamProviderId === "402");
   const liverpoolSource = mixedCompetitionForm.structuredContent.sources.find((source) => source.purpose === "TEAM_FORM" && source.teamProviderId === "64");
-  if (mixedFixture?.formCoverage !== "UNAVAILABLE" || brentfordSource?.teamName !== "Brentford FC"
+  if (mixedFixture?.formCoverage !== "PARTIAL" || mixedFixture.homeFormResultCount !== 5
+    || mixedFixture.awayFormResultCount !== 0 || !mixedFixture.formReason?.includes("Liverpool FC (0/5 results)")
+    || !mixedFixture.formReason.includes("HTTP 403") || brentfordSource?.teamName !== "Brentford FC"
     || brentfordSource.availability !== "AVAILABLE" || brentfordSource.returnedResultCount !== 5
     || liverpoolSource?.teamName !== "Liverpool FC" || liverpoolSource.availability !== "UNAVAILABLE"
     || !liverpoolSource.reason?.includes("HTTP 403")) {
@@ -434,10 +453,25 @@ export async function testOfflineArtifact(root = process.cwd()) {
     fail("team form did not filter mixed competitions, non-finished matches, and kickoff times", "soccer_team_history_filter_invalid");
   }
   const incompleteForm = await callTool(artifact, researchTool, { league: "PL", fixtureId: "9999", date: "2026-10-20", days: 0, limit: 3 }, { fixtures: true });
-  if (incompleteForm.structuredContent.fixtures[0]?.formCoverage !== "UNAVAILABLE"
-    || incompleteForm.structuredContent.fixtures[0]?.homeFormCoverage !== "UNAVAILABLE"
-    || incompleteForm.structuredContent.fixtures[0]?.homeRecentResults.length !== 4) {
-    fail("incomplete historical soccer form was silently presented as complete", "soccer_form_invalid");
+  if (incompleteForm.structuredContent.fixtures[0]?.formCoverage !== "PARTIAL"
+    || incompleteForm.structuredContent.fixtures[0]?.homeFormCoverage !== "PARTIAL"
+    || incompleteForm.structuredContent.fixtures[0]?.homeFormResultCount !== 4
+    || incompleteForm.structuredContent.fixtures[0]?.homeRecentResults.length !== 4
+    || !incompleteForm.structuredContent.fixtures[0]?.formReason?.includes("4/5 results")) {
+    fail("partial historical soccer form was not returned with its actual count", "soccer_form_invalid");
+  }
+  const fiveFourForm = await callTool(artifact, researchTool, { league: "PL", fixtureId: "7777", date: "2026-10-20", days: 0, limit: 3 }, { fixtures: true });
+  const fiveFourFixture = fiveFourForm.structuredContent.fixtures[0];
+  if (fiveFourFixture?.formCoverage !== "PARTIAL" || fiveFourFixture.homeFormResultCount !== 5
+    || fiveFourFixture.awayFormResultCount !== 4 || fiveFourFixture.homeRecentResults.length !== 5
+    || fiveFourFixture.awayRecentResults.length !== 4 || !fiveFourFixture.formReason?.includes("Partial History FC (4/5 results)")) {
+    fail("5/4 team form did not retain both teams' available results and explain partial coverage", "soccer_form_invalid");
+  }
+  const zeroZeroForm = await callTool(artifact, researchTool, { league: "PL", fixtureId: "7776", date: "2026-10-20", days: 0, limit: 3 }, { fixtures: true });
+  const zeroZeroFixture = zeroZeroForm.structuredContent.fixtures[0];
+  if (zeroZeroFixture?.formCoverage !== "UNAVAILABLE" || zeroZeroFixture.homeFormResultCount !== 0
+    || zeroZeroFixture.awayFormResultCount !== 0 || !zeroZeroFixture.formReason?.startsWith("Form unavailable:")) {
+    fail("0/0 team form did not report unavailable coverage", "soccer_form_invalid");
   }
   const deniedForm = await callTool(artifact, researchTool, { league: "PL", fixtureId: "8888", date: "2026-10-21", days: 0, limit: 3 }, { fixtures: true });
   const deniedReason = deniedForm.structuredContent.sources.find((source) => source.purpose === "TEAM_FORM" && source.teamProviderId === "888")?.reason ?? "";
@@ -446,7 +480,10 @@ export async function testOfflineArtifact(root = process.cwd()) {
   }
   const rateLimitedForm = await callTool(artifact, researchTool, { league: "SA", fixtureId: "8889", date: "2026-10-22", days: 0, limit: 3 }, { fixtures: true });
   const rateLimitReason = rateLimitedForm.structuredContent.sources.find((source) => source.purpose === "TEAM_FORM" && source.teamProviderId === "889")?.reason ?? "";
-  if (!rateLimitReason.includes("HTTP 429")) {
+  const rateLimitedFixture = rateLimitedForm.structuredContent.fixtures[0];
+  if (!rateLimitReason.includes("HTTP 429") || rateLimitedFixture?.formCoverage !== "PARTIAL"
+    || rateLimitedFixture.homeFormResultCount !== 0 || rateLimitedFixture.awayFormResultCount !== 5
+    || !rateLimitedFixture.formReason?.includes("HTTP 429")) {
     fail("team-form rate-limit failures did not expose the HTTP status", "soccer_provider_error_invalid");
   }
   const unavailable = await callTool(artifact, researchTool, { league: "PL", date: "2026-11-01", days: 0, limit: 3 }, { fixtures: true });
@@ -475,8 +512,8 @@ export async function testOfflineArtifact(root = process.cwd()) {
       "BUY FAK preserves exact signed limit, size, precision, and fee-inclusive cap", "lack of visible liquidity does not block bounded FAK preparation", "no ExecutionApproval signature is required", "signed order is accepted for exactly one intercepted CLOB POST", "undocumented 300-second ClobAuth cutoff removed", "undocumented order-timestamp freshness cutoff removed", "SELL FAK preserves exact signed minimum price and size", "market fee descriptor and exact fee calculation",
       "reject invalid Polymarket order signature", "reject real provider geoblock", "missing CLOB credentials handled", "Deposit Wallet TypedDataSign preparation", "local smart-wallet signer recovery is distinct from deferred CLOB acceptance", "Deposit Wallet ERC-7739 order reaches exactly one intercepted CLOB POST without Polygon RPC",
       "121s book age is informational for preparation", "future, invalid, missing, and stale book timestamps do not block bounded FAK execution", "changed minimum decrease and still-valid tick are accepted", "increased minimum and invalid current tick reject the exact signed order", "zero current minimum is rejected as invalid provider data", "changed risk mode rejects an incompatible exchange domain", "restricted Gamma metadata omitted and does not reject preparation/submission", "market and quote responses omit removed eligibility metadata", "unsigned book metadata does not change EIP-712 signature validation", "51s quote remains labeled stale", "51s book age alone does not block bounded FAK execution", "ambiguous submission is reconciled once and never reposted", "provider-invalid structured diagnostics", "reject unsafe CLOB salt precision", "reject fee-inclusive cap overrun", "reject wrong outcome asset",
-      "team-attributed news", "PL/PD/SA/CL fixture mapping", "documented team-form filters with mixed-competition history filtering", "independent Brentford/Liverpool form status",
-      "safe team-form HTTP 403 permission and 429 rate-limit diagnostics", "complete and unavailable form handling", "provider failure remains unavailable", "official v2 portfolio rows and cursor pagination completeness", "public portfolio address is not wallet proof", "trade tools registered without submission",
+      "team-attributed news", "PL/PD/SA/CL fixture mapping", "documented team-form filters with mixed-competition history filtering", "form counts and explanations for 5/5, 5/4, 5/0, and 0/0 histories",
+      "safe team-form HTTP 403 permission and 429 rate-limit diagnostics", "soccer skill continuation for missing xG, missing injury reports, and unavailable browser tools", "provider failure remains unavailable", "official v2 portfolio rows and cursor pagination completeness", "public portfolio address is not wallet proof", "trade tools registered without submission",
     ],
   };
 }

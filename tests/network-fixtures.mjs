@@ -140,6 +140,14 @@ globalThis.fetch = async (input, init = {}) => {
     body = match(9999, "PL", "2026-10-20");
     body.homeTeam = { id: 999, name: "Incomplete History FC" };
     body.awayTeam = { id: 998, name: "Opponent FC" };
+  } else if (url.hostname === "api.football-data.org" && url.pathname === "/v4/matches/7777") {
+    body = match(7777, "PL", "2026-10-20");
+    body.homeTeam = { id: 777, name: "Complete History FC" };
+    body.awayTeam = { id: 778, name: "Partial History FC" };
+  } else if (url.hostname === "api.football-data.org" && url.pathname === "/v4/matches/7776") {
+    body = match(7776, "PL", "2026-10-20");
+    body.homeTeam = { id: 779, name: "No History Home FC" };
+    body.awayTeam = { id: 780, name: "No History Away FC" };
   } else if (url.hostname === "api.football-data.org" && url.pathname === "/v4/matches/8888") {
     body = match(8888, "PL", "2026-10-21");
     body.homeTeam = { id: 888, name: "Permission Denied FC" };
@@ -184,7 +192,11 @@ globalThis.fetch = async (input, init = {}) => {
       ? mixedHistory(teamId)
       : teamId === 999
         ? history(teamId).slice(0, 4)
-        : allCompetitionHistory(teamId);
+        : teamId === 778
+          ? history(teamId).slice(0, 4)
+          : teamId === 779 || teamId === 780
+            ? []
+            : allCompetitionHistory(teamId);
     body = { matches: matches.slice(0, Number(url.searchParams.get("limit") ?? "100")) };
   } else if (url.hostname === "www.espn.com" && url.pathname === "/espn/rss/soccer/news") {
     const publishedAt = new Date().toUTCString();

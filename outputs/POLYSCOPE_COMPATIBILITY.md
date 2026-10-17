@@ -4,9 +4,11 @@ Checked: 2026-10-17 (Asia/Jakarta)
 
 Runtime: official PayBox starter 1.0.2, Node.js 24.22.0, pnpm 11.11.0
 
-Decision: **LOCAL_CHECKS_PASSED; HOSTED_DISCOVERY_AND_PREPARATION_PASSED; LIVE_TRADING_UNVERIFIED**
+Integrated base: PR #3 merge commit `0f5866cac685f860f0a79ccb1a9009812ff3b2a4` on `main`.
 
-This report records local implementation and public-network checks plus the project owner's PayBox hosted acceptance results below. This documentation update performed no additional hosted test, wallet-signing request, order broadcast, deposit, deployment, merge, or project submission.
+Decision: **PR3_MERGED; LOCAL_INTEGRATION_CHECKS_PASSED; PAYBOX_SKILL_AUTO_LOADING_UNVERIFIED; LIVE_AGENT_BROWSING_UNVERIFIED; LIVE_TRADING_UNVERIFIED**
+
+This report records the integrated PR #3 trading implementation and PR #4 soccer research extension. The hosted acceptance rows below are historical owner-reported evidence, not a retest of this bundle. This integration performs no hosted test, wallet-signing request, order broadcast, deposit, deployment, or PR merge.
 
 ## PayBox hosted acceptance evidence
 
@@ -34,7 +36,7 @@ The plugin keeps the approved four stages: public live data and news → PayBox 
 | `search_markets` | Searches active Gamma markets and maps each outcome to its CLOB asset/position ID. |
 | `get_quote` | Reads a CLOB book, bounded depth, fillability, market fee descriptor, fee estimate, and informational freshness. |
 | `get_soccer_news` | Reads ESPN RSS and returns only stories whose text names a requested team, with source/publication/observation times; content is marked untrusted. |
-| `research_soccer` | Reads football-data.org PL, PD, SA, and CL fixtures/results. Team-form requests use numeric competition IDs PL `2021`, PD `2014`, SA `2019`, and CL `2001`. Exact fixture requests include last five completed results only when all five for both teams are present. xG, injuries, and lineups are `UNAVAILABLE`. |
+| `research_soccer` | Reads football-data.org PL, PD, SA, and CL fixtures/results and every available recent result, with per-team counts and `COMPLETE_LAST_5`, `PARTIAL`, or `UNAVAILABLE` coverage. Missing API topics are research gaps; the tool description directs the host agent to continue with its browser/search tools. The repository skill covers match context, xG/xGA, injuries, suspensions, lineups, sources, and uncertainty. |
 | `prepare_clob_auth` | Prepares the official Polygon ClobAuth EIP-712 payload for an existing signer. |
 | `validate_clob_auth_signature` | Recovers and checks the ClobAuth signer against the supplied signer address. |
 | `prepare_order_signing` | Prepares one selected-outcome FAK BUY or SELL and returns one Polymarket Order typed-data intent. BUY `priceLimit` is the maximum; SELL `priceLimit` is the minimum. Signed maker/taker amounts encode the chosen price and exact share size. Book age is informational and has no 120-second cutoff. |
@@ -53,20 +55,22 @@ Polymarket documents FAK with a maximum BUY price or minimum SELL price. The off
 | Provider | Local result | What this proves |
 |---|---|---|
 | Polymarket Gamma | `AVAILABLE` | Current sample market search returned valid active market/outcome data. |
-| Polymarket CLOB | `AVAILABLE`, `STALE` | The current conformance run returned a 68,769 ms book age and prepared the unsigned order. Quote freshness remains informational for execution. |
+| Polymarket CLOB | `AVAILABLE`, `STALE` | Current conformance observed a 97,392 ms book; unsigned preparation succeeded and did not submit an order. Quote freshness is informational for execution. |
 | ESPN RSS | `AVAILABLE` | Team-filtered soccer headlines and source timestamps were returned. This is not a verified injury or lineup feed. |
-| football-data.org direct API diagnostic | Brentford `402` and Liverpool `64`: baseline HTTP 200; adding `dateTo=2026-10-16` returned HTTP 400 for each; numeric `competitions=2021` without `dateTo` returned HTTP 200. The production query (`competitions=2021&status=FINISHED&limit=100`) returned HTTP 200 with six finished PL matches for each team. | The developer-supplied token can read PL team history for these two teams. It does not prove all-team or all-competition coverage, and no response body or token was retained. |
+| football-data.org direct API diagnostic | The developer previously reported authenticated HTTP 200 checks on 2026-10-17: PL 5 fixtures, PD 4, SA 3, CL 0. | Historical direct API access only; HTTP 200 with zero fixtures is not an authentication failure. The check was not repeated during this integration and does not prove PayBox-hosted secret injection. |
 | `pnpm conformance` soccer calls | `UNAVAILABLE` for PL, PD, SA, and CL; each call returned HTTP 403 because the local runner has no PayBox host-scoped secret injection. | The offline/runtime harness correctly reports missing local credentials. The direct token diagnostic above is separate and is not a hosted PayBox test. |
 
-football-data.org lists the four supported competitions in its Free Tier and sets a 10-request/minute rate limit for registered free clients. The controlled diagnostic used eight sequential requests, within that limit. Its successful `limit=100` query returned six rows for both tested PL teams; the data spanned Aug 22–Oct 10 for Brentford and Aug 23–Oct 11 for Liverpool, all before the Oct 17 fixture. This verifies those two team histories with the supplied token at the time of the check, not every supported league/team. PolyScope requests numeric competition ID, `status=FINISHED`, and `limit=100`, then independently filters exact competition ID, finished status, and kickoff earlier than the selected fixture before using five results. The `dateTo` failure's provider-side explanation remains unknown; the response body was not retained. The API uses `X-Auth-Token`. [Coverage](https://www.football-data.org/coverage) · [Pricing and rate limits](https://www.football-data.org/pricing) · [API authentication examples](https://docs.football-data.org/general/v4/coding_client.html)
+The prior four-competition check is historical provider evidence only. PolyScope requests numeric competition ID, `status=FINISHED`, and `limit=100`, then independently filters exact competition ID, finished status, and kickoff earlier than the selected fixture. No season identifier is inferred when the API does not supply one; `coverage` describes only returned matches in the requested date window. HTTP 403 and 429 remain distinct provider errors. The API uses `X-Auth-Token`. [Coverage](https://www.football-data.org/coverage) · [Pricing and rate limits](https://www.football-data.org/pricing) · [API authentication examples](https://docs.football-data.org/general/v4/coding_client.html)
 
-The official Team Match API reference does not list `competitions`, while the official v4 quickstart does. The controlled requests resolved this for the current provider path: `competitions=2021` alone returned 200 for both teams, including at `limit=100`; adding `dateTo=2026-10-16` to the baseline returned 400 for both. The final request omits `dateTo` and retains the numeric competition filter. The v4 quickstart and official lookup map PL/PD/SA/CL to `2021`/`2014`/`2019`/`2001`. Provider HTTP errors remain status-specific and do not include response bodies or tokens. [Team Match API reference](https://docs.football-data.org/general/v4/team.html) · [v4 quickstart filter reference](https://www.football-data.org/documentation/quickstart) · [Official competition lookup table](https://docs.football-data.org/general/v4/lookup_tables.html)
+The v4 quickstart and official lookup map PL/PD/SA/CL to `2021`/`2014`/`2019`/`2001`. Provider HTTP errors remain status-specific and do not include response bodies or tokens. [Team Match API reference](https://docs.football-data.org/general/v4/team.html) · [v4 quickstart filter reference](https://www.football-data.org/documentation/quickstart) · [Official competition lookup table](https://docs.football-data.org/general/v4/lookup_tables.html)
 
-The deterministic offline suite uses isolated fixtures to validate mapping and numeric team-form filters without `dateTo` for all four competitions, client-side filtering of mixed competitions/statuses/kickoff times, complete/incomplete form handling, and safe 403/429 diagnostics. Those fixtures are test data, not provider-coverage evidence. TheSportsDB is removed from the current path; its known disabled free API was not debugged again.
+The deterministic offline suite uses isolated fixtures to validate mapping and numeric team-form filters for all four competitions, client-side filtering of mixed competitions/statuses/kickoff times, 5/5, 5/4, 5/0, and 0/0 form handling, and safe 403/429 diagnostics. Those fixtures are test data, not provider-coverage evidence. TheSportsDB is removed from the current path; its known disabled free API was not debugged again.
 
 The generic market search and order tools use a single selected Polymarket CLOB market/outcome. Crypto, weather, soccer, politics, and finance are discoverable through the same market-data path when a corresponding active CLOB market exists. There are no specialized weather/xG/injury datasets or combo/multi-leg tools.
 
 ## PayBox signing and stateless runtime compatibility
+
+**PayBox automatic skill loading: UNVERIFIED.** The public PayBox plugin README lists its packaged skills but does not specify that a connected host automatically loads arbitrary repository `SKILL.md` files. PolyScope therefore also puts browser-continuation instructions in both MCP tool descriptions. That fallback is verified in the built tool catalog; it does not prove live agent browsing.
 
 `requestWalletSignIntent: { op: "typedData", typedData }` carries the Polymarket Order intent. PayBox's official MCP flow uses `request_wallet_sign`, surfaces any required passkey approval, and polls `get_request` until the signing window returns its signature. ClobAuth is a distinct Polymarket L1 authentication operation used to derive CLOB L2 credentials; it is not another PolyScope approval. Order signatures are checked against the selected signer and wallet type. Deposit Wallet preparation uses the documented `TypedDataSign` envelope and ERC-7739 wrapper path. [PayBox request lifecycle](https://docs.paybox.sh/concepts/requests) · [PayBox MCP tools](https://docs.paybox.sh/reference/mcp-tools)
 
@@ -126,9 +130,11 @@ The official `@polymarket/client` package is Node 24 compatible, but its documen
 
 ## Changed files
 
+- `README.md` — documents partial soccer coverage, browser continuation, historical provider-check scope, and merged PR #3.
+- `skills/polyscope-soccer-research/SKILL.md` — guides API-first match research with host-native browser continuation.
 - `src/plugin.ts` — removes the separate Polygon RPC ERC-1271 preflight; distinguishes locally recovered signer from deferred CLOB smart-wallet acceptance; checks exact signed price/size against current tick/minimum without rejecting metadata changes alone; keeps exchange version/risk compatibility and ignores book timestamp for eligibility.
-- `scripts/conformance.mjs` — verifies EOA and Deposit Wallet signatures, one intercepted CLOB POST for valid smart-wallet data without RPC, invalid local signature rejection, min/tick drift acceptance/rejection, exchange risk mismatch, and timestamp informational behavior.
-- `tests/network-fixtures.mjs` — deterministic CLOB, Gamma, geoblock, credentials, smart-wallet, metadata drift, and POST fixtures; no real signing or live order is performed.
+- `scripts/conformance.mjs` — keeps PR #3 trading regressions and adds PR #4 browser-continuation, soccer mapping, partial-form, source-error, and skill-text regressions.
+- `tests/network-fixtures.mjs` — deterministic trading, CLOB, Gamma, geoblock, credential, smart-wallet, metadata-drift, POST, soccer coverage, and provider-error fixtures; no real signing or live order is performed.
 - `docs/errors.md` — stable error codes, retry guidance, user-facing explanations, and safe football provider HTTP/network failure behavior.
 - `outputs/POLYSCOPE_COMPATIBILITY.md` — this report.
 - `outputs/plugin.mjs` — distributable copy of the built artifact.
@@ -141,11 +147,11 @@ Toolchain used: Node.js `24.22.0`, pnpm `11.11.0`.
 
 | Command | Result |
 |---|---|
-| `pnpm install --frozen-lockfile` | PASS — frozen lockfile unchanged; already up to date |
+| `pnpm install --frozen-lockfile` | PASS — Node.js 24.22.0 and pnpm 11.11.0; lockfile unchanged and dependencies already current |
 | `pnpm typecheck` | PASS — `tsc --noEmit` |
-| `pnpm test` | PASS — repeat builds were byte-identical. Offline fixtures cover one signed FAK POST, no Polygon RPC call for a valid Deposit Wallet order, local invalid signer rejection, current min/tick drift (both valid and invalid), exchange risk mismatch, future/malformed book timestamps, exact price/size and fee cap, `restricted=true`, geoblock, missing credentials, and ambiguous POST non-retry; no live order submission |
-| `pnpm conformance` | PASS — market/news/quote reads and preparation succeeded; quote age was 68,769 ms (`STALE`) and still prepared. PL, PD, SA, and CL returned HTTP 403 without local PayBox secret injection and were reported `UNAVAILABLE`. Tool catalog remained 12 tools. |
-| `pnpm build` | PASS — Node.js 24.22.0 and pnpm 11.11.0; generated `dist/plugin.mjs` matches tracked `outputs/plugin.mjs` (574,730 bytes, SHA-256 `2d43798c3c3edc560cba399cc93e0141080f0e483d9fc6ea63fa5cd79606d1a7`). |
+| `pnpm test` | PASS — TypeScript check, two deterministic builds, and offline regression suite. Covered PR #3 trading behavior and soccer 5/5, 5/4, 5/0, 0/0, 403/429, host-tool description, and skill-guidance cases. No live order submission. |
+| `pnpm conformance` | PASS — public market/news/quote reads and unsigned preparation succeeded; quote age was 97,392 ms (`STALE`). PL, PD, SA, and CL returned HTTP 403 without a local football-data.org secret. Tool catalog: exactly 12. Both soccer tool descriptions contain browser continuation instructions; active MCP schemas omit removed trading-policy fields. |
+| `pnpm build` | PASS — two consecutive builds were byte-identical; `dist/plugin.mjs` and tracked `outputs/plugin.mjs` match (575,421 bytes, SHA-256 `eea82bd4a418a30a8f8a4d86e8c13710f8d8270f504c05d6078cdc9c9b222819`). |
 | `pnpm audit --prod` | PASS — no known production dependency vulnerabilities reported |
 | `git diff --check` | PASS after source, report, and bundle updates |
 
@@ -154,16 +160,16 @@ Offline cases include exact BUY/SELL signed price and share amounts, one valid E
 
 **Not covered locally:** PayBox signing-window `primaryType` behavior and wallet binding, real ERC-1271 acceptance by CLOB, authenticated L2 credentials, live balance/allowance/geoblock behavior, real fills, status read-back, cancellation, or real ambiguous-POST reconciliation. The fixture demonstrates adapter behavior only; no live signature or trade was requested.
 
-Current public conformance returned an AVAILABLE CLOB quote marked STALE at 68,769 ms and prepared the unsigned order. Soccer calls returned HTTP 403 without local PayBox secret injection. The separate historical direct API diagnostic remains unchanged and does not substitute for a hosted PayBox retest.
+Current public conformance returned an AVAILABLE CLOB quote marked STALE at 97,392 ms and prepared the unsigned order without submitting. Soccer calls returned HTTP 403 because this runner has no local provider secret. The developer-reported authenticated provider check from 2026-10-17 (PL 5, PD 4, SA 3, CL 0) was not repeated; HTTP 200 with zero fixtures is not an authentication failure. Neither check proves PayBox-hosted secret injection.
 
 ## Artifact
 
 - Path: `dist/plugin.mjs` (matching tracked copy at `outputs/plugin.mjs`)
-- Size: **574,730 bytes** (561.3 KiB; below 10 MiB)
-- SHA-256: `2d43798c3c3edc560cba399cc93e0141080f0e483d9fc6ea63fa5cd79606d1a7`
+- Size: **575,421 bytes** (562 KiB; below 10 MiB)
+- SHA-256: `eea82bd4a418a30a8f8a4d86e8c13710f8d8270f504c05d6078cdc9c9b222819`
 
 ## Readiness decision and next gate
 
-**Hosted PayBox Marketplace BUY/SELL: NOT PROVEN.** The source contains a FAK order path that performs the documented Polymarket checks and submission contract, but no authenticated order or fill was attempted. The latest local quote was marked stale and preparation succeeded; live trading remains unverified. Soccer calls returned 403 without local PayBox secret injection. PayBox's signing-window `primaryType` blocker, real wallet signing, and authenticated CLOB BUY/SELL have not been exercised. Hosted compatibility and separate explicit live-trading approval remain required before claiming an end-to-end trade works.
+**Hosted PayBox Marketplace BUY/SELL: NOT PROVEN. PayBox automatic loading of this repository skill: UNVERIFIED. Live host-agent browser research: UNVERIFIED.** The source contains a FAK order path that performs the documented Polymarket checks and submission contract, but no authenticated order or fill was attempted. The latest local quote was marked stale and preparation succeeded; live trading remains unverified. Soccer calls returned 403 without local PayBox secret injection. PayBox's signing-window `primaryType` blocker, real wallet signing, and authenticated CLOB BUY/SELL have not been exercised. PayBox-hosted signing and CLOB execution remain unverified; any order still follows PayBox's normal approval and signing flow.
 
 The tracked bundle was rebuilt in this PR and was not uploaded to hosted PayBox. No live signature, order broadcast, deposit, deployment, merge, or project resubmission was performed. The `Submitted` status above is the project owner's reported hackathon status, not an action taken in this update.

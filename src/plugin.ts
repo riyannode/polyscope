@@ -180,11 +180,11 @@ const soccerFixtureSchema = z.object({
   homeTeam: z.string(), homeTeamProviderId: z.string(), awayTeam: z.string(), awayTeamProviderId: z.string(),
   kickoffUtc: z.string().datetime(), status: z.string(), homeScore: z.number().int().nonnegative().nullable(),
   awayScore: z.number().int().nonnegative().nullable(), providerUpdatedAt: z.string().datetime().nullable(),
-  formCoverage: z.enum(["COMPLETE_LAST_5", "UNAVAILABLE"]), formReason: z.string().nullable(),
-  homeFormCoverage: z.enum(["COMPLETE_LAST_5", "UNAVAILABLE"]), homeFormReason: z.string().nullable(),
-  awayFormCoverage: z.enum(["COMPLETE_LAST_5", "UNAVAILABLE"]), awayFormReason: z.string().nullable(),
+  formCoverage: z.enum(["COMPLETE_LAST_5", "PARTIAL", "UNAVAILABLE"]), formReason: z.string().nullable(),
+  homeFormCoverage: z.enum(["COMPLETE_LAST_5", "PARTIAL", "UNAVAILABLE"]), homeFormReason: z.string().nullable(),
+  awayFormCoverage: z.enum(["COMPLETE_LAST_5", "PARTIAL", "UNAVAILABLE"]), awayFormReason: z.string().nullable(),
+  homeFormResultCount: z.number().int().nonnegative(), awayFormResultCount: z.number().int().nonnegative(),
   homeRecentResults: z.array(soccerObservedResultSchema), awayRecentResults: z.array(soccerObservedResultSchema),
-  xgAvailability: z.literal("UNAVAILABLE"), injuryAndLineupAvailability: z.literal("UNAVAILABLE"),
 }).strict();
 const soccerSourceSchema = z.object({
   provider: z.literal("football-data.org"), purpose: z.enum(["FIXTURES_AND_RESULTS", "EXACT_FIXTURE", "TEAM_FORM"]),
@@ -196,7 +196,7 @@ const soccerSourceSchema = z.object({
 const soccerResearchOutputSchema = z.object({
   availability: providerAvailabilitySchema, reason: z.string().nullable(), league: z.enum(["PL", "PD", "SA", "CL"]),
   competition: z.string(), provider: z.literal("football-data.org"), sources: z.array(soccerSourceSchema), observedAt: z.string().datetime(),
-  season: z.string().nullable(), leagueProviderId: z.string().nullable(), coverage: z.enum(["FREE_TIER_CURRENT_SEASON", "UNAVAILABLE"]),
+  season: z.string().nullable(), leagueProviderId: z.string().nullable(), coverage: z.enum(["RETURNED_MATCHES", "UNAVAILABLE"]),
   returnedEventCount: z.number().int(), fixtures: z.array(soccerFixtureSchema),
 }).strict();
 const typedOutputSchema = z.object({
@@ -505,10 +505,10 @@ function mapFootballFixture(
   awayFormReason: string | null = formReason,
 ): z.infer<typeof soccerFixtureSchema> | null {
   if (match.competition?.code !== league) return null;
-  const homeFormCoverage = homeFormReason === null && homeRecentResults.length === 5 ? "COMPLETE_LAST_5" as const : "UNAVAILABLE" as const;
-  const awayFormCoverage = awayFormReason === null && awayRecentResults.length === 5 ? "COMPLETE_LAST_5" as const : "UNAVAILABLE" as const;
+  const homeFormCoverage = homeRecentResults.length === 5 ? "COMPLETE_LAST_5" as const : homeRecentResults.length > 0 ? "PARTIAL" as const : "UNAVAILABLE" as const;
+  const awayFormCoverage = awayRecentResults.length === 5 ? "COMPLETE_LAST_5" as const : awayRecentResults.length > 0 ? "PARTIAL" as const : "UNAVAILABLE" as const;
   const formCoverage = homeFormCoverage === "COMPLETE_LAST_5" && awayFormCoverage === "COMPLETE_LAST_5"
-    ? "COMPLETE_LAST_5" as const : "UNAVAILABLE" as const;
+    ? "COMPLETE_LAST_5" as const : homeRecentResults.length > 0 || awayRecentResults.length > 0 ? "PARTIAL" as const : "UNAVAILABLE" as const;
   return {
     fixtureId: String(match.id), competition: SPORTS_COMPETITIONS[league].name, leagueProviderId: league,
     homeTeam: match.homeTeam.name, homeTeamProviderId: String(match.homeTeam.id),
@@ -517,11 +517,11 @@ function mapFootballFixture(
     homeScore: match.score.fullTime?.home ?? null, awayScore: match.score.fullTime?.away ?? null,
     providerUpdatedAt: match.lastUpdated ?? null,
     formCoverage,
-    formReason: formCoverage === "COMPLETE_LAST_5" ? null : formReason ?? "Provider did not return five completed results for both teams.",
+    formReason: formCoverage === "COMPLETE_LAST_5" ? null : formReason ?? "football-data.org returned partial recent results.",
     homeFormCoverage, homeFormReason,
     awayFormCoverage, awayFormReason,
+    homeFormResultCount: homeRecentResults.length, awayFormResultCount: awayRecentResults.length,
     homeRecentResults, awayRecentResults,
-    xgAvailability: "UNAVAILABLE", injuryAndLineupAvailability: "UNAVAILABLE",
   };
 }
 
@@ -677,15 +677,17 @@ async function getSoccerResearch(input: {
             .map((match) => mapFootballResult(match, request.team.id))
             .filter((result): result is z.infer<typeof soccerObservedResultSchema> => result !== null)
             .slice(0, 5);
-          if (recentResults.length !== 5) {
-            teamReason = `football-data.org returned ${recentResults.length} of the required five completed ${input.league} results for ${request.team.name}.`;
+          if (recentResults.length === 0) {
+            teamReason = `football-data.org returned no completed ${input.league} results for ${request.team.name}.`;
+          } else if (recentResults.length < 5) {
+            teamReason = `football-data.org returned ${recentResults.length} completed ${input.league} results for ${request.team.name}.`;
           }
         }
       }
       sources.push({
         provider: "football-data.org", purpose: "TEAM_FORM", url: request.url, observedAt: new Date().toISOString(),
         teamProviderId: String(request.team.id), teamName: request.team.name,
-        availability: teamReason === null ? "AVAILABLE" : "UNAVAILABLE",
+        availability: recentResults.length > 0 ? "AVAILABLE" : "UNAVAILABLE",
         returnedResultCount: response.ok ? recentResults.length : null, reason: teamReason,
       });
       if (index === 0) {
@@ -696,8 +698,17 @@ async function getSoccerResearch(input: {
         awayFormReason = teamReason;
       }
     }
-    if (homeFormReason === null && awayFormReason === null) formReason = null;
-    else formReason = "One or both team histories are unavailable; inspect each TEAM_FORM source for its team-specific status and reason.";
+    const incompleteTeams = [
+      { name: exactMatch.homeTeam.name, count: homeRecentResults.length, reason: homeFormReason },
+      { name: exactMatch.awayTeam.name, count: awayRecentResults.length, reason: awayFormReason },
+    ].filter((team) => team.count < 5)
+      .map((team) => `${team.name} (${team.count}/5 results): ${team.reason ?? "fewer than five completed results were returned."}`);
+    if (incompleteTeams.length === 0) formReason = null;
+    else if (homeRecentResults.length + awayRecentResults.length === 0) {
+      formReason = `Form unavailable: ${incompleteTeams.join("; ")}`;
+    } else {
+      formReason = `Partial form: ${incompleteTeams.join("; ")}`;
+    }
   }
   const fixtures = matches
     .sort((left, right) => left.utcDate.localeCompare(right.utcDate) || left.id - right.id)
@@ -713,8 +724,8 @@ async function getSoccerResearch(input: {
   if (fixtures.length === 0) return unavailable("football-data.org response did not match the requested competition schema.");
   return soccerResearchOutputSchema.parse({
     availability: "AVAILABLE", reason: null, league: input.league, competition: definition.name,
-    provider: "football-data.org", sources, observedAt, season: new Date(startDate).getUTCFullYear().toString(),
-    leagueProviderId: input.league, coverage: "FREE_TIER_CURRENT_SEASON", returnedEventCount: matches.length, fixtures,
+    provider: "football-data.org", sources, observedAt, season: null,
+    leagueProviderId: input.league, coverage: "RETURNED_MATCHES", returnedEventCount: matches.length, fixtures,
   });
 }
 
@@ -1335,7 +1346,7 @@ async function createServer() {
     "get_soccer_news",
     {
       title: "Read ESPN soccer headlines",
-      description: "Reads ESPN soccer headlines mentioning one of the requested teams. Items preserve source and publication timestamps and are untrusted reports, not verified injury or lineup records.",
+      description: "Reads ESPN soccer headlines mentioning one of the requested teams. These tools provide API evidence, not exhaustive research. When statistics, injuries, lineups or other relevant information are missing, continue with the host's web search/browser tools before writing the final analysis. Headlines preserve source and publication timestamps and are untrusted reports, not verified injury or lineup records.",
       inputSchema: z.object({ teams: z.array(z.string().trim().min(2).max(80)).min(1).max(2), limit: z.number().int().min(1).max(10).default(5) }).strict(),
       outputSchema: soccerNewsOutputSchema,
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
@@ -1350,7 +1361,7 @@ async function createServer() {
     "research_soccer",
     {
       title: "Research supported soccer fixtures",
-      description: "Reads football-data.org fixtures and results for PL, PD, SA, or CL. Configure the developer API token as a PayBox host-scoped X-Auth-Token secret. Exact fixture requests include last-five form only when all five results for both teams are returned; xG, injuries, and lineups remain UNAVAILABLE.",
+      description: "Reads football-data.org fixtures, results, and available recent form for PL, PD, SA, or CL. Returns actual recent results and per-team counts, including partial form. Configure the developer API token as a PayBox host-scoped X-Auth-Token secret. These tools provide API evidence, not exhaustive research. When statistics, injuries, lineups or other relevant information are missing, continue with the host's web search/browser tools before writing the final analysis.",
       inputSchema: z.object({
         league: z.enum(["PL", "PD", "SA", "CL"]),
         date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
