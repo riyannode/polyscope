@@ -6,7 +6,7 @@ PolyScope is a PayBox plugin for AI-assisted Polymarket research and user-approv
 
 > PolyScope is an independent, unofficial project. It is not affiliated with, endorsed by, or sponsored by Polymarket.
 
-> **Implementation status:** Local deterministic checks and the plugin build are available. PayBox-hosted wallet signing and real BUY/SELL execution have not been verified. Soccer xG, injuries, and confirmed lineups are unavailable. See [`outputs/POLYSCOPE_COMPATIBILITY.md`](outputs/POLYSCOPE_COMPATIBILITY.md) for the latest evidence and known blockers.
+> **Implementation status:** Local deterministic checks and the plugin build are available. PayBox-hosted wallet signing and real BUY/SELL execution have not been verified. Use [`skills/polyscope-soccer-research/SKILL.md`](skills/polyscope-soccer-research/SKILL.md) to continue soccer research with host-native browser tools when API evidence is incomplete. See [`outputs/POLYSCOPE_COMPATIBILITY.md`](outputs/POLYSCOPE_COMPATIBILITY.md) for compatibility evidence and known blockers.
 
 ## Research-to-trade workflow
 
@@ -27,8 +27,8 @@ FAK is the only supported order type. There is no GTC/resting-order strategy, Co
 |---|---|
 | `search_markets` | Find active Polymarket markets and return each outcome's public CLOB asset ID, resolution details, and observed market data. |
 | `get_quote` | Read one outcome's public order book and estimate visible BUY/SELL fillability, prices, and fees. No order is created. |
-| `get_soccer_news` | Read ESPN soccer headlines that mention the requested team names, preserving source and publication times. Headlines are not verified injury or lineup reports. |
-| `research_soccer` | Read fixtures/results and, for an exact fixture, available recent form for PL, PD, SA, or CL. xG, injuries, and lineups are reported `UNAVAILABLE`. |
+| `get_soccer_news` | Read ESPN soccer headlines and continue with host-native browser research for missing or incomplete information. Headlines are not verified injury or lineup reports. |
+| `research_soccer` | Read fixtures/results and available recent form for PL, PD, SA, or CL. Returns partial results with counts; continue with host-native browser research for missing topics. |
 | `prepare_clob_auth` | Prepare the Polygon ClobAuth EIP-712 payload for an existing signer. |
 | `validate_clob_auth_signature` | Recover and verify the signer of the exact ClobAuth payload. |
 | `prepare_order_signing` | Prepare one marketable FAK BUY or SELL for a selected outcome, price bound, size, and fee-inclusive maximum; return the order and separate execution-approval signing intents. |
@@ -48,7 +48,11 @@ FAK is the only supported order type. There is no GTC/resting-order strategy, Co
 
 ### Soccer coverage
 
-Supported competition codes are `PL`, `PD`, `SA`, and `CL`. Form coverage is marked complete only when five completed results are available for both teams; any returned partial history remains labeled unavailable. Results are filtered by competition ID, match status, and kickoff time. A direct provider check confirmed Premier League history for Brentford and Liverpool with the supplied developer token, but that does not establish other teams' coverage or PayBox secret injection. The last local conformance run had no PayBox-injected provider secret and returned `UNAVAILABLE` for soccer. The provider-side cause of the earlier `dateTo` HTTP 400 is unknown; current team-history requests omit that filter.
+Supported competition codes are `PL`, `PD`, `SA`, and `CL`. Results are filtered by competition ID, match status, and kickoff time. Form reports its actual result count and labels coverage complete, partial, or unavailable. `season` is null because this response does not establish a season identifier; `coverage` means only that matches were returned for the requested date window. Missing xG, injuries, lineups, standings, and other context are research gaps, not conclusions that the information cannot be found. Use the soccer research skill to continue with host-native browser tools. A direct provider check confirmed Premier League history for Brentford and Liverpool with the supplied developer token, but that does not establish other teams' coverage or PayBox secret injection. The last local conformance run had no PayBox-injected provider secret and returned `UNAVAILABLE` for soccer. The provider-side cause of the earlier `dateTo` HTTP 400 is unknown; current team-history requests omit that filter.
+
+### PayBox skill discovery
+
+The [official PayBox plugin README](https://github.com/moonpay/paybox-plugin/blob/main/README.md) describes its MCP server and packaged skills, but does not specify automatic loading of arbitrary repository `SKILL.md` files by a connected host. Repository-to-host `SKILL.md` loading is therefore **UNVERIFIED**. The soccer skill is included in this repository, and `research_soccer` and `get_soccer_news` tool descriptions repeat its core continuation instruction so agents still receive it through MCP tool discovery. No browser service or crawler is added.
 
 ## Technology stack
 
