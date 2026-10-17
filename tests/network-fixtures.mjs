@@ -8,6 +8,10 @@ if (scenario === "unexpected-failure") {
   Object.defineProperty(globalThis.crypto, "getRandomValues", { value: () => { throw new Error("fixture unexpected programming failure"); } });
 }
 let orderPosts = 0;
+process.on("exit", () => {
+  if (scenario?.startsWith("snapshot-") && !["snapshot-min-increase", "snapshot-min-zero", "snapshot-tick-invalid", "snapshot-risk-changed"].includes(scenario) && orderPosts !== 1) process.exitCode = 92;
+  if (["snapshot-min-increase", "snapshot-min-zero", "snapshot-tick-invalid", "snapshot-risk-changed"].includes(scenario) && orderPosts !== 0) process.exitCode = 93;
+});
 
 const conditionId = `0x${"1".repeat(64)}`;
 const market = {
@@ -69,50 +73,65 @@ const mixedHistory = (teamId) => [
 
 globalThis.fetch = async (input, init = {}) => {
   const url = new URL(typeof input === "string" ? input : input.url);
-  if (scenario === "submit-budget" && url.hostname !== "api.football-data.org" && url.pathname !== "/order") {
-    await new Promise((resolve) => setTimeout(resolve, 1_400));
-  }
   let body;
   if (url.hostname === "gamma-api.polymarket.com" && url.pathname === "/markets/1") {
     if (scenario === "provider-invalid-json") return new Response("{", { headers: { "content-type": "application/json" } });
     if (scenario === "provider-unavailable") return new Response("unavailable", { status: 503 });
     body = scenario === "provider-invalid" ? { id: false } : { ...market };
     if (scenario === "wrong-market") body.id = "2";
-    if (scenario === "restricted") body.restricted = true;
+    if (scenario === "restricted-prepare" || scenario === "restricted-submit") body.restricted = true;
+  } else if (url.hostname === "gamma-api.polymarket.com" && url.pathname === "/public-search") {
+    body = { events: [{ title: "Sample event", markets: [{ ...market, restricted: true }] }] };
   } else if (url.hostname === "clob.polymarket.com" && url.pathname === "/book" && ["123", "124", "999"].includes(url.searchParams.get("token_id") ?? "")) {
     const assetId = url.searchParams.get("token_id");
     body = {
       asset_id: assetId, market: conditionId,
-      timestamp: String(Date.now() - (ageScenario ? Number(ageScenario[1]) : assetId === "124" ? 121_000 : 0)),
+      timestamp: String(Date.now() - (ageScenario ? Number(ageScenario[1]) : scenario === "submit-stale-book" ? 51_000 : assetId === "124" ? 121_000 : 0)),
       bids: [{ price: "0.49", size: "100" }], asks: [{ price: "0.50", size: "100" }],
       min_order_size: "5", tick_size: "0.01", neg_risk: false, version: "v1",
     };
+    if (scenario === "snapshot-min-decrease") body.min_order_size = "1";
+    if (scenario === "snapshot-min-increase") body.min_order_size = "11";
+    if (scenario === "snapshot-min-zero") body.min_order_size = "0";
+    if (scenario === "snapshot-tick-valid") body.tick_size = "0.005";
+    if (scenario === "snapshot-tick-invalid") body.tick_size = "0.1";
+    if (scenario === "snapshot-risk-changed") body.neg_risk = true;
+    if (scenario === "submit-future-book") body.timestamp = String(Date.now() + 1);
+    if (scenario === "missing-book-timestamp") delete body.timestamp;
+    if (scenario === "no-visible-liquidity") body.asks = [];
     if (scenario === "wrong-book") body.asset_id = "999";
-    if (scenario === "invalid-timestamp") body.timestamp = "0";
+    if (scenario === "invalid-timestamp") body.timestamp = "not-a-timestamp";
     if (scenario === "future-timestamp") body.timestamp = String(Date.now() + 1);
     if (scenario === "invalid-level") body.asks = [{ price: "NaN", size: "100" }];
     if (scenario === "price-bound") body.asks = [{ price: "0.51", size: "100" }];
   } else if (url.hostname === "clob.polymarket.com" && url.pathname === `/clob-markets/${conditionId}`) {
     body = { fd: { r: scenario === "fee-changed" ? 0.06 : 0.05, e: 1 } };
   } else if (url.hostname === "clob.polymarket.com" && url.pathname === "/auth/derive-api-key") {
+    if (scenario === "missing-credentials") return new Response("unauthorized", { status: 401 });
     body = { apiKey: "fixture-api-key", secret: "dGVzdA==", passphrase: "fixture-passphrase" };
-  } else if (url.hostname === "clob.polymarket.com" && url.pathname === "/auth/ban-status/closed-only") {
-    body = { closed_only: scenario === "close-only" };
-  } else if (url.hostname === "clob.polymarket.com" && url.pathname === "/balance-allowance/update") {
-    body = {};
-  } else if (url.hostname === "clob.polymarket.com" && url.pathname === "/balance-allowance") {
-    body = {
-      balance: scenario === "low-balance" ? "1" : "100000000",
-      allowances: { "0xE111180000d2663C0091e4f400237545B87B996B": scenario === "low-allowance" ? "1" : "100000000" },
-    };
+  } else if (url.hostname === "clob.polymarket.com" && url.pathname.startsWith("/data/order/")) {
+    return new Response("not found", { status: 404 });
   } else if (url.hostname === "clob.polymarket.com" && url.pathname === "/order" && init.method === "POST") {
     orderPosts += 1;
-    if (scenario !== "submit-fresh" || orderPosts !== 1) process.exit(89);
+    if (!["submit-valid", "submit-deposit-wallet", "restricted-submit", "submit-stale-book", "submit-stale-auth", "submit-future-book", "missing-book-timestamp", "submit-ambiguous", "snapshot-min-decrease", "snapshot-tick-valid"].includes(scenario) || orderPosts !== 1) process.exit(89);
+    const postedOrder = JSON.parse(init.body);
+    if (postedOrder.orderType !== "FAK" || postedOrder.order.side !== "BUY"
+      || postedOrder.order.makerAmount !== "5000000" || postedOrder.order.takerAmount !== "10000000"
+      || postedOrder.order.timestamp === undefined || !postedOrder.order.signature) process.exit(90);
+    if (scenario === "submit-deposit-wallet" && (postedOrder.order.signature.length <= 132 || postedOrder.order.signatureType !== 3)) process.exit(94);
+    if (scenario === "submit-ambiguous") throw new Error("fixture connection reset after request body");
+    if (["submit-valid", "submit-deposit-wallet", "restricted-submit", "submit-stale-book", "submit-stale-auth", "submit-future-book", "missing-book-timestamp", "snapshot-min-decrease", "snapshot-tick-valid"].includes(scenario)) {
+      return new Response(JSON.stringify({ success: true, orderID: `0x${"a".repeat(64)}`, status: "MATCHED", tradeIDs: [] }), {
+        status: 200, headers: { "content-type": "application/json" },
+      });
+    }
     return new Response(JSON.stringify({ success: false, errorMsg: "offline fixture blocks order submission; attempts=1" }), {
       status: 403, headers: { "content-type": "application/json" },
     });
   } else if (url.hostname === "polymarket.com" && url.pathname === "/api/geoblock") {
     body = { blocked: scenario === "geoblocked" };
+  } else if (url.hostname === "polygon-rpc.com") {
+    process.exit(91);
   } else if (url.hostname === "api.football-data.org" && url.pathname.startsWith("/v4/competitions/")) {
     const league = url.pathname.split("/")[3];
     if (url.searchParams.get("dateFrom") === "2026-11-01") return new Response("provider unavailable", { status: 403 });
