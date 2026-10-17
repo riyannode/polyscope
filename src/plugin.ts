@@ -5,7 +5,7 @@ import {
   createPublicClient as createPolymarketClient, createSecureClient, OrderSide, OrderType, SignerType,
   RequestRejectedError, RateLimitError, type Signer, type SignedOrder, type TypedDataPayload,
 } from "@polymarket/client";
-import { createOrDeriveApiKey, fetchMarketInfo, prepareLimitOrder, prepareRedeemMarketPositions, prepareRedeemPosition } from "@polymarket/client/actions";
+import { createOrDeriveApiKey, fetchMarketInfo, prepareLimitOrder } from "@polymarket/client/actions";
 import { toTokenId } from "@polymarket/bindings";
 import { expectEvmAddress, expectEvmSignature, expectErc1271Signature, expectHexString } from "@polymarket/types";
 import {
@@ -17,7 +17,6 @@ import {
   type Address,
   type Hex,
 } from "viem";
-import { XMLParser, XMLValidator } from "fast-xml-parser";
 import * as z from "zod/v4";
 
 // The SDK transport may retry DELETE; each tool invocation permits one mutation per endpoint.
@@ -46,15 +45,10 @@ const GAMMA_API = "https://gamma-api.polymarket.com";
 const CLOB_API = "https://clob.polymarket.com";
 const DATA_API = "https://data-api.polymarket.com";
 const GEOBLOCK_API = "https://polymarket.com/api/geoblock";
-const ESPN_SOCCER_FEED = "https://www.espn.com/espn/rss/soccer/news";
 const FOOTBALL_DATA_API = "https://api.football-data.org/v4";
 const API_FOOTBALL_API = "https://v3.football.api-sports.io";
-const NEWS_STALE_AFTER_MS = 24 * 60 * 60 * 1000;
-const MAX_RSS_BYTES = 256 * 1024;
-const RSS_XML_PARSER = new XMLParser({ ignoreAttributes: true, processEntities: false, trimValues: false });
 const ZERO32 = `0x${"0".repeat(64)}` as const;
 const TICK_SIZES = ["0.1", "0.01", "0.005", "0.0025", "0.001", "0.0001"] as const;
-const FAK = "FAK" as const;
 
 const preparationErrorCodeSchema = z.enum([
   "PS_MARKET_IDENTITY", "PS_PROVIDER_INVALID", "PS_PROVIDER_UNAVAILABLE",
@@ -143,17 +137,6 @@ const quoteResultSchema = z.object({
   source: z.literal("Polymarket CLOB"),
 }).strict();
 const providerAvailabilitySchema = z.enum(["AVAILABLE", "UNAVAILABLE"]);
-const providerFreshnessSchema = z.enum(["AVAILABLE", "STALE", "UNKNOWN"]);
-const soccerNewsItemSchema = z.object({
-  title: z.string(), summary: z.string().nullable(), url: z.string().url(),
-  publishedAt: z.string().nullable(), publishedAtUtc: z.string().datetime().nullable(),
-  matchedTeams: z.array(z.string()), reportStatus: z.literal("REPORTED"), status: providerFreshnessSchema,
-}).strict();
-const soccerNewsOutputSchema = z.object({
-  availability: providerAvailabilitySchema, reason: z.string().nullable(), provider: z.literal("ESPN"),
-  sourceUrl: z.string().url(), observedAt: z.string().datetime(), staleAfterHours: z.literal(24),
-  teams: z.array(z.string()), contentIsUntrusted: z.literal(true), items: z.array(soccerNewsItemSchema),
-}).strict();
 const soccerObservedResultSchema = z.object({
   fixtureId: z.string(), date: z.string().nullable(), opponent: z.string().nullable(), venue: z.enum(["HOME", "AWAY"]),
   score: z.string(), result: z.enum(["W", "D", "L"]),
@@ -327,54 +310,22 @@ const orderLifecycleSchema = z.enum([
   "FILLED", "CANCELLED", "FAILED", "UNKNOWN",
 ]);
 const executionResultSchema = z.object({
-  status: orderLifecycleSchema, orderId: z.string().nullable(), orderType: orderTypeSchema,
-  requestedSize: z.string(), filledSize: z.string().nullable(), remainingSize: z.string().nullable(),
+  status: orderLifecycleSchema, orderId: z.string().nullable(), orderType: orderTypeSchema.nullable(),
+  requestedSize: z.string().nullable(), filledSize: z.string().nullable(), remainingSize: z.string().nullable(),
   tradeIds: z.array(z.string()), message: z.string(), errorCode: z.string().regex(/^PS_[A-Z_]+$/).nullable().default(null),
   httpStatus: z.number().int().min(100).max(599).optional(),
 }).strict();
-const chainBalanceSchema = z.object({
-  baseUnits: z.string().regex(/^(0|[1-9][0-9]*)$/).nullable(),
-  formatted: z.string().nullable(), decimals: z.number().int(),
-  status: z.enum(["NONZERO", "ZERO", "UNKNOWN"]),
-}).strict();
-const operatorApprovalSchema = z.object({
-  tokenLedger: z.enum(["Conditional Tokens", "PositionManager"]), operator: addressSchema,
-  approved: z.boolean().nullable(), status: z.enum(["PRESENT", "MISSING", "UNKNOWN"]),
-}).strict();
-const tradingApprovalSchema = z.object({
-  kind: z.enum(["PUSD_ALLOWANCE", "ERC1155_OPERATOR"]).nullable(),
-  target: addressSchema.nullable(), tokenLedger: z.enum(["Conditional Tokens", "PositionManager"]).nullable(),
-  allowanceBaseUnits: z.string().regex(/^(0|[1-9][0-9]*)$/).nullable(),
-  status: z.enum(["PRESENT", "MISSING", "UNKNOWN"]),
-}).strict();
-const tradingReadinessSchema = z.object({
-  status: z.enum(["CHECKS_PRESENT", "ACTION_REQUIRED", "UNKNOWN"]),
-  wallet: z.object({ address: addressSchema, type: walletTypeSchema, addressRole: z.literal("ACCOUNT_WALLET") }).strict(),
-  chainId: z.literal(137), observedAt: z.string().datetime(),
-  pUsdBalance: chainBalanceSchema, polBalance: chainBalanceSchema.nullable(),
-  approval: tradingApprovalSchema,
-  eoaTradingEligibility: z.enum(["UNKNOWN", "NOT_APPLICABLE"]),
-  reason: z.string(), nextAction: z.string().nullable(),
-}).strict();
-const transactionPreviewSchema = z.object({
-  from: addressSchema, to: addressSchema, value: z.literal("0"), data: z.string().regex(/^0x[0-9a-fA-F]+$/),
-}).strict();
-const preparedRedeemSchema = z.object({
-  status: z.enum(["PREPARED", "UNRESOLVED", "NO_POSITION", "UNKNOWN", "UNSUPPORTED"]),
-  conditionId: z.string().regex(/^0x[0-9a-fA-F]{64}$/),
-  wallet: z.object({ address: addressSchema, type: walletTypeSchema, addressRole: z.literal("POSITION_OWNER") }).strict(),
-  market: z.object({ marketId: z.string().nullable(), question: z.string().nullable(), version: z.enum(["v1", "v2"]).nullable(), negRisk: z.boolean().nullable() }).strict(),
-  resolution: z.enum(["RESOLVED", "UNRESOLVED", "UNKNOWN"]),
-  positionLedger: z.enum(["Conditional Tokens", "NegRisk Adapter", "PositionManager", "UNKNOWN"]),
-  positions: z.array(z.object({
-    outcome: z.string(), tokenId: decimalIdSchema, balanceBaseUnits: z.string().regex(/^(0|[1-9][0-9]*)$/).nullable(),
-    ownership: z.enum(["HELD", "NOT_HELD", "UNKNOWN"]),
-  }).strict()),
-  routeApproval: operatorApprovalSchema.nullable(),
-  transactionPreview: z.array(transactionPreviewSchema),
-  execution: z.enum(["EXTERNAL_ACTION_REQUIRED", "NOT_READY", "UNSUPPORTED"]),
-  missingRequirements: z.array(z.string()), unknownRequirements: z.array(z.string()), nextActions: z.array(z.string()),
-  errorCode: z.enum(["PS_MARKET_NOT_FOUND", "PS_MARKET_DATA_UNAVAILABLE", "PS_MARKET_UNSUPPORTED", "PS_CHAIN_READ_UNAVAILABLE"]).nullable(),
+const tradingApprovalsSchema = z.object({
+  walletAddress: addressSchema,
+  isFullyApproved: z.boolean().nullable(),
+  missingRequirements: z.object({
+    erc20: z.array(z.object({
+      amount: z.string().regex(/^(0|[1-9][0-9]*)$/), spenderAddress: addressSchema, tokenAddress: addressSchema,
+    }).strict()),
+    erc1155: z.array(z.object({ operatorAddress: addressSchema, tokenAddress: addressSchema }).strict()),
+  }).strict().nullable(),
+  observedAt: z.string().datetime(),
+  source: z.literal("Polymarket SDK indexed trading approvals"),
 }).strict();
 const geoblockSchema = z.object({ blocked: z.boolean() }).passthrough();
 const positionsResponseSchema = z.array(z.object({
@@ -572,36 +523,6 @@ function addDays(date: string, days: number): string {
   const value = new Date(`${date}T00:00:00.000Z`);
   value.setUTCDate(value.getUTCDate() + days);
   return value.toISOString().slice(0, 10);
-}
-
-function decodeRssEntities(value: string): string {
-  return value.replace(/&(?:amp|lt|gt|quot|apos|#(?:[0-9]+|x[0-9a-f]+));/gi, (entity) => {
-    const named: Record<string, string> = { "&amp;": "&", "&lt;": "<", "&gt;": ">", "&quot;": "\"", "&apos;": "'" };
-    const replacement = named[entity.toLowerCase()];
-    if (replacement !== undefined) return replacement;
-    const hexadecimal = /^&#x([0-9a-f]+);$/i.exec(entity);
-    const decimal = /^&#([0-9]+);$/.exec(entity);
-    const codePoint = hexadecimal ? Number.parseInt(hexadecimal[1] ?? "", 16) : decimal ? Number.parseInt(decimal[1] ?? "", 10) : Number.NaN;
-    return Number.isInteger(codePoint) && codePoint >= 0 && codePoint <= 0x10ffff && !(codePoint >= 0xd800 && codePoint <= 0xdfff)
-      ? String.fromCodePoint(codePoint)
-      : entity;
-  });
-}
-
-const rssItemSchema = z.object({
-  title: z.string().optional(), link: z.string().optional(), description: z.string().optional(), pubDate: z.string().optional(),
-}).passthrough();
-const rssDocumentSchema = z.object({
-  rss: z.object({
-    channel: z.object({ item: z.union([rssItemSchema, z.array(rssItemSchema)]).optional() }).passthrough(),
-  }).passthrough(),
-}).passthrough();
-
-function rssItems(value: unknown): z.infer<typeof rssItemSchema>[] | null {
-  const result = rssDocumentSchema.safeParse(value);
-  if (!result.success) return null;
-  const items = result.data.rss.channel.item;
-  return items === undefined ? [] : Array.isArray(items) ? items : [items];
 }
 
 const SPORTS_COMPETITIONS = {
@@ -940,86 +861,6 @@ async function getApiFootballFallback(league: SoccerLeague, date: string, reques
     },
     fixtures,
   };
-}
-
-async function getSoccerNews(limit: number, teams: string[]): Promise<z.infer<typeof soccerNewsOutputSchema>> {
-  const observedAt = new Date().toISOString();
-  const requestedTeams = [...new Set(teams.map((team) => team.trim()).filter(Boolean))];
-  try {
-    const response = await fetch(ESPN_SOCCER_FEED, {
-      headers: { accept: "application/rss+xml, application/xml, text/xml" },
-      redirect: "error",
-      signal: AbortSignal.timeout(4_000),
-    });
-    if (!response.ok) {
-      return soccerNewsOutputSchema.parse({
-        availability: "UNAVAILABLE", reason: `ESPN returned HTTP ${response.status}.`, provider: "ESPN",
-        sourceUrl: ESPN_SOCCER_FEED, observedAt, staleAfterHours: 24, teams: requestedTeams, contentIsUntrusted: true, items: [],
-      });
-    }
-    const xml = await boundedResponseText(response, MAX_RSS_BYTES);
-    if (/<!DOCTYPE\b/i.test(xml) || XMLValidator.validate(xml) !== true) {
-      return soccerNewsOutputSchema.parse({
-        availability: "UNAVAILABLE", reason: "ESPN feed did not pass safe XML validation.", provider: "ESPN",
-        sourceUrl: ESPN_SOCCER_FEED, observedAt, staleAfterHours: 24, teams: requestedTeams, contentIsUntrusted: true, items: [],
-      });
-    }
-    const parsed: unknown = RSS_XML_PARSER.parse(xml);
-    const sourceItems = rssItems(parsed);
-    if (sourceItems === null) {
-      return soccerNewsOutputSchema.parse({
-        availability: "UNAVAILABLE", reason: "ESPN feed did not match the expected RSS shape.", provider: "ESPN",
-        sourceUrl: ESPN_SOCCER_FEED, observedAt, staleAfterHours: 24, teams: requestedTeams, contentIsUntrusted: true, items: [],
-      });
-    }
-    const observedAtMs = Date.parse(observedAt);
-    const items = sourceItems.flatMap((item) => {
-      if (!item.title || !item.link || item.link !== item.link.trim()) return [];
-      let articleUrl: URL;
-      try { articleUrl = new URL(item.link); } catch { return []; }
-      const trustedHost = articleUrl.protocol === "https:" &&
-        (articleUrl.hostname === "espn.com" || articleUrl.hostname.endsWith(".espn.com") ||
-          articleUrl.hostname === "espn.in" || articleUrl.hostname.endsWith(".espn.in"));
-      if (!trustedHost) return [];
-      const publishedAt = item.pubDate ? decodeRssEntities(item.pubDate) : null;
-      const publishedMs = publishedAt === null ? Number.NaN : Date.parse(publishedAt);
-      const ageMs = observedAtMs - publishedMs;
-      const status = !Number.isFinite(publishedMs) || ageMs < 0
-        ? "UNKNOWN" as const
-        : ageMs > NEWS_STALE_AFTER_MS ? "STALE" as const : "AVAILABLE" as const;
-      const title = decodeRssEntities(item.title);
-      const summary = item.description === undefined ? null : decodeRssEntities(item.description);
-      const searchable = `${title} ${summary ?? ""}`.toLocaleLowerCase("en-US");
-      const matchedTeams = requestedTeams.filter((team) => searchable.includes(team.toLocaleLowerCase("en-US")));
-      if (matchedTeams.length === 0) return [];
-      return [{
-        title,
-        summary,
-        url: item.link,
-        publishedAt,
-        publishedAtUtc: Number.isFinite(publishedMs) ? new Date(publishedMs).toISOString() : null,
-        matchedTeams,
-        reportStatus: "REPORTED" as const,
-        status,
-      }];
-    }).slice(0, limit);
-    return soccerNewsOutputSchema.parse({
-      availability: items.length > 0 ? "AVAILABLE" : "UNAVAILABLE",
-      reason: items.length > 0 ? null : "ESPN feed contained no valid stories mentioning the requested team names.",
-      provider: "ESPN", sourceUrl: ESPN_SOCCER_FEED, observedAt, staleAfterHours: 24,
-      teams: requestedTeams, contentIsUntrusted: true, items,
-    });
-  } catch (error) {
-    const reason = error instanceof Error && error.message === "response_too_large"
-      ? "ESPN feed exceeded the 256 KB limit."
-      : error instanceof DOMException && error.name === "TimeoutError"
-        ? "ESPN feed request timed out."
-        : "ESPN feed request or parsing failed.";
-    return soccerNewsOutputSchema.parse({
-      availability: "UNAVAILABLE", reason, provider: "ESPN", sourceUrl: ESPN_SOCCER_FEED,
-      observedAt, staleAfterHours: 24, teams: requestedTeams, contentIsUntrusted: true, items: [],
-    });
-  }
 }
 
 async function getSoccerResearch(input: {
@@ -1414,8 +1255,16 @@ async function sdkResponse(call: () => Promise<unknown>): Promise<{ status: numb
 async function sdkReadOrder(client: ClobCredentials, orderId: string) {
   return sdkResponse(async () => {
     const order = await client.fetchOrder({ orderId });
-    return { id: order.id, status: order.status, order_type: order.orderType, original_size: String(order.originalSize),
-      size_matched: String(order.sizeMatched), asset_id: order.assetId, side: order.side, associate_trades: order.associateTrades };
+    return {
+      id: order.id,
+      ...(order.status === undefined ? {} : { status: order.status }),
+      ...(order.orderType === undefined ? {} : { order_type: order.orderType }),
+      ...(order.originalSize === undefined ? {} : { original_size: String(order.originalSize) }),
+      ...(order.sizeMatched === undefined ? {} : { size_matched: String(order.sizeMatched) }),
+      ...(order.assetId === undefined ? {} : { asset_id: order.assetId }),
+      ...(order.side === undefined ? {} : { side: order.side }),
+      ...(order.associateTrades === undefined ? {} : { associate_trades: order.associateTrades }),
+    };
   });
 }
 
@@ -1484,21 +1333,19 @@ function mapOrderStatus(status: string | undefined, matched: string | undefined,
   return normalized === "MATCHED" ? "UNKNOWN" as const : "UNKNOWN" as const;
 }
 
-function orderStatusResult(input: {
-  orderId: string; requestedSize: string; record: unknown; orderType?: "FAK" | "FOK";
-}): z.infer<typeof executionResultSchema> | null {
+function orderStatusResult(input: { orderId: string; record: unknown }): z.infer<typeof executionResultSchema> | null {
   const parsed = orderReadSchema.safeParse(input.record);
   if (!parsed.success) return null;
   const record = parsed.data;
-  if (record.id !== undefined && record.id.toLowerCase() !== input.orderId.toLowerCase()) return null;
-  const original = record.original_size ?? input.requestedSize;
+  if (record.id === undefined || record.id.toLowerCase() !== input.orderId.toLowerCase()) return null;
+  const original = record.original_size;
   const matched = record.size_matched;
   const status = mapOrderStatus(record.status, matched, original);
   const reportedOrderType = record.order_type?.toUpperCase();
-  const orderType = reportedOrderType === "FAK" || reportedOrderType === "FOK" ? reportedOrderType : input.orderType ?? FAK;
+  const orderType = reportedOrderType === "FAK" || reportedOrderType === "FOK" ? reportedOrderType : null;
   const filledSize = matched === undefined ? null : matched;
   let remainingSize: string | null = null;
-  if (matched !== undefined) {
+  if (original !== undefined && matched !== undefined) {
     try {
       const remaining = toUnits(original, 6) - toUnits(matched, 6);
       remainingSize = remaining >= 0n ? formatUnits(remaining, 6) : null;
@@ -1506,10 +1353,10 @@ function orderStatusResult(input: {
   }
   return executionResultSchema.parse({
     status, orderId: input.orderId, orderType,
-    requestedSize: input.requestedSize, filledSize, remainingSize,
+    requestedSize: original ?? null, filledSize, remainingSize,
     tradeIds: record.associate_trades ?? [],
-    message: status === "FILLED" ? "Order status read-back reports the requested size filled."
-      : status === "PARTIALLY_FILLED" ? `Order status read-back reports a partial fill; the ${orderType} remainder does not rest.`
+    message: status === "FILLED" ? "Order status read-back reports the original order size filled."
+      : status === "PARTIALLY_FILLED" ? `Order status read-back reports a partial fill${orderType ? `; the ${orderType} remainder does not rest` : ""}.`
         : status === "OPEN" ? "Order status read-back reports an open order; inspect or cancel it explicitly."
           : `Polymarket order status: ${status}.`,
   });
@@ -1563,20 +1410,8 @@ function textToolResult(tool: string, structuredContent: unknown) {
         observedAt: market.observedAt,
       })),
     };
-  } else if (tool === "validate_order_signature") {
-    const output = z.object({
-      localSignerVerified: z.boolean(), expectedSignerAddress: addressSchema,
-      recoveredSignerAddress: addressSchema.nullable(), signatureEncoding: z.enum(["EIP-712", "ERC-7739"]),
-      signedOrderSignature: z.string().nullable(), contractWalletAcceptance: z.enum(["NOT_APPLICABLE", "DEFERRED_TO_CLOB"]),
-    }).parse(structuredContent);
-    result = {
-      localSignerVerified: output.localSignerVerified,
-      expectedSignerAddress: output.expectedSignerAddress,
-      recoveredSignerAddress: output.recoveredSignerAddress,
-      signatureEncoding: output.signatureEncoding,
-      contractWalletAcceptance: output.contractWalletAcceptance,
-    };
   }
+
   return {
     content: [{ type: "text" as const, text: JSON.stringify({ tool, result }) ?? "{}" }],
     structuredContent,
@@ -1798,7 +1633,7 @@ function analyzeSoccerEdge(input: {
     }
   }
   const calculationAssumptions = [
-    "Polymarket CLOB BUY ask levels, requested size, estimated gross cost, and fees come from the supplied get_quote result; midpoint and Gamma indicative prices are not used.",
+    "Polymarket CLOB BUY ask levels, requested size, estimated gross cost, and fees come from the supplied get_market_quote result; midpoint and Gamma indicative prices are not used.",
     "The 30-second quote freshness threshold is a PolyScope analysis indicator, not a Polymarket order-expiration rule.",
     "The estimate covers only visible fillable shares; FAK may partially fill and discards the unfilled remainder.",
     "Net edge per share equals modeled probability minus (estimated gross fill cost plus fees) divided by fillable shares.",
@@ -1840,8 +1675,8 @@ async function createServer() {
   server.registerTool(
     "search_markets",
     {
-      title: "Search Polymarket markets",
-      description: "Find active Polymarket markets and map every listed outcome to its public CLOB asset ID. Returns resolution details and observed public market data.",
+      title: "Search Markets",
+      description: "Find active Polymarket markets, mapping each outcome to its CLOB asset ID and including resolution metadata. Read-only.",
       inputSchema: z.object({ query: z.string().min(2).max(100), limit: z.number().int().min(1).max(5).default(3) }).strict(),
       outputSchema: z.object({ markets: z.array(marketResultSchema), resultCount: z.number().int() }).strict(),
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
@@ -1893,10 +1728,10 @@ async function createServer() {
   );
 
   server.registerTool(
-    "get_quote",
+    "get_market_quote",
     {
-      title: "Read a Polymarket order book quote",
-      description: "Reads the public CLOB book and current fee rate for one market outcome and estimates visible BUY/SELL fill, average price, gross amount, and fee. No order is created. The 30-second freshness threshold is a PolyScope indicator, not an order-expiration rule; analysis recalculates freshness from the book timestamp.",
+      title: "Get Market Quote",
+      description: "Read one outcome's CLOB order book and estimate visible BUY/SELL fillability, spread, price, and fees. Read-only; never places an order.",
       inputSchema: z.object({
         marketId: z.string().regex(/^[0-9]{1,32}$/), assetId: decimalIdSchema, side: sideSchema,
         size: z.string().max(32).optional(), depth: z.number().int().min(1).max(20).default(10),
@@ -1999,30 +1834,15 @@ async function createServer() {
         observedAt,
         source: "Polymarket CLOB",
       });
-      return textToolResult("get_quote", structuredContent);
-    },
-  );
-
-  server.registerTool(
-    "get_soccer_news",
-    {
-      title: "Read ESPN soccer headlines",
-      description: "Reads ESPN soccer headlines mentioning one of the requested teams. These tools provide API evidence, not exhaustive research. When statistics, injuries, lineups or other relevant information are missing, continue with the host's web search/browser tools before writing the final analysis. Headlines preserve source and publication timestamps and are untrusted reports, not verified injury or lineup records.",
-      inputSchema: z.object({ teams: z.array(z.string().trim().min(2).max(80)).min(1).max(2), limit: z.number().int().min(1).max(10).default(5) }).strict(),
-      outputSchema: soccerNewsOutputSchema,
-      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
-    },
-    async ({ teams, limit }) => {
-      const structuredContent = await getSoccerNews(limit, teams);
-      return textToolResult("get_soccer_news", structuredContent);
+      return textToolResult("get_market_quote", structuredContent);
     },
   );
 
   server.registerTool(
     "research_soccer",
     {
-      title: "Research supported soccer fixtures",
-      description: "Reads football-data.org fixtures, results, and available recent form for PL, PD, SA, or CL. On provider failures or unusable responses, it makes one date-scoped API-Football fixture fallback request; a valid empty football-data.org response does not trigger fallback. API-Football-only fixtures use provider-qualified IDs and are not cross-provider verified. For exact fallback matching, provide fixtureIdentity with homeTeam, awayTeam, and kickoffUtc; a football-data.org fixtureId is never reused as an API-Football ID. Set includeApiFootball=true on an exact football-data.org fixture to keep the existing optional enrichment. The legacy provider field identifies the primary provider; availability is aggregate, and resultProvider identifies the source of returned fixtures (football-data.org or API-Football). Fallback coverage reports requested and queried dates. These tools provide API evidence, not exhaustive research. When statistics, injuries, lineups or other relevant information are missing, continue with the host's web search/browser tools before writing the final analysis. If either structured provider fails or leaves material gaps, continue with host-native search/browser tools where available; do not claim browser work unless performed.",
+      title: "Research Soccer Fixtures",
+      description: "Read supported soccer fixtures, results, and recent form, with bounded API-Football fallback when primary data fails. Read-only.",
       inputSchema: z.object({
         league: z.enum(["PL", "PD", "SA", "CL"]),
         date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
@@ -2045,8 +1865,8 @@ async function createServer() {
   server.registerTool(
     "analyze_soccer_edge",
     {
-      title: "Estimate soccer probabilities and Polymarket net edge",
-      description: "Deterministically estimates regulation-time Home/Draw/Away probabilities from API-Football venue averages or football-data.org pre-kickoff same-venue form. It recalculates quote freshness from the original book timestamp at analysis time; the 30-second label is informational, and stale quote results are historical rather than current executable evidence. For API-Football-only fallback fixtures, identityEvidence and marketMapping are host-agent attestations: their source URLs are not fetched or independently verified by PolyScope. PolyScope checks supplied identity fields against the fixture and supplied market fields against the quote, fixture, and rules; evidenceAssessment reports these local checks separately from external source verification. Without a host-attested VERIFIED identity claim, probabilities are UNAVAILABLE; without a consistent market mapping and exact 90-minute resolution declaration, market-specific edge is unavailable. Browser-researched statistics are not model inputs. This read-only analysis does not fetch providers, create orders, impose a trading gate, or authorize a trade.",
+      title: "Analyze Soccer Edge",
+      description: "Estimate regulation-time 1X2 probabilities from supported match data and compare them with a supplied CLOB BUY quote. Read-only; host attestations are not independently verified.",
       inputSchema: z.object({
         fixture: z.union([soccerFixtureSchema, providerQualifiedFixtureSchema]), quote: quoteResultSchema,
         outcome: z.enum(["HOME_WIN", "DRAW", "AWAY_WIN"]),
@@ -2066,8 +1886,8 @@ async function createServer() {
   server.registerTool(
     "prepare_clob_auth",
     {
-      title: "Prepare Polymarket CLOB authentication signature",
-      description: "Uses the official SDK authentication workflow and its current timestamp to prepare the Polygon ClobAuth EIP-712 payload for the existing owner EOA signer. The PayBox agent must call request_wallet_sign with the matching wallet credential, poll get_request, then reuse that signed ClobAuth across related authenticated calls while Polymarket accepts it. No signature or credentials are sent by this tool.",
+      title: "Prepare CLOB Authentication",
+      description: "Prepare SDK-derived ClobAuth EIP-712 data for PayBox signing. Does not sign, authenticate, or return credentials.",
       inputSchema: z.object({ signerAddress: addressSchema, nonce: z.string().regex(/^(0|[1-9][0-9]{0,77})$/).default("0") }).strict(),
       outputSchema: typedOutputSchema,
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: false, openWorldHint: true },
@@ -2089,15 +1909,15 @@ async function createServer() {
   );
 
   server.registerTool(
-    "prepare_order_signing",
+    "prepare_order",
     {
-      title: "Prepare a bounded Polymarket BUY or SELL signature",
-      description: "Accepts reusable signed ClobAuth and asks the official SDK to prepare an unsigned FAK or FOK order for the selected market outcome, side, price, and size. The returned size reflects SDK rounding. orderType defaults to FAK. Polymarket CLOB determines whether a FOK order fills in full. BUY priceLimit is the maximum; SELL priceLimit is the minimum. PayBox handles human approval and wallet signing for the Polymarket order.",
+      title: "Prepare FAK/FOK Order",
+      description: "Use the official SDK to prepare a FAK/FOK BUY or SELL order and return its effective amounts and EIP-712 signing payload. Does not sign or submit.",
       inputSchema: z.object({
         marketId: z.string().regex(/^[0-9]{1,32}$/), assetId: decimalIdSchema,
         makerAddress: addressSchema, signingAddress: addressSchema, clobAuth: clobAuthSchema,
-        walletType: walletTypeSchema.optional(), side: sideSchema,
-        orderType: orderTypeSchema.default(FAK),
+        side: sideSchema,
+        orderType: orderTypeSchema,
         priceLimit: z.string().max(32), size: z.string().max(32),
       }).strict(),
       outputSchema: z.discriminatedUnion("status", [
@@ -2159,7 +1979,7 @@ async function createServer() {
         });
         const preparedOrder = preparedOrderSchema.parse({ ...preparedBase, typedData });
         const intent = { op: "typedData" as const, typedData };
-        return textToolResult("prepare_order_signing", {
+        return textToolResult("prepare_order", {
           status: "PREPARED" as const, preparedOrder, requestWalletSignIntent: intent,
           submitsOrder: false as const,
         });
@@ -2169,13 +1989,13 @@ async function createServer() {
         if (!code.success) {
           if (error.name === "UnexpectedResponseError" || error.name === "TransportError" || error.name === "RequestRejectedError" || error.name === "UserInputError") {
             const failure = clobRequestFailure(error, "PS_PROVIDER_INVALID", "Official SDK preparation could not complete.");
-            return textToolResult("prepare_order_signing", { status: "REJECTED", errorCode: preparationErrorCodeSchema.safeParse(failure.code).success ? failure.code : "PS_PROVIDER_INVALID",
+            return textToolResult("prepare_order", { status: "REJECTED", errorCode: preparationErrorCodeSchema.safeParse(failure.code).success ? failure.code : "PS_PROVIDER_INVALID",
               reason: "Official SDK preparation failed; check authentication, wallet identity, and provider availability.", submitsOrder: false });
           }
           throw error;
         }
         const reason = error.message.slice(code.data.length + 1).trim();
-        return textToolResult("prepare_order_signing", {
+        return textToolResult("prepare_order", {
           status: "REJECTED" as const, errorCode: code.data, reason,
           submitsOrder: false as const,
         });
@@ -2183,74 +2003,22 @@ async function createServer() {
     },
   );
 
-  server.registerTool(
-    "validate_clob_auth_signature",
-    {
-      title: "Validate a PayBox ClobAuth signature",
-      description: "Recovers the signer from the exact ClobAuth payload and checks it against the expected existing PayBox owner EOA. This cryptographic check does not establish timestamp freshness or provider acceptance, and does not derive or return CLOB credentials.",
-      inputSchema: z.object({
-        signerAddress: addressSchema, timestamp: z.string().regex(/^[0-9]{1,16}$/),
-        nonce: z.string().regex(/^(0|[1-9][0-9]{0,77})$/), signature: z.string().regex(/^0x[0-9a-fA-F]{130}$/),
-      }).strict(),
-      outputSchema: z.object({ valid: z.boolean(), expectedSignerAddress: addressSchema, recoveredSignerAddress: addressSchema.nullable() }).strict(),
-      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
-    },
-    async ({ signerAddress, timestamp, nonce, signature }) => {
-      if (BigInt(nonce) >= 1n << 256n) throw new Error("PS_AUTH_NONCE_INVALID: Nonce exceeds uint256.");
-      const expected = address(signerAddress);
-      let recovered: Address | null = null;
-      try {
-        recovered = await recoverTypedDataAddress({
-          ...await clobAuthTypedData(expected, timestamp, nonce),
-          signature: signatureHex(signature),
-        });
-      } catch {
-        recovered = null;
-      }
-      const valid = recovered?.toLowerCase() === expected.toLowerCase();
-      return textToolResult("validate_clob_auth_signature", { valid, expectedSignerAddress: expected, recoveredSignerAddress: recovered });
-    },
-  );
-
-  server.registerTool(
-    "validate_order_signature",
-    {
-      title: "Validate a Polymarket order signature",
-      description: "Rebuilds the exact Polymarket EIP-712 order and locally verifies that its signature recovers to the selected signer. Smart-wallet contract acceptance is left to Polymarket CLOB; Deposit Wallet output includes the ERC-7739 wrapper.",
-      inputSchema: z.object({ preparedOrder: preparedOrderSchema, signature: z.string().regex(/^0x[0-9a-fA-F]{130}$/) }).strict(),
-      outputSchema: z.object({
-        localSignerVerified: z.boolean(), expectedSignerAddress: addressSchema, recoveredSignerAddress: addressSchema.nullable(),
-        signatureEncoding: z.enum(["EIP-712", "ERC-7739"]), signedOrderSignature: z.string().nullable(),
-        contractWalletAcceptance: z.enum(["NOT_APPLICABLE", "DEFERRED_TO_CLOB"]),
-      }).strict(),
-      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
-    },
-    async ({ preparedOrder: parsedPrepared, signature }) => {
-      const prepared = preparedOrderSchema.parse(parsedPrepared);
-      const signatureValue = signatureHex(signature);
-      validatePreparedOrder(prepared);
-      const validation = await validateWalletSignature(prepared, signatureValue);
-      const expected = address(prepared.wallet.signingAddress);
-      const valid = validation.valid;
-      return textToolResult("validate_order_signature", {
-        localSignerVerified: valid,
-        expectedSignerAddress: expected,
-        recoveredSignerAddress: validation.recovered,
-        signatureEncoding: validation.encoding,
-        signedOrderSignature: validation.signedSignature,
-        contractWalletAcceptance: validation.contractWalletAcceptance,
-      });
-    },
-  );
-
   const submitOrderHandler = async (args: {
     preparedOrder: PreparedOrder; orderSignature: string; clobAuth: z.infer<typeof clobAuthSchema>;
-    orderType: "FAK" | "FOK"; resultTool: "submit_order" | "submit_fak_order";
+    orderType: "FAK" | "FOK"; resultTool: "submit_order";
   }) => {
       const { preparedOrder: inputOrder, orderSignature, clobAuth, orderType, resultTool } = args;
       const orderResult = (value: unknown) => tradeToolResult(value, resultTool);
       const prepared = preparedOrderSchema.parse(inputOrder);
-      validatePreparedOrder(prepared);
+      try { validatePreparedOrder(prepared); }
+      catch {
+        return orderResult({
+          status: "REJECTED", orderId: null, orderType, requestedSize: prepared.order.size,
+          filledSize: null, remainingSize: prepared.order.size, tradeIds: [],
+          message: "The prepared order differs from its exact EIP-712 payload; no order was sent.",
+          errorCode: "PS_SIGNATURE_INVALID",
+        });
+      }
       if (prepared.order.orderType !== orderType) return orderResult({
         status: "REJECTED", orderId: null, orderType, requestedSize: prepared.order.size,
         filledSize: null, remainingSize: prepared.order.size, tradeIds: [],
@@ -2294,7 +2062,7 @@ async function createServer() {
       const reconcileSubmission = async (httpStatus?: number, orderId: string = orderHash, tradeIds: string[] = []) => {
         const reconciled = await sdkReadOrder(credentials, orderHash).catch(() => null);
         const known = reconciled?.status === 200 && reconciled.data !== null
-          ? orderStatusResult({ orderId: orderHash, requestedSize: prepared.order.size, record: reconciled.data, orderType }) : null;
+          ? orderStatusResult({ orderId: orderHash, record: reconciled.data }) : null;
         if (known && known.status !== "UNKNOWN") return orderResult({ ...known, httpStatus: httpStatus ?? reconciled?.status });
         return orderResult({
           status: "UNKNOWN", orderId, orderType, requestedSize: prepared.order.size,
@@ -2355,8 +2123,8 @@ async function createServer() {
   server.registerTool(
     "submit_order",
     {
-      title: "Submit a PayBox-approved Polymarket FAK or FOK order",
-      description: "Makes one signed FAK or FOK POST attempt after checking the exact PayBox-approved order payload, prepared order type, and official geoblock response. Polymarket CLOB determines whether FOK fills in full. FAK may partially fill. Ambiguous POST results get at most one order-hash read-back and are never automatically resubmitted.",
+      title: "Submit FAK/FOK Order",
+      description: "Submit one prepared FAK/FOK order after verifying its signature and exact wire payload. State-changing; checks geoblock and never blindly retries an ambiguous POST.",
       inputSchema: z.object({
         preparedOrder: preparedOrderSchema, orderSignature: z.string().regex(/^0x[0-9a-fA-F]{130}$/),
         clobAuth: clobAuthSchema, orderType: orderTypeSchema,
@@ -2368,69 +2136,56 @@ async function createServer() {
   );
 
   server.registerTool(
-    "submit_fak_order",
-    {
-      title: "Submit a PayBox-approved Polymarket FAK order",
-      description: "Backward-compatible FAK submission wrapper. Makes one signed FAK POST attempt after checking the PayBox-approved payload, prepared FAK type, and official geoblock response. FAK may partially fill. Ambiguous POST results get at most one order-hash read-back and are never automatically resubmitted.",
-      inputSchema: z.object({
-        preparedOrder: preparedOrderSchema, orderSignature: z.string().regex(/^0x[0-9a-fA-F]{130}$/), clobAuth: clobAuthSchema,
-      }).strict(),
-      outputSchema: executionResultSchema,
-      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
-    },
-    async (args) => submitOrderHandler({ ...args, orderType: FAK, resultTool: "submit_fak_order" }),
-  );
-
-  server.registerTool(
     "get_order_status",
     {
-      title: "Read Polymarket order status and fills",
-      description: "Reads one authenticated order record and reports its matched size and trade IDs. No order is placed or retried.",
-      inputSchema: z.object({ orderId: z.string().regex(/^0x[0-9a-fA-F]{64}$/), requestedSize: z.string().max(32), signerAddress: addressSchema, clobAuth: clobAuthSchema, orderType: orderTypeSchema.default(FAK) }).strict(),
+      title: "Get Order Status",
+      description: "Read the authenticated provider status, matched size, and trade IDs for one order. Read-only; unknown outcomes remain unknown.",
+      inputSchema: z.object({
+        orderId: z.string().regex(/^0x[0-9a-fA-F]{64}$/), signerAddress: addressSchema,
+        accountWalletAddress: addressSchema, clobAuth: clobAuthSchema,
+      }).strict(),
       outputSchema: executionResultSchema,
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
     },
-    async ({ orderId, requestedSize, signerAddress, clobAuth, orderType }) => {
+    async ({ orderId, signerAddress, accountWalletAddress, clobAuth }) => {
       let credentials: ClobCredentials;
-      try { credentials = await deriveClobCredentials(clobAuth, signerAddress); }
+      try { credentials = await deriveClobCredentials(clobAuth, signerAddress, accountWalletAddress); }
       catch (error) {
         const failure = clobRequestFailure(error, "PS_CLOB_AUTH_FAILED", "Polymarket CLOB credentials could not be derived.");
         return tradeToolResult({
-          status: "FAILED", orderId, orderType, requestedSize, filledSize: null, remainingSize: null, tradeIds: [],
+          status: "FAILED", orderId, orderType: null, requestedSize: null, filledSize: null, remainingSize: null, tradeIds: [],
           message: failure.message, errorCode: failure.code,
           ...(failure.httpStatus === undefined ? {} : { httpStatus: failure.httpStatus }),
         }, "get_order_status");
       }
       let result: { status: number; data: unknown | null };
-      try {
-        result = await sdkReadOrder(credentials, orderId);
-      } catch (error) {
+      try { result = await sdkReadOrder(credentials, orderId); }
+      catch (error) {
         const failure = clobRequestFailure(error, "PS_PROVIDER_UNAVAILABLE", "Polymarket order status could not be read.");
         return tradeToolResult({
-          status: "UNKNOWN", orderId, orderType, requestedSize, filledSize: null, remainingSize: null, tradeIds: [],
+          status: "UNKNOWN", orderId, orderType: null, requestedSize: null, filledSize: null, remainingSize: null, tradeIds: [],
           message: failure.message, errorCode: failure.code,
           ...(failure.httpStatus === undefined ? {} : { httpStatus: failure.httpStatus }),
         }, "get_order_status");
       }
       if (result.status === 401) return tradeToolResult({
-        status: "UNKNOWN", orderId, orderType, requestedSize, filledSize: null, remainingSize: null, tradeIds: [],
+        status: "UNKNOWN", orderId, orderType: null, requestedSize: null, filledSize: null, remainingSize: null, tradeIds: [],
         message: "Polymarket rejected L2 order-status authentication (HTTP 401); verify the CLOB credentials. Order status is unconfirmed.",
         errorCode: "PS_CLOB_PRIVATE_AUTH_REJECTED", httpStatus: result.status,
       }, "get_order_status");
       if (result.status === 404) return tradeToolResult({
-        status: "UNKNOWN", orderId, orderType, requestedSize, filledSize: null, remainingSize: null, tradeIds: [],
+        status: "UNKNOWN", orderId, orderType: null, requestedSize: null, filledSize: null, remainingSize: null, tradeIds: [],
         message: "Polymarket returned HTTP 404 for this order ID; no order record was found.",
         errorCode: "PS_ORDER_NOT_FOUND", httpStatus: result.status,
       }, "get_order_status");
       if (result.status < 200 || result.status >= 300) return tradeToolResult({
-        status: "UNKNOWN", orderId, orderType, requestedSize, filledSize: null, remainingSize: null, tradeIds: [],
+        status: "UNKNOWN", orderId, orderType: null, requestedSize: null, filledSize: null, remainingSize: null, tradeIds: [],
         message: `${clobPrivateHttpFailure(result.status).message} Order status is unconfirmed.`,
-        errorCode: clobPrivateHttpFailure(result.status).code,
-        httpStatus: result.status,
+        errorCode: clobPrivateHttpFailure(result.status).code, httpStatus: result.status,
       }, "get_order_status");
-      const known = result.data === null ? null : orderStatusResult({ orderId, requestedSize, record: result.data, orderType });
+      const known = result.data === null ? null : orderStatusResult({ orderId, record: result.data });
       if (known === null) return tradeToolResult({
-        status: "UNKNOWN", orderId, orderType, requestedSize, filledSize: null, remainingSize: null, tradeIds: [],
+        status: "UNKNOWN", orderId, orderType: null, requestedSize: null, filledSize: null, remainingSize: null, tradeIds: [],
         message: "Polymarket returned no authoritative order record.", errorCode: "PS_ORDER_STATUS_UNKNOWN", httpStatus: result.status,
       }, "get_order_status");
       return tradeToolResult({ ...known, httpStatus: result.status }, "get_order_status");
@@ -2440,20 +2195,22 @@ async function createServer() {
   server.registerTool(
     "cancel_order",
     {
-      title: "Cancel an open Polymarket order",
-      description: "Cancels one specified open order only after explicit confirmation. An ambiguous cancellation is reconciled once; the cancellation is never blindly retried.",
-      inputSchema: z.object({ orderId: z.string().regex(/^0x[0-9a-fA-F]{64}$/), requestedSize: z.string().max(32), signerAddress: addressSchema, clobAuth: clobAuthSchema, confirmCancel: z.literal(true) }).strict(),
+      title: "Cancel Order",
+      description: "Cancel one identified order through the authenticated SDK, then reconcile ambiguous results without retrying. State-changing; obtain user confirmation first.",
+      inputSchema: z.object({
+        orderId: z.string().regex(/^0x[0-9a-fA-F]{64}$/), signerAddress: addressSchema,
+        accountWalletAddress: addressSchema, clobAuth: clobAuthSchema, confirmCancel: z.literal(true),
+      }).strict(),
       outputSchema: executionResultSchema,
       annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
     },
-    async ({ orderId, requestedSize, signerAddress, clobAuth }) => {
+    async ({ orderId, signerAddress, accountWalletAddress, clobAuth }) => {
       let credentials: ClobCredentials;
-      try {
-        credentials = await deriveClobCredentials(clobAuth, signerAddress);
-      } catch (error) {
+      try { credentials = await deriveClobCredentials(clobAuth, signerAddress, accountWalletAddress); }
+      catch (error) {
         const failure = clobRequestFailure(error, "PS_CLOB_AUTH_FAILED", "Polymarket CLOB credentials could not be derived.");
         return tradeToolResult({
-          status: "FAILED", orderId, orderType: FAK, requestedSize, filledSize: null, remainingSize: null, tradeIds: [],
+          status: "FAILED", orderId, orderType: null, requestedSize: null, filledSize: null, remainingSize: null, tradeIds: [],
           message: failure.message, errorCode: failure.code,
           ...(failure.httpStatus === undefined ? {} : { httpStatus: failure.httpStatus }),
         }, "cancel_order");
@@ -2461,41 +2218,36 @@ async function createServer() {
       const reconcileCancellation = async (deleteStatus?: number) => {
         const readback = await sdkReadOrder(credentials, orderId).catch(() => null);
         const known = readback?.status === 200 && readback.data !== null
-          ? orderStatusResult({ orderId, requestedSize, record: readback.data }) : null;
+          ? orderStatusResult({ orderId, record: readback.data }) : null;
         if (known && known.status !== "UNKNOWN") return tradeToolResult({ ...known, httpStatus: deleteStatus ?? readback?.status }, "cancel_order");
         const httpStatus = deleteStatus ?? readback?.status;
         return tradeToolResult({
-          status: "UNKNOWN", orderId, orderType: FAK, requestedSize,
+          status: "UNKNOWN", orderId, orderType: null, requestedSize: null,
           filledSize: null, remainingSize: null, tradeIds: [],
           message: "Cancellation was not authoritatively confirmed. Inspect the order before any further cancellation request.",
           errorCode: "PS_CANCEL_UNKNOWN", ...(httpStatus === undefined ? {} : { httpStatus }),
         }, "cancel_order");
       };
       let canceled: { status: number; data: unknown | null };
-      try {
-        canceled = await sdkResponse(() => credentials.cancelOrder({ orderId }));
-      } catch {
-        return reconcileCancellation();
-      }
+      try { canceled = await sdkResponse(() => credentials.cancelOrder({ orderId })); }
+      catch { return reconcileCancellation(); }
       if (canceled.status >= 400 && canceled.status < 500 && canceled.status !== 408 && canceled.status !== 429) {
         const failure = clobPrivateHttpFailure(canceled.status);
         return tradeToolResult({
-          status: canceled.status === 400 ? "REJECTED" : "FAILED", orderId, orderType: FAK, requestedSize,
+          status: canceled.status === 400 ? "REJECTED" : "FAILED", orderId, orderType: null, requestedSize: null,
           filledSize: null, remainingSize: null, tradeIds: [], message: failure.message,
           errorCode: failure.code, httpStatus: canceled.status,
         }, "cancel_order");
       }
-      if (canceled.status === 408 || canceled.status === 429 || canceled.status >= 500) {
-        return reconcileCancellation(canceled.status);
-      }
+      if (canceled.status === 408 || canceled.status === 429 || canceled.status >= 500) return reconcileCancellation(canceled.status);
       if (canceled.status >= 200 && canceled.status < 300 && canceled.data !== null) {
         const result = z.object({ canceled: z.array(z.string()).optional(), not_canceled: z.record(z.string(), z.string()).optional() }).passthrough().safeParse(canceled.data);
         if (result.success && result.data.canceled?.some((id) => id.toLowerCase() === orderId.toLowerCase())) return tradeToolResult({
-          status: "CANCELLED", orderId, orderType: FAK, requestedSize, filledSize: null, remainingSize: null, tradeIds: [],
+          status: "CANCELLED", orderId, orderType: null, requestedSize: null, filledSize: null, remainingSize: null, tradeIds: [],
           message: "Polymarket confirmed the order cancellation.", httpStatus: canceled.status,
         }, "cancel_order");
         if (result.success && result.data.not_canceled && Object.keys(result.data.not_canceled).some((id) => id.toLowerCase() === orderId.toLowerCase())) return tradeToolResult({
-          status: "REJECTED", orderId, orderType: FAK, requestedSize, filledSize: null, remainingSize: null, tradeIds: [],
+          status: "REJECTED", orderId, orderType: null, requestedSize: null, filledSize: null, remainingSize: null, tradeIds: [],
           message: "Polymarket did not cancel the requested order.", errorCode: "PS_CLOB_REJECTED", httpStatus: canceled.status,
         }, "cancel_order");
       }
@@ -2504,106 +2256,35 @@ async function createServer() {
   );
 
   server.registerTool(
-    "get_trading_readiness",
+    "get_trading_approvals",
     {
-      title: "Read Polymarket trading readiness",
-      description: "Reads official SDK indexed trading-approval state for the supplied public account wallet. Funding, gas and exact order-size sufficiency remain UNKNOWN. Optional marketId/side are retained for compatibility; this is an aggregate SDK approval summary. Never signs, approves, funds, or sends transactions.",
-      inputSchema: z.object({
-        walletAddress: addressSchema, walletType: walletTypeSchema,
-        marketId: z.string().regex(/^[0-9]{1,32}$/).optional(), side: sideSchema.optional(),
-      }).strict(),
-      outputSchema: tradingReadinessSchema,
+      title: "Get Trading Approvals",
+      description: "Read the SDK's indexed trading-approval status and missing requirements for a public wallet. Read-only; does not check funding, gas, or per-order sufficiency.",
+      inputSchema: z.object({ walletAddress: addressSchema }).strict(),
+      outputSchema: tradingApprovalsSchema,
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
     },
-    async ({ walletAddress, walletType }) => {
+    async ({ walletAddress }) => {
       const state = await runSdk(() => createPolymarketClient().fetchTradingApprovalsState({ user: walletAddress })).catch(() => null);
-      return textToolResult("get_trading_readiness", tradingReadinessSchema.parse({
-        status: state && !state.isFullyApproved ? "ACTION_REQUIRED" : "UNKNOWN",
-        wallet: { address: getAddress(walletAddress), type: walletType, addressRole: "ACCOUNT_WALLET" },
-        chainId: 137, observedAt: new Date().toISOString(),
-        pUsdBalance: { baseUnits: null, formatted: null, decimals: 6, status: "UNKNOWN" }, polBalance: null,
-        approval: { kind: null, target: null, tokenLedger: null, allowanceBaseUnits: null,
-          status: state ? state.isFullyApproved ? "PRESENT" : "MISSING" : "UNKNOWN" },
-        eoaTradingEligibility: walletType === "EOA" ? "UNKNOWN" : "NOT_APPLICABLE",
-        reason: state ? "Official SDK indexed trading-approval state; funding, gas, freshness and order-size sufficiency remain UNKNOWN." : "Official SDK trading-approval state is unavailable.",
-        nextAction: state && !state.isFullyApproved ? "EXTERNAL_ACTION_REQUIRED: Review missing approvals in the official Polymarket wallet flow." : null,
+      return textToolResult("get_trading_approvals", tradingApprovalsSchema.parse({
+        walletAddress: getAddress(walletAddress),
+        isFullyApproved: state?.isFullyApproved ?? null,
+        missingRequirements: state ? {
+          erc20: state.missing.erc20.map((approval) => ({
+            amount: approval.amount.toString(), spenderAddress: approval.spenderAddress, tokenAddress: approval.tokenAddress,
+          })),
+          erc1155: state.missing.erc1155,
+        } : null,
+        observedAt: new Date().toISOString(), source: "Polymarket SDK indexed trading approvals",
       }));
     },
   );
 
   server.registerTool(
-    "prepare_redeem",
+    "get_positions",
     {
-      title: "Prepare a Polymarket redemption preview",
-      description: "Uses official SDK indexed positions and redemption workflows for the explicitly supplied owner. Accepts reusable signed ClobAuth and owner signingAddress for the SDK client. Returns an unsigned preview with EXTERNAL_ACTION_REQUIRED; route approval, fresh chain finality, and Polygon PayBox proposal support remain unverified. Never signs, submits approvals, or broadcasts.",
-      inputSchema: z.object({
-        walletAddress: addressSchema, walletType: walletTypeSchema, signingAddress: addressSchema, clobAuth: clobAuthSchema,
-        conditionId: z.string().regex(/^0x[0-9a-fA-F]{64}$/),
-      }).strict(),
-      outputSchema: preparedRedeemSchema,
-      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
-    },
-    async ({ walletAddress, walletType, conditionId, signingAddress, clobAuth }) => {
-      const base = { conditionId, wallet: { address: getAddress(walletAddress), type: walletType, addressRole: "POSITION_OWNER" },
-        market: { marketId: null, question: null, version: null, negRisk: null }, resolution: "UNKNOWN", positionLedger: "UNKNOWN",
-        positions: [], routeApproval: null, transactionPreview: [], execution: "NOT_READY", missingRequirements: [], unknownRequirements: [], nextActions: [], errorCode: null };
-      try {
-        const client = await deriveClobCredentials(clobAuth, signingAddress, walletAddress);
-        if (["EOA", "PROXY", "SAFE", "DEPOSIT_WALLET"][client.account.walletType] !== walletType) throw new Error("PS_WALLET_BINDING: Account type differs from SDK identity.");
-        const page = await runSdk(() => client.listPositions({ user: walletAddress, conditionId, pageSize: 3 }).firstPage());
-        if (page.hasMore || page.items.some((position) => position.wallet.toLowerCase() !== walletAddress.toLowerCase() || position.conditionId.toLowerCase() !== conditionId.toLowerCase())) {
-          throw new Error("PS_MARKET_IDENTITY: Position page is incomplete or differs from the requested owner and condition.");
-        }
-        const held = page.items.filter((position) => toUnits(position.currentSize, 6) > 0n);
-        const positions = held.map((position) => ({ outcome: position.outcome ?? "Unknown", tokenId: position.assetId,
-          balanceBaseUnits: toUnits(position.currentSize, 6).toString(), ownership: "HELD" }));
-        if (!held.length) return textToolResult("prepare_redeem", preparedRedeemSchema.parse({ ...base, status: "NO_POSITION" }));
-        if (held.some((position) => !position.redeemable || position.status !== "REDEEMABLE")) {
-          return textToolResult("prepare_redeem", preparedRedeemSchema.parse({ ...base, status: "UNRESOLVED", positions,
-            unknownRequirements: ["The official indexed position state does not mark every held outcome redeemable."] }));
-        }
-        const markets = await runSdk(() => client.listMarkets({ conditionIds: [conditionId], pageSize: 1 }).firstPage());
-        const market = markets.items[0];
-        if (!market || market.conditionId?.toLowerCase() !== conditionId.toLowerCase()) throw new Error("PS_MARKET_IDENTITY: No exact SDK market match.");
-        const assets = [market.outcomes.yes, market.outcomes.no].map((outcome) => outcome.positionId ?? outcome.tokenId);
-        if (held.some((position) => !assets.includes(position.assetId))) throw new Error("PS_MARKET_IDENTITY: Indexed position asset differs from SDK market outcomes.");
-        if (walletType !== "EOA") return textToolResult("prepare_redeem", preparedRedeemSchema.parse({ ...base,
-          status: "UNSUPPORTED", execution: "EXTERNAL_ACTION_REQUIRED", positions,
-          unknownRequirements: ["The public SDK gasless-wallet workflow requires relayer authorization and signing before direct calls can be exposed; PolyScope supplies neither."],
-          nextActions: ["Use the official authorized wallet redemption flow. No approval, signing or broadcast was requested."],
-        }));
-        const requests = market.version === "v2" ? held.map((position) => ({ positionId: position.assetId })) : [{ conditionId }];
-        const previews: z.infer<typeof transactionPreviewSchema>[] = [];
-        for (const request of requests) {
-          const workflow = "positionId" in request ? await runSdk(() => prepareRedeemPosition(client, request)) : await runSdk(() => prepareRedeemMarketPositions(client, request));
-          try {
-            const step = await runSdk(() => workflow.next());
-            if (!step.done && step.value.kind === "sendRedeemPositionsTransaction") {
-              previews.push({ from: getAddress(walletAddress), to: step.value.request.to, value: "0", data: step.value.request.data ?? "0x" });
-            }
-          } finally { await workflow.return(undefined!); }
-        }
-        return textToolResult("prepare_redeem", preparedRedeemSchema.parse({ ...base,
-          market: { marketId: market.id, question: market.question ?? null, version: market.version ?? null, negRisk: market.state.negRisk ?? null },
-          positionLedger: market.version === "v2" ? "PositionManager" : market.state.negRisk ? "NegRisk Adapter" : "Conditional Tokens",
-          positions, status: previews.length === requests.length ? "PREPARED" : "UNSUPPORTED", transactionPreview: previews,
-          execution: "EXTERNAL_ACTION_REQUIRED",
-          unknownRequirements: ["Indexed redeemability is not fresh chain finality. Route approval and Polygon transaction-proposal validation are unverified."],
-          nextActions: [previews.length ? "Review SDK-generated unsigned calls in an authorized official wallet flow. No transaction was signed or broadcast."
-            : "The SDK requests a gasless-wallet signature before exposing direct calls. Complete redemption in the official wallet flow."],
-        }));
-      } catch {
-        return textToolResult("prepare_redeem", preparedRedeemSchema.parse({ ...base, status: "UNKNOWN",
-          unknownRequirements: ["Official SDK redemption preparation could not be completed."], errorCode: "PS_MARKET_DATA_UNAVAILABLE" }));
-      }
-    },
-  );
-
-  server.registerTool(
-    "get_portfolio",
-    {
-      title: "Read public Polymarket positions and PnL",
-      description: "Reads one cursor-paginated page of the default OPEN single-market positions and PnL view from Polymarket Data API v2. OPEN may include held REDEEMABLE positions after resolution; these rows are preserved. Pass nextCursor to continue; complete is true only after the final page of this view. The caller-provided address is not proof of wallet ownership. Closed positions and combos are not included.",
+      title: "Get Open Positions",
+      description: "Read paginated public OPEN single-market positions and PnL for a wallet. Read-only; excludes closed positions, cash, and combos.",
       inputSchema: z.object({
         walletAddress: addressSchema, limit: z.number().int().min(1).max(50).default(20),
         cursor: z.string().min(1).max(4_096).optional(),
@@ -2627,7 +2308,7 @@ async function createServer() {
         throw new Error("PS_PORTFOLIO_INVALID: Polymarket returned an unsupported positions page or inconsistent cursor metadata.");
       }
       const { data: positions, pagination } = page.data;
-      return textToolResult("get_portfolio", {
+      return textToolResult("get_positions", {
         walletAddress, addressBinding: "PUBLIC_ADDRESS_UNVERIFIED", observedAt: new Date().toISOString(),
         sourceUrl: url.toString(), positions, complete: !pagination.has_more,
         hasMore: pagination.has_more, nextCursor: pagination.next_cursor,

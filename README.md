@@ -2,7 +2,7 @@
 
 ![PolyScope logo](assets/polyscope-logo.png)
 
-PolyScope is a PayBox plugin for AI-assisted Polymarket research and user-approved, single-market FAK/FOK trading. It provides structured market, quote, soccer research, signing-preparation, order-status, cancellation, readiness, redemption-preview, and portfolio tools to a PayBox-connected AI agent.
+PolyScope is a PayBox plugin for AI-assisted Polymarket research and user-approved, single-market FAK/FOK trading. It provides 11 structured tools for market discovery, soccer research, order preparation, user-approved FAK/FOK execution, order recovery, approvals readback, and positions.
 
 > PolyScope is an independent, unofficial project. It is not affiliated with, endorsed by, or sponsored by Polymarket.
 
@@ -12,52 +12,47 @@ PolyScope is a PayBox plugin for AI-assisted Polymarket research and user-approv
 
 The PayBox-connected AI agent uses the plugin's tools to assemble evidence. PolyScope does not contain a separate trading strategy or autonomous decision engine.
 
-1. **Soccer research:** `research_soccer` uses football-data.org for fixtures, results, and recent form. On primary request failure or unusable data, it tries one API-Football fixture lookup scoped to the competition, season, and one UTC date; valid HTTP 200 with zero fixtures does not trigger fallback. Exact fallback matching requires competition, both teams, and kickoff. football-data.org IDs are never reused as API-Football IDs. `includeApiFootball: true` still opts into venue statistics on a successful exact football-data.org fixture. `get_soccer_news` returns team-attributed ESPN headlines with source and publication timestamps.
+1. **Soccer research:** `research_soccer` uses football-data.org for fixtures, results, and recent form. On primary request failure or unusable data, it tries one API-Football fixture lookup scoped to the competition, season, and one UTC date; valid HTTP 200 with zero fixtures does not trigger fallback. Exact fallback matching requires competition, both teams, and kickoff. football-data.org IDs are never reused as API-Football IDs. `includeApiFootball: true` still opts into venue statistics on a successful exact football-data.org fixture. Use host-native web research for current injuries, lineups, and news; PolyScope does not provide a news-feed tool.
 2. **Polymarket discovery:** `search_markets` finds active markets and maps outcomes to their CLOB asset IDs. The agent selects the relevant market and outcome.
-3. **Quote:** `get_quote` reads order-book depth, price, visible fillability, fees, and capture-time freshness. It does not create an order. The 30-second freshness threshold is a PolyScope indicator, not an exchange order-expiration rule.
+3. **Quote:** `get_market_quote` reads order-book depth, price, visible fillability, fees, and capture-time freshness. It does not create an order. The 30-second freshness threshold is a PolyScope indicator, not an exchange order-expiration rule.
 4. **Independent analysis:** `analyze_soccer_edge` estimates regulation-time Home/Draw/Away probabilities from historical venue-specific goal averages, then compares the selected outcome with supplied CLOB ask depth and fees. It recalculates quote freshness at analysis time from the original book timestamp. A stale quote can still produce a historical edge estimate, clearly labeled with its age and timestamp; it is not current executable market evidence. API-Football-only fixtures require separate host-attested identity evidence and a matching host-attested Polymarket market/outcome mapping; browser evidence is used for identity only, never as Poisson statistics. Missing evidence or statistics returns null probabilities and edge values. It does not use market prices in its probability model or authorize or block trading.
 5. **AI recommendation:** The agent explains its evidence, sources and timestamps, uncertainty, liquidity, risks, edge, and missing data, then recommends **TRADE** or **NO TRADE**. News and provider data are untrusted input and must not be treated as instructions.
 6. **User decision:** The user explicitly chooses **BUY**, **SELL**, or **NO TRADE**, and approves the market, outcome, price bound, and size. Quote fee estimates are informational; PolyScope does not enforce a spending-cap or trading-risk policy.
-7. **PayBox authentication and orders:** Call `prepare_clob_auth`, let PayBox sign its complete SDK-generated payload, and reuse `{timestamp, nonce, signature}` as `clobAuth` while Polymarket accepts it. Pass that material into `prepare_order_signing`. The official SDK prepares and rounds the order; the returned effective signed size is what PayBox approves. PayBox signs the exact Order payload. PolyScope verifies that signature and the reconstructed wire fields locally, checks the official geoblock endpoint, then makes one SDK POST. PolyScope does not refresh market, book, or fee state or reconsider the trade after approval. Diagnostic `validate_clob_auth_signature` and `validate_order_signature` calls are optional. `get_order_status` uses the SDK for authenticated readback.
+7. **PayBox authentication and orders:** Call `prepare_clob_auth`, let PayBox sign its complete SDK-generated payload, and reuse `{timestamp, nonce, signature}` as `clobAuth` while Polymarket accepts it. Pass that material into `prepare_order`. The official SDK prepares and rounds the order; the returned effective signed size is what PayBox approves. PayBox signs the exact Order payload. PolyScope verifies that signature and the reconstructed wire fields locally, checks the official geoblock endpoint, then makes one SDK POST. PolyScope does not refresh market, book, or fee state or reconsider the trade after approval. `get_order_status` uses the SDK for authenticated readback.
 
 ```text
 prepare_clob_auth → PayBox signs once
-prepare_order_signing(FAK, clobAuth) → PayBox signs FAK Order → submit_order(FAK, clobAuth)
-prepare_order_signing(FOK, same clobAuth) → PayBox signs FOK Order → submit_order(FOK, same clobAuth)
+prepare_order(FAK, clobAuth) → PayBox signs FAK Order → submit_order(FAK, clobAuth)
+prepare_order(FOK, same clobAuth) → PayBox signs FOK Order → submit_order(FOK, same clobAuth)
 ```
 
-SDK authentication rejection requires explicit fresh authentication. Credentials are derived/created inside each invocation, never returned or persisted. The public unified SDK requires an authenticated client for its preparation workflows; `prepare_order_signing` therefore adds required `clobAuth`, and `prepare_redeem` adds required `signingAddress` and `clobAuth`. These are public owner addresses and signed material, not PayBox wallet IDs or grants.
+SDK authentication rejection requires explicit fresh authentication. Credentials are derived/created inside each invocation, never returned or persisted. Order preparation requires reusable `clobAuth`; status and cancellation require both the owner `signerAddress` and the `accountWalletAddress`. These are public addresses and signed material, not PayBox wallet IDs or grants.
 
-FAK may partially fill and its remainder does not rest. FOK is all-or-cancel: the CLOB determines whether the full size can be filled, and local book depth is not a guarantee. `prepare_order_signing` defaults to FAK; the trusted prepared approval context binds the submitted order type to the order PayBox approved. Readiness is informational and never gates submission. PolyScope does not automatically fund or approve wallets. There is no GTC/resting-order strategy, Combo, Parlay, RFQ, multi-leg order, autonomous scheduler, or automatic retry. An ambiguous submission is reported as `UNKNOWN` and is not automatically resubmitted.
+FAK may partially fill and its remainder does not rest. FOK is all-or-cancel: the CLOB determines whether the full size can be filled, and local book depth is not a guarantee. `prepare_order` requires an explicit order type; the trusted prepared approval context binds the submitted order type to the order PayBox approved. `get_trading_approvals` reports SDK-indexed approval requirements and never gates submission. PolyScope does not automatically fund or approve wallets. There is no GTC/resting-order strategy, Combo, Parlay, RFQ, multi-leg order, autonomous scheduler, or automatic retry. An ambiguous submission is reported as `UNKNOWN` and is not automatically resubmitted.
 
 ## Tools
 
 | Tool | Purpose |
 |---|---|
-| `search_markets` | Find active Polymarket markets and return each outcome's public CLOB asset ID, resolution details, and observed market data. |
-| `get_quote` | Read one outcome's public order book and estimate visible BUY/SELL fillability, prices, and fees. Its 30-second freshness label is informational, not an order-expiration rule. No order is created. |
-| `get_soccer_news` | Read ESPN soccer headlines and continue with host-native browser research for missing or incomplete information. Headlines are not verified injury or lineup reports. |
-| `research_soccer` | Read football-data.org fixtures/results/form, automatically fall back to API-Football on provider failure or unusable responses, and return provider-qualified fallback IDs and diagnostics. A valid empty result stays distinct. Continue browser research for gaps. |
-| `analyze_soccer_edge` | Calculate independent regulation-time 1X2 Poisson probabilities from supported structured API evidence and compare a validated market mapping against CLOB BUY depth and fees. API-only fallback requires separately verified fixture identity. No order is created. |
-| `prepare_clob_auth` | Prepare the Polygon ClobAuth EIP-712 payload for an existing signer. |
-| `validate_clob_auth_signature` | Optional local signer diagnostic; does not establish provider acceptance. |
-| `prepare_order_signing` | Ask the official SDK to prepare a FAK or FOK BUY or SELL for the selected outcome, price bound, and size; return the effective order and its signing intent. The default is FAK. |
-| `validate_order_signature` | Optional local signer diagnostic for the stored SDK payload. Contract acceptance remains with Polymarket. |
-| `submit_order` | Submit one PayBox-approved FAK or FOK order after local signature/payload checks and the standalone official geoblock check. An ambiguous result is reconciled at most once and is never automatically resubmitted. |
-| `submit_fak_order` | Backward-compatible FAK-only submission wrapper. It rejects a prepared FOK instead of changing its type. |
-| `get_order_status` | Read one authenticated Polymarket order record and report matched size and trade IDs. |
-| `cancel_order` | Request cancellation for one explicitly confirmed order and reconcile an ambiguous response once. |
-| `get_trading_readiness` | Read the SDK aggregate indexed approval state. Funding, gas, per-order sufficiency and EOA eligibility remain UNKNOWN. Optional marketId/side remain accepted for compatibility. |
-| `prepare_redeem` | Use SDK indexed redeemability and unsigned redemption workflows. Return EXTERNAL_ACTION_REQUIRED; fresh chain resolution/approvals and Polygon proposal support remain unverified. Never signs or broadcasts. |
-| `get_portfolio` | Read one cursor-paginated page of public OPEN single-market positions and PnL from Data API v2. OPEN may include held `REDEEMABLE` positions after resolution; those rows are preserved. |
+| `search_markets` | Find active markets, map outcomes to CLOB asset IDs, and include resolution metadata. |
+| `get_market_quote` | Read an outcome order book and estimate visible BUY/SELL fillability, spread, price, and fees. |
+| `research_soccer` | Read supported fixtures, results, and recent form, with bounded API-Football fallback. |
+| `analyze_soccer_edge` | Estimate regulation-time 1X2 probabilities and compare them with a supplied CLOB BUY quote. |
+| `prepare_clob_auth` | Prepare SDK-derived ClobAuth EIP-712 data for PayBox signing. |
+| `prepare_order` | Prepare a FAK/FOK BUY or SELL order and return effective amounts and its EIP-712 payload. |
+| `submit_order` | Verify signed order data, check geoblock, and submit one user-approved FAK/FOK order. |
+| `get_order_status` | Read the provider's order record using the owner signer and account wallet. |
+| `cancel_order` | Request one explicitly confirmed cancellation and reconcile an ambiguous response once. |
+| `get_trading_approvals` | Read SDK-indexed trading approvals and missing requirements for an account wallet. |
+| `get_positions` | Read a cursor-paginated public OPEN positions and PnL page. |
 
-Every successful tool returns a machine-readable JSON object serialized in `content[].text`, alongside its existing `structuredContent`. Market search text keeps exact market, condition, and outcome asset IDs while omitting verbose resolution rules. Signing tools include the complete EIP-712 payload in text so text-only MCP clients can continue the PayBox signing flow. Signature validation text reports signer and encoding results without echoing the signed order signature.
+Every successful tool returns a machine-readable JSON object serialized in `content[].text`, alongside its existing `structuredContent`. Market search text keeps exact market, condition, and outcome asset IDs while omitting verbose resolution rules. Signing tools include the complete EIP-712 payload in text so text-only MCP clients can continue the PayBox signing flow. Execution signature checks run internally; no separate validator tools are exposed.
 
 ## Architecture
 
 - **Runtime:** TypeScript MCP server over stdio, following the PayBox starter 1.0.2 structure.
-- **Research providers:** Polymarket Gamma and CLOB public APIs, football-data.org for primary soccer fixtures/results/form, API-Football as a bounded fallback after primary provider failure or unusable responses (and optional exact-fixture enrichment on primary success), and ESPN RSS for headlines. TheSportsDB remains disabled.
-- **Ownership:** PolyScope owns research, market/outcome selection, quote/edge presentation, signed-payload integrity, FAK/FOK approval-context binding, MCP output, provenance and ambiguous-outcome protection. `@polymarket/client@0.13.0` owns authentication, HMAC, wallet classification, protocol/exchange routing, amount rounding and typed data, POST/read/cancel, indexed approvals and redemption construction. PayBox owns wallet choice/grants, policy, human approval, signing, simulation and supported transaction broadcasting.
+- **Research providers:** Polymarket Gamma and CLOB public APIs, football-data.org for primary soccer fixtures/results/form, API-Football as a bounded fallback after primary provider failure or unusable responses (and optional exact-fixture enrichment on primary success), . TheSportsDB is not called automatically.
+- **Ownership:** PolyScope owns research, market/outcome selection, quote/edge presentation, signed-payload integrity, FAK/FOK approval-context binding, MCP output, provenance and ambiguous-outcome protection. `@polymarket/client@0.13.0` owns authentication, HMAC, wallet classification, protocol/exchange routing, amount rounding and typed data, POST/read/cancel, indexed trading approvals. PayBox owns wallet choice/grants, policy, human approval, signing, simulation and supported transaction broadcasting.
 - **Compatibility adapters:** The SDK has no public stateless order-signature finalizer. PolyScope reattaches the saved SDK fields, checks them against the exact reconstructed wire order locally, and applies a small ERC-7739 envelope for owner Deposit Wallet signatures using generic viem hashes. No SDK implementation files are copied or deep-imported. Public Gamma/book adapters retain quote provenance and raw timestamp/version diagnostics that SDK-normalized book output does not preserve; order/exchange routing still comes from the SDK. Fee descriptors are fetched and decoded for informational quote estimates only. A scoped HTTP adapter prevents a second mutation transmission if SDK transport retries DELETE and retains the first response status. A two-line declaration correction in `patches/` fixes an upstream generated mapped-type error; runtime SDK code is unchanged.
 - **State:** No database or persistent service. Order recovery does not assume exactly-once delivery; ambiguous POST outcomes remain `UNKNOWN` unless authoritative read-back resolves them.
 - **Market scope:** The generic Polymarket discovery, quote, and trade path applies to active crypto, weather, soccer, politics, or finance markets when their market and outcome metadata meet the supported single-market CLOB requirements. The plugin does not provide specialized weather, xG, injury, or lineup data.
@@ -74,13 +69,13 @@ TheSportsDB free v1 was checked read-only on 2026-10-17 using its public Arsenal
 
 `analyze_soccer_edge` implements an independent Poisson goals model, version `1.0.0`. For API-Football-only fixtures, the agent supplies identity evidence and a market mapping as host attestations. A caller-provided `VERIFIED` value is the host's claim; PolyScope does not fetch the URLs or independently verify their authenticity. The output labels the attestation authority and separately reports local field-consistency checks. Those checks compare identity fields to the fixture and market fields to the supplied quote, fixture, and resolution declarations; they do not validate external source content. Browser statistics are never model inputs. Missing identity or model inputs produce unavailable probabilities and null edge/EV. The existing Poisson formula and market-specific edge behavior otherwise remain unchanged.
 
-Only a market whose rules match the exact 90-minute Home/Draw/Away outcome can receive an edge. Extra time, qualification, totals, both-teams-to-score, and other semantics are not mapped. For BUY, the tool uses `get_quote` CLOB ask levels, weighted fill price, gross cost, and fees: effective cost/share = (gross fill cost + fees) / fillable shares; net edge/share = outcome probability - effective cost/share; expected value = fillable shares × net edge/share. Fees are included once. Partial FAK availability limits the calculation to visible fillable shares; the remainder is not assumed to rest. SELL edge is unavailable without an existing position and sale-proceeds basis. Edge is analysis, not a trade gate or guarantee.
+Only a market whose rules match the exact 90-minute Home/Draw/Away outcome can receive an edge. Extra time, qualification, totals, both-teams-to-score, and other semantics are not mapped. For BUY, the tool uses `get_market_quote` CLOB ask levels, weighted fill price, gross cost, and fees: effective cost/share = (gross fill cost + fees) / fillable shares; net edge/share = outcome probability - effective cost/share; expected value = fillable shares × net edge/share. Fees are included once. Partial FAK availability limits the calculation to visible fillable shares; the remainder is not assumed to rest. SELL edge is unavailable without an existing position and sale-proceeds basis. Edge is analysis, not a trade gate or guarantee.
 
 When both structured providers fail, their diagnostics are returned and the tool description and soccer skill direct the agent to continue with host-native search/browser tools. Browser findings remain agent-reported evidence with original URLs, separate access/publication times, verification labels, and categorical confidence rationale; they are not API statistics and are not sent to the Poisson model. If browsing is unavailable, report that and the remaining gaps. PayBox automatic repository-skill loading, host browser execution, and host-scoped credential injection remain **UNVERIFIED**. Local deterministic tests do not prove provider availability or hosted browser execution.
 
 ### PayBox skill discovery
 
-The [official PayBox plugin README](https://github.com/moonpay/paybox-plugin/blob/main/README.md) describes its MCP server and packaged skills, but does not specify automatic loading of arbitrary repository `SKILL.md` files by a connected host. Repository-to-host `SKILL.md` loading is therefore **UNVERIFIED**. The soccer skill is included in this repository, and `research_soccer` and `get_soccer_news` tool descriptions repeat its core continuation instruction. Offline checks confirm these instructions appear in built MCP definitions; they do not prove live agent browsing. No browser service or crawler is added. PR #3 is merged; this branch integrates its trading implementation and rebuilds the tracked plugin bundle.
+The [official PayBox plugin README](https://github.com/moonpay/paybox-plugin/blob/main/README.md) describes its MCP server and packaged skills, but does not specify automatic loading of arbitrary repository `SKILL.md` files by a connected host. Repository-to-host `SKILL.md` loading is therefore **UNVERIFIED**. The soccer skill is included in this repository, and `research_soccer` tool description repeats its core continuation instruction. Offline checks confirm these instructions appear in built MCP definitions; they do not prove live agent browsing. No browser service or crawler is added. PR #3 is merged; this branch integrates its trading implementation and rebuilds the tracked plugin bundle.
 
 ## Technology stack
 
@@ -89,7 +84,6 @@ The [official PayBox plugin README](https://github.com/moonpay/paybox-plugin/blo
 - `@modelcontextprotocol/server` 2.0.0
 - Zod 4 for tool input and output schemas
 - viem 2 for EIP-712, address, and signature operations
-- fast-xml-parser 5 for ESPN RSS
 - esbuild 0.28 for the Node.js 24 bundle
 
 Dependency versions are pinned in `package.json` and `pnpm-lock.yaml`.
@@ -114,7 +108,7 @@ The upload artifact is generated at `dist/plugin.mjs` and must remain under PayB
 Suggested project details:
 
 - **Project name:** `POLYSCOPE`
-- **Description:** `AI-assisted Polymarket research and user-approved trading. Discover markets, analyze live odds and soccer news, execute FAK/FOK BUY/SELL through PayBox, and verify order outcomes.`
+- **Description:** `AI-assisted Polymarket research and user-approved trading. Discover markets, research soccer fixtures, compare CLOB quotes, prepare FAK/FOK BUY/SELL orders, and read order outcomes.`
 - **Plugin file:** upload `dist/plugin.mjs` directly, not a ZIP.
 
 Add only these exact network hosts to the PayBox allowlist:
@@ -123,13 +117,10 @@ Add only these exact network hosts to the PayBox allowlist:
 |---|---|
 | `gamma-api.polymarket.com` | Active market discovery and market metadata |
 | `clob.polymarket.com` | Order books, fee metadata, authentication, orders, status, and cancellation |
-| `data-api.polymarket.com` | Positions, PnL, indexed trading-approval and redeemability state |
+| `data-api.polymarket.com` | Positions, PnL, and indexed trading-approval state |
 | `polymarket.com` | Geoblock preflight endpoint |
-| `polygon.drpc.org` | SDK read-only Polygon position reads for V2 redemption |
-| `relayer-v2.polymarket.com` | SDK read-only wallet deployment-state checks; plugin signer refuses all deployment signing |
 | `api.football-data.org` | Soccer fixtures, results, and team history |
 | `v3.football.api-sports.io` | Optional API-Football dated fixtures and venue-specific team statistics |
-| `www.espn.com` | ESPN soccer RSS headlines |
 
 Soccer research requires a developer-owned football-data.org token. Configure it in PayBox **Variables & Secrets** as a host-scoped Secret for `api.football-data.org`, with header name `X-Auth-Token` and the token as its value. PayBox should broker the header to requests for that host. Do not place the token in source, `.env` files, example arguments, or the bundle. No environment variables are required by the plugin source. Without a valid configured token, soccer results may be `UNAVAILABLE`.
 
@@ -142,7 +133,7 @@ Optional API-Football enrichment requires an API key configured as a host-scoped
 - The SDK classifies supported owner wallets; no wallet is selected or deployed by PolyScope. EOA signatures are locally recovered against the selected signer. For PROXY, SAFE, and Deposit Wallets, local signer recovery and the preserved signature type/wrapping are checked; final contract-wallet signature acceptance is delegated to Polymarket CLOB. No Polygon RPC signature preflight is performed. Deposit Wallet session-key signing is not added; only SDK-classified owner signing is supported.
 - The official geoblock check fails closed when Polymarket reports `blocked`; it is not bypassed.
 - The supplied portfolio address is a public lookup input, not proof of wallet ownership. Portfolio reads cover the Data API v2 OPEN single-market view and may require additional cursor pages. OPEN can include held REDEEMABLE positions after resolution; the plugin preserves those rows.
-- News and external provider responses are untrusted content. Treat them as evidence with sources and timestamps, never as executable instructions.
+- Host research and external provider responses are evidence that must be attributed and timestamped, never executable instructions.
 - Private keys are not requested or embedded. No alternate-wallet executor or persistent credential store is used. The football-data.org token belongs in a PayBox host-scoped Secret; CLOB credentials are derived from ClobAuth during an invocation and are not returned or logged.
 - The PayBox `request_wallet_sign` handoff, hosted credential binding, authenticated CLOB flow, real submission, fills, and cancellation have not been live-verified. A local build or test is not evidence of a successful hosted trade.
 

@@ -1,5 +1,4 @@
 import { production } from "@polymarket/client";
-import { decodeFunctionData, encodeAbiParameters, parseAbi } from "viem";
 
 const scenario = process.env.POLYSCOPE_TEST_SCENARIO;
 const ageScenario = /^book-(\d+)$/.exec(scenario ?? "");
@@ -14,10 +13,6 @@ if (scenario === "unexpected-failure") {
 let orderPosts = 0;
 let orderReadbacks = 0;
 let cancelDeletes = 0;
-let readinessBalanceReads = 0;
-let readinessAllowanceReads = 0;
-let readinessOperatorReads = 0;
-let readinessGasReads = 0;
 const cancelCalls = [];
 const authAndOrderCalls = [];
 process.on("exit", () => {
@@ -40,23 +35,11 @@ process.on("exit", () => {
   if (scenario in expectedCancelCalls && (cancelCalls.join(",") !== expectedCancelCalls[scenario]
     || cancelDeletes !== (scenario === "cancel-l1-401" ? 0 : 1))) process.exitCode = 103;
   if (scenario === "identity-mismatch" && authAndOrderCalls.length !== 0) process.exitCode = 100;
-  if (scenario?.startsWith("readiness-") && readinessBalanceReads + readinessAllowanceReads + readinessOperatorReads + readinessGasReads !== 0) process.exitCode = 105;
   if (scenario === "submit-type-mismatch" && (authAndOrderCalls.length !== 0 || orderPosts !== 0)) process.exitCode = 113;
+  if (["invalid-clob-auth", "invalid-order-signature"].includes(scenario) && (authAndOrderCalls.length !== 0 || orderPosts !== 0)) process.exitCode = 117;
 });
 
 const conditionId = `0x${"1".repeat(64)}`;
-const v2ConditionId = `0x01${"11".repeat(30)}00`;
-const v2PositionIds = [BigInt(v2ConditionId).toString(), (BigInt(v2ConditionId) + 1n).toString()];
-const rpcReadAbis = {
-  erc20: parseAbi(["function balanceOf(address account) view returns (uint256)", "function allowance(address owner, address spender) view returns (uint256)"]),
-  erc1155: parseAbi(["function balanceOf(address account, uint256 id) view returns (uint256)", "function isApprovedForAll(address account, address operator) view returns (bool)"]),
-  ctf: parseAbi(["function payoutDenominator(bytes32 conditionId) view returns (uint256)"]),
-  positionManager: parseAbi(["function moduleById(uint8 moduleId) view returns (address)"]),
-  v2Module: parseAbi(["function hasResult(bytes31 conditionId) view returns (bool)"]),
-};
-function rpcWord(value) {
-  return `0x${BigInt(value).toString(16).padStart(64, "0")}`;
-}
 const market = {
   id: "1", question: "Will the sample team win?", description: "The sample market resolves from the match result.",
   resolutionSource: "https://example.test/rules", conditionId,
@@ -64,7 +47,6 @@ const market = {
   outcomePrices: JSON.stringify(["0.50", "0.50"]), active: true, closed: false,
   restricted: false, acceptingOrders: true, enableOrderBook: true, negRisk: false, version: "v1",
 };
-
 const competitionNames = { PL: "Premier League", PD: "LaLiga", SA: "Serie A", CL: "UEFA Champions League" };
 const footballCompetitionIds = { PL: "2021", PD: "2014", SA: "2019", CL: "2001" };
 const apiFootballLeagueNames = { PL: "Premier League", PD: "La Liga", SA: "Serie A", CL: "UEFA Champions League" };
@@ -125,116 +107,23 @@ globalThis.fetch = async (input, init = {}) => {
   if (scenario === "submit-no-refresh" && ((url.hostname === "gamma-api.polymarket.com" && url.pathname === "/markets/1")
     || (url.hostname === "clob.polymarket.com" && ["/book", `/clob-markets/${conditionId}`].includes(url.pathname)))) process.exit(116);
   let body;
-  if (scenario?.startsWith("readiness-") && init.method && init.method !== "GET") process.exit(110);
   if (url.hostname === "data-api.polymarket.com" && url.pathname === "/v2/approvals") {
     if (scenario === "chain-read-unavailable") return new Response("unavailable", { status: 503 });
     const contracts = production.contracts;
     const targets = [...new Set(Object.values(contracts))];
-    const approved = scenario !== "readiness-sell-missing";
+    const approved = scenario !== "approvals-missing";
     return Response.json({ data: { address: url.searchParams.get("user"), chain_id: 137, contracts: [
       ...targets.map((spender) => ({ token: contracts.collateralToken, spender, standard: "ERC20", amount: "max", approved })),
       ...[contracts.conditionalTokens, contracts.positionManager, contracts.negRiskAdapter].flatMap((token) => targets.map((spender) => ({ token, spender, standard: "ERC1155", approved }))),
     ] } });
   }
-  if (url.hostname === "polygon.drpc.org") {
-    const request = JSON.parse(init.body);
-    const rpcResponse = (entry) => {
-      if (["eth_sendTransaction", "eth_sendRawTransaction", "personal_sign", "eth_signTypedData_v4"].includes(entry.method)) process.exit(110);
-      if (scenario === "chain-read-unavailable") return { jsonrpc: "2.0", id: entry.id, error: { code: -32000, message: "fixture RPC unavailable" } };
-      if (entry.method === "eth_chainId") return { jsonrpc: "2.0", id: entry.id, result: "0x89" };
-      if (entry.method === "eth_blockNumber") return { jsonrpc: "2.0", id: entry.id, result: "0x100" };
-      if (entry.method === "eth_getBalance") {
-        readinessGasReads += 1;
-        const address = entry.params[0].toLowerCase();
-        const isEmpty = scenario === "readiness-empty";
-        const balance = isEmpty || address.endsWith("0002") ? 0n : 1_000_000_000_000_000_000n;
-        return { jsonrpc: "2.0", id: entry.id, result: `0x${balance.toString(16)}` };
-      }
-      if (entry.method !== "eth_call") process.exit(111);
-      const call = entry.params[0];
-      const target = call.to.toLowerCase();
-      let decoded;
-      let value;
-      if (target === "0xc011a7e12a19f7b1f670d46f03b03f3342e82dfb") {
-        decoded = decodeFunctionData({ abi: rpcReadAbis.erc20, data: call.data });
-        if (decoded.functionName === "balanceOf") {
-          readinessBalanceReads += 1;
-          const owner = decoded.args[0].toLowerCase();
-          value = scenario === "readiness-empty" || owner.endsWith("0002") ? 0n : 8_500_000n;
-        } else {
-          readinessAllowanceReads += 1;
-          const expectedSpender = scenario === "readiness-neg-risk" ? "0xe2222d279d744050d28e00520010520000310f59"
-            : scenario === "readiness-v2" ? "0xe3333700ca9d93003f00f0f71f8515005f6c00aa"
-              : "0xe111180000d2663c0091e4f400237545b87b996b";
-          if (["readiness-buy", "readiness-neg-risk", "readiness-v2"].includes(scenario) && decoded.args[1].toLowerCase() !== expectedSpender) process.exit(108);
-          const allowance = scenario === "readiness-empty" || scenario === "readiness-missing-approvals" ? 0n : 100_000_000n;
-          value = allowance;
-        }
-      } else if (target === "0x4d97dcd97ec945f40cf65f87097ace5ea0476045") {
-        try { decoded = decodeFunctionData({ abi: rpcReadAbis.erc1155, data: call.data }); }
-        catch { decoded = decodeFunctionData({ abi: rpcReadAbis.ctf, data: call.data }); }
-        if (decoded.functionName === "payoutDenominator") value = scenario === "redeem-unresolved" ? 0n : 1n;
-        else if (decoded.functionName === "isApprovedForAll") {
-          readinessOperatorReads += 1;
-          if (scenario === "readiness-sell-missing" && decoded.args[1].toLowerCase() !== "0xe111180000d2663c0091e4f400237545b87b996b") process.exit(109);
-          value = scenario === "readiness-missing-approvals" || scenario === "readiness-sell-missing" || scenario === "redeem-missing-approval" ? 0n : 1n;
-        } else {
-          const owner = decoded.args[0].toLowerCase();
-          const tokenId = decoded.args[1];
-          const noPosition = scenario === "redeem-wrong-owner" || scenario === "redeem-insufficient-balance" || owner.endsWith("0002") || scenario === "readiness-empty";
-          value = noPosition ? 0n : tokenId === BigInt("123") ? 10_000_000n : 0n;
-        }
-      } else if (target === "0xd91e80cf2e7be2e162c6513ced06f1dd0da35296") {
-        decoded = decodeFunctionData({ abi: rpcReadAbis.erc1155, data: call.data });
-        const owner = decoded.args[0].toLowerCase();
-        const noPosition = scenario === "redeem-wrong-owner" || scenario === "redeem-insufficient-balance" || owner.endsWith("0002") || scenario === "readiness-empty";
-        value = noPosition ? 0n : decoded.args[1] === BigInt("123") ? 10_000_000n : 0n;
-      } else if (target === "0x006f54f7f9a22e0000cc2ab60031000000ae9fef") {
-        try { decoded = decodeFunctionData({ abi: rpcReadAbis.erc1155, data: call.data }); }
-        catch { decoded = decodeFunctionData({ abi: rpcReadAbis.positionManager, data: call.data }); }
-        if (decoded.functionName === "moduleById") {
-          value = "0x00000000000000000000000000000000000000a1";
-        } else if (decoded.functionName === "isApprovedForAll") {
-          readinessOperatorReads += 1;
-          value = scenario === "readiness-missing-approvals" || scenario === "redeem-missing-approval" ? 0n : 1n;
-        } else {
-          const owner = decoded.args[0].toLowerCase();
-          const tokenId = decoded.args[1];
-          const noPosition = scenario === "redeem-wrong-owner" || scenario === "redeem-insufficient-balance" || owner.endsWith("0002") || scenario === "readiness-empty";
-          value = noPosition ? 0n : scenario.startsWith("redeem-v2") && tokenId === BigInt(v2PositionIds[0]) ? 10_000_000n : scenario === "redeem-v2-both" ? 4_000_000n : 0n;
-        }
-      } else if (target === "0x00000000000000000000000000000000000000a1") {
-        decoded = decodeFunctionData({ abi: rpcReadAbis.v2Module, data: call.data });
-        value = scenario === "redeem-v2-unresolved" ? 0n : 1n;
-      } else {
-        process.exit(112);
-      }
-      const result = typeof value === "string"
-        ? encodeAbiParameters([{ type: "address" }], [value])
-        : typeof value === "boolean"
-        ? encodeAbiParameters([{ type: "bool" }], [value])
-        : rpcWord(value);
-      return { jsonrpc: "2.0", id: entry.id, result };
-    };
-    const rpcResult = Array.isArray(request) ? request.map(rpcResponse) : rpcResponse(request);
-    return Response.json(rpcResult);
-  }
   if (url.hostname === "gamma-api.polymarket.com" && ["/markets", "/markets/keyset"].includes(url.pathname)) {
-    const requestedCondition = url.searchParams.get("condition_ids")?.toLowerCase();
-    if (requestedCondition === v2ConditionId && scenario?.startsWith("redeem-v2")) {
-      body = [{ ...market, conditionId: v2ConditionId, version: "v2", positionIds: v2PositionIds }];
-    } else if (requestedCondition === conditionId) {
-      body = [{ ...market, ...(scenario === "redeem-negative-risk" ? { negRisk: true } : {}) }];
-    } else {
-      body = [];
-    }
+    body = [];
     if (url.pathname === "/markets/keyset") body = { markets: body };
   } else if (url.hostname === "gamma-api.polymarket.com" && url.pathname === "/markets/1") {
     if (scenario === "provider-invalid-json") return new Response("{", { headers: { "content-type": "application/json" } });
     if (scenario === "provider-unavailable") return new Response("unavailable", { status: 503 });
     body = scenario === "provider-invalid" ? { id: false } : { ...market };
-    if (scenario === "readiness-neg-risk") body.negRisk = true;
-    if (scenario === "readiness-v2") body.version = "v2";
     if (scenario === "wrong-market") body.id = "2";
     if (scenario === "restricted-prepare" || scenario === "restricted-submit") body.restricted = true;
   } else if (url.hostname === "gamma-api.polymarket.com" && url.pathname === "/public-search") {
@@ -295,8 +184,6 @@ globalThis.fetch = async (input, init = {}) => {
     else if (scenario === "identity-mismatch") process.exit(88);
     else body = { apiKey: "fixture-api-key", secret: "dGVzdA==", passphrase: "fixture-passphrase" };
   } else if (url.hostname === "clob.polymarket.com" && url.pathname.startsWith("/data/order/")) {
-    const expectedSigner = process.env.POLYSCOPE_TEST_EXPECTED_SIGNER;
-    if (expectedSigner && init.headers?.POLY_ADDRESS?.toLowerCase() !== expectedSigner.toLowerCase()) process.exit(84);
     if (scenario?.startsWith("submit-ambiguous") || scenario === "submit-fok-ambiguous-503" || scenario === "submit-malformed-success" || scenario === "submit-malformed-order-id" || scenario === "submit-reconciled") {
       orderReadbacks += 1;
       if (scenario === "submit-reconciled") return Response.json({ maker_address: "0x0000000000000000000000000000000000000001", owner: "fixture-api-key", market: conditionId, created_at: 1800000000, expiration: "0", price: "0.5", outcome: "Yes",
@@ -320,6 +207,7 @@ globalThis.fetch = async (input, init = {}) => {
       id: `0x${"a".repeat(64)}`, status: "MATCHED", order_type: "FAK", original_size: "10", size_matched: "2",
       associate_trades: ["fixture-trade"], asset_id: "123", side: "BUY",
     }, { status: scenario === "order-status-created" ? 201 : 200 });
+    if (scenario === "order-status-missing-details") return Response.json({ id: `0x${"a".repeat(64)}`, status: "LIVE" });
     if (scenario === "order-status-id-mismatch") return Response.json({ maker_address: "0x0000000000000000000000000000000000000001", owner: "fixture-api-key", market: conditionId, created_at: 1800000000, expiration: "0", price: "0.5", outcome: "Yes",
       id: `0x${"b".repeat(64)}`, status: "MATCHED", order_type: "FAK", original_size: "10", size_matched: "10",
       associate_trades: ["fixture-trade"], asset_id: "123", side: "BUY",
@@ -360,6 +248,8 @@ globalThis.fetch = async (input, init = {}) => {
     const expectedMaker = process.env.POLYSCOPE_TEST_EXPECTED_MAKER;
     if (expectedMaker && (postedOrder.order.maker.toLowerCase() !== expectedMaker.toLowerCase()
       || postedOrder.order.signer.toLowerCase() !== expectedMaker.toLowerCase())) process.exit(85);
+    const expectedSignature = process.env.POLYSCOPE_TEST_EXPECTED_ORDER_SIGNATURE;
+    if (expectedSignature && postedOrder.order.signature.toLowerCase() !== expectedSignature.toLowerCase()) process.exit(119);
     if (scenario === "submit-provider-minimum") return Response.json({ success: false, errorMsg: "Order size is below the provider minimum." }, { status: 400 });
     if (scenario === "submit-ambiguous") throw new Error("fixture connection reset after request body");
     if (scenario === "submit-ambiguous-429") return new Response("signature=SECRET_SENTINEL; apiKey=SECRET_SENTINEL", { status: 429 });
@@ -536,20 +426,7 @@ globalThis.fetch = async (input, init = {}) => {
             ? []
             : allCompetitionHistory(teamId);
     body = { matches: matches.slice(0, Number(url.searchParams.get("limit") ?? "100")) };
-  } else if (url.hostname === "www.espn.com" && url.pathname === "/espn/rss/soccer/news") {
-    const publishedAt = new Date().toUTCString();
-    body = `<?xml version="1.0"?><rss><channel><item><title>Arsenal confirms training update</title><link>https://www.espn.com/soccer/story/1</link><description>Arsenal update.</description><pubDate>${publishedAt}</pubDate></item><item><title>General football headline</title><link>https://www.espn.com/soccer/story/2</link><pubDate>${publishedAt}</pubDate></item></channel></rss>`;
-    return new Response(body, { headers: { "content-type": "application/rss+xml" } });
   } else if (url.hostname === "data-api.polymarket.com" && url.pathname === "/v2/positions") {
-    if (scenario?.startsWith("redeem-")) {
-      const v2 = scenario.startsWith("redeem-v2");
-      const unresolved = scenario === "redeem-unresolved" || scenario === "redeem-v2-unresolved";
-      const row = { ...portfolioPosition, proxy_wallet: url.searchParams.get("user"), condition_id: v2 ? v2ConditionId : conditionId,
-        current_size: 10, token_id: scenario === "redeem-wrong-asset" ? "999" : v2 ? v2PositionIds[0] : "123", redeemable: !unresolved, status: unresolved ? "OPEN" : "REDEEMABLE" };
-      const data = ["redeem-wrong-owner", "redeem-insufficient-balance"].includes(scenario) ? [] : [row];
-      if (scenario === "redeem-v2-both") data.push({ ...row, current_size: 4, outcome: "No", token_id: v2PositionIds[1] });
-      return Response.json({ data, pagination: { has_more: false, limit: 3, next_cursor: null, offset: 0 } });
-    }
     const secondPage = url.searchParams.get("cursor") === "fixture-next-page";
     const position = scenario === "portfolio-redeemable" ? { ...portfolioPosition, redeemable: true, status: "REDEEMABLE" } : portfolioPosition;
     body = {

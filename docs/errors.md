@@ -8,7 +8,7 @@ Known order-preparation failures return `status: "REJECTED"`, `errorCode`, `reas
 | `PS_PROVIDER_TIMEOUT` | Polymarket read exceeded its per-request timeout. | Reads may be retried; a timed-out order POST is `UNKNOWN` and must be reconciled. | Polymarket data did not respond in time. |
 | `PS_PROVIDER_INVALID` | Invalid JSON, market/book shape, or numeric market data required to construct the request. | Check provider status; do not prepare from malformed market data. | Polymarket returned incomplete or unreadable data. |
 | `PS_RESPONSE_TOO_LARGE` | A Polymarket response exceeded 1 MiB. | Reduce the requested result size where possible. | The provider response was too large to process. |
-| `PS_MARKET_UNSUPPORTED` | Required market mapping metadata is absent, or redemption metadata does not identify a supported binary CTF/V2 route. | Use a supported market. | This market does not expose a supported mapping or redemption path. |
+| `PS_MARKET_UNSUPPORTED` | Required market mapping metadata is absent. | Use a supported market. | This market does not expose a supported outcome mapping. |
 | `PS_MARKET_IDENTITY` | The selected market or outcome asset does not match the requested product mapping. | Re-run discovery and prepare a new order. | The selected outcome could not be matched to the requested market. |
 | `PS_MARKET_CLOSED` | A read-only quote request found an inactive or closed market. | Refresh discovery later. This is not a post-approval submission gate. | This market is not active for a current quote. |
 | `PS_MARKET_VERSION` | Gamma and CLOB metadata disagree during a read-only quote. | Check provider data. This is not a post-approval submission gate. | Polymarket quote metadata conflicts. |
@@ -36,15 +36,11 @@ Known order-preparation failures return `status: "REJECTED"`, `errorCode`, `reas
 | `PS_ORDER_NOT_FOUND` | CLOB returned HTTP 404 for the requested order ID. | Confirm the order ID; a missing record does not prove an earlier submission was rejected. | Polymarket returned no record for this order ID. |
 | `PS_CANCEL_UNKNOWN` | Cancel result was ambiguous and one read-only order read-back did not confirm the outcome. | Inspect the order before another cancellation request. PolyScope never repeats DELETE automatically. | Cancellation status is unknown. |
 | `PS_PORTFOLIO_INVALID` | Public positions response did not match the v2 shape or cursor metadata. | Retry the read after checking the Data API response. | This positions page could not be decoded. |
-| `PS_MARKET_NOT_FOUND` | Gamma returned no exact market match for the supplied redemption condition ID. | Verify the condition ID against Polymarket's market record. | No matching Polymarket market was returned. |
-| `PS_MARKET_DATA_UNAVAILABLE` | Gamma market metadata could not be read while preparing a redemption preview. | Retry the read after checking Gamma availability. | Polymarket market metadata is unavailable. |
 | `PS_PREFLIGHT_FAILED` | A provider or credential failure stopped execution before the order POST. | Resolve the reported provider or authentication issue first. | Trading preflight could not complete; no order was sent. |
 
 
 Authentication and order errors are normalized from SDK classes/provider HTTP status; raw provider bodies, credentials, secrets and passphrases are omitted. HTTP status is retained when observed. `PS_CLOB_AUTH_REJECTED` means explicit fresh ClobAuth is required; another order alone does not require reauthentication.
 
-The normal flow is authentication once, then SDK preparation → PayBox approval/signing → local signature and wire-payload verification → standalone geoblock check → SDK submission. Diagnostic validators are optional. Preparation takes reusable `clobAuth` because the public SDK requires a secure client. The SDK-generated effective amount is returned for approval. PolyScope does not enforce market minimum, tick, fee, or spending-cap policy after approval.
+The normal flow is authentication once, then SDK order preparation → PayBox approval/signing → internal signature and wire-payload verification → standalone geoblock check → one SDK submission. Preparation takes reusable `clobAuth`. The SDK-generated effective amount is returned for approval. PolyScope does not enforce market minimum, tick, fee, or spending-cap policy after approval.
 
 `PS_MUTATION_RETRY_BLOCKED` is an internal transport sentinel: the first financial request may have reached the provider. It is normalized to `PS_SUBMISSION_UNKNOWN` or `PS_CANCEL_UNKNOWN` after read-only reconciliation. Neither POST nor DELETE is transmitted twice automatically. `UNKNOWN` never authorizes another trade.
-
-Readiness uses indexed SDK approval state and is informational; it never gates submission. Funding, gas, order sufficiency and fresh approval finality remain UNKNOWN where unavailable. Redemption uses indexed positions and SDK unsigned calls; it never approves or broadcasts, and always requires an external action until Polygon PayBox proposal validation is established.
