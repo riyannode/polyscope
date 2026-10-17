@@ -225,14 +225,21 @@ const soccerSourceSchema = z.object({
   returnedResultCount: z.number().int().nonnegative().nullable().optional(),
   reason: z.string().nullable().optional(),
 }).strict();
+const fallbackCoverageSchema = z.object({
+  requestedDateFrom: z.string().regex(/^\d{4}-\d{2}-\d{2}$/), requestedDateTo: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+  queriedDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/), datesNotQueried: z.array(z.string().regex(/^\d{4}-\d{2}-\d{2}$/)),
+  status: z.enum(["COMPLETE", "PARTIAL"]), continuationInstruction: z.string(),
+}).strict();
 const soccerResearchOutputSchema = z.object({
   availability: providerAvailabilitySchema, reason: z.string().nullable(), league: z.enum(["PL", "PD", "SA", "CL"]),
   competition: z.string(), provider: z.literal("football-data.org"), sources: z.array(soccerSourceSchema), observedAt: z.string().datetime(),
-  season: z.string().nullable(), leagueProviderId: z.string().nullable(), coverage: z.enum(["RETURNED_MATCHES", "FALLBACK_MATCHES", "UNAVAILABLE"]),
+  season: z.string().nullable(), leagueProviderId: z.string().nullable(), resultProvider: z.enum(["football-data.org", "API-Football"]).optional(),
+  coverage: z.enum(["RETURNED_MATCHES", "FALLBACK_MATCHES", "PARTIAL_FALLBACK_MATCHES", "UNAVAILABLE"]),
   returnedEventCount: z.number().int(), fixtures: z.array(soccerFixtureSchema),
   fallbackProvider: z.object({ provider: z.literal("API-Football"), availability: providerAvailabilitySchema, reason: z.string().nullable(),
     sourceUrl: z.string().url(), observedAt: z.string().datetime(), httpStatus: z.number().int().min(100).max(599).nullable(),
-    verificationStatus: fixtureEvidenceStatusSchema, confidenceCategory: z.enum(["LOW", "MODERATE", "HIGH"]), confidenceReason: z.string() }).strict().optional(),
+    verificationStatus: fixtureEvidenceStatusSchema, confidenceCategory: z.enum(["LOW", "MODERATE", "HIGH"]), confidenceReason: z.string(),
+    coverage: fallbackCoverageSchema }).strict().optional(),
   fallbackFixtures: z.array(providerQualifiedFixtureSchema).optional(),
 }).strict();
 const soccerEdgeOutputSchema = z.object({
@@ -256,11 +263,14 @@ const soccerEdgeOutputSchema = z.object({
   calculationAssumptions: z.array(z.string()),
   identityEvidence: z.array(z.object({ provider: z.string(), url: z.string().url(), observedAt: z.string().datetime(), publishedAt: z.string().datetime().nullable(),
     verificationStatus: fixtureEvidenceStatusSchema, confidenceCategory: z.enum(["LOW", "MODERATE", "HIGH"]), confidenceReason: z.string(),
-    competition: z.string(), homeTeam: z.string(), awayTeam: z.string(), kickoffUtc: z.string().datetime() }).strict()).optional(),
+    competition: z.string(), homeTeam: z.string(), awayTeam: z.string(), kickoffUtc: z.string().datetime(),
+    attestationAuthority: z.literal("HOST_AGENT") }).strict()).optional(),
   marketMapping: z.object({ provider: z.literal("Polymarket Gamma"), url: z.string().url(), observedAt: z.string().datetime(),
     marketId: z.string(), question: z.string(), outcome: z.string(), competition: z.string(), homeTeam: z.string(), awayTeam: z.string(),
     kickoffUtc: z.string().datetime(), outcomeMapping: z.enum(["HOME_WIN", "DRAW", "AWAY_WIN"]),
-    resolutionType: z.enum(["REGULATION_1X2", "OTHER", "UNKNOWN"]), resolutionRules: z.string() }).strict().optional(),
+    resolutionType: z.enum(["REGULATION_1X2", "OTHER", "UNKNOWN"]), resolutionRules: z.string(), attestationAuthority: z.literal("HOST_AGENT") }).strict().optional(),
+  evidenceAssessment: z.object({ claimAuthority: z.literal("HOST_AGENT"), sourceVerification: z.literal("NOT_PERFORMED_BY_POLYSCOPE"),
+    identityClaimMatchesFixture: z.boolean(), marketClaimMatchesSuppliedQuoteAndFixture: z.boolean() }).strict().optional(),
 }).strict();
 const identityEvidenceSchema = z.object({ provider: z.string().trim().min(1).max(120), url: z.string().url(), observedAt: z.string().datetime(),
   publishedAt: z.string().datetime().nullable(), verificationStatus: fixtureEvidenceStatusSchema,
@@ -778,15 +788,32 @@ async function getApiFootballEnrichment(fixture: z.infer<typeof soccerFixtureSch
   };
 }
 
-async function getApiFootballFallback(league: SoccerLeague, date: string, fixtureIdentity?: z.infer<typeof fixtureIdentitySchema>, exactFixtureRequested = false) {
+function apiFootballFallbackCoverage(requestedDateFrom: string, requestedDateTo: string, queriedDate: string) {
+  const datesNotQueried: string[] = [];
+  for (let date = requestedDateFrom; date <= requestedDateTo; date = addDays(date, 1)) {
+    if (date !== queriedDate) datesNotQueried.push(date);
+  }
+  const status = datesNotQueried.length === 0 ? "COMPLETE" as const : "PARTIAL" as const;
+  return {
+    requestedDateFrom, requestedDateTo, queriedDate, datesNotQueried, status,
+    continuationInstruction: status === "COMPLETE"
+      ? `The request covered every date in the requested range using ${queriedDate}; check provider availability separately to determine whether usable data was returned.`
+      : `This fallback queried only ${queriedDate}. Call research_soccer with date set to each of ${datesNotQueried.join(", ")} and days=0 to continue; those dates are not covered by this result.`,
+  };
+}
+
+async function getApiFootballFallback(league: SoccerLeague, date: string, requestedDateFrom: string, requestedDateTo: string,
+  fixtureIdentity?: z.infer<typeof fixtureIdentitySchema>, exactFixtureRequested = false) {
   const sourceUrl = apiFootballUrl("fixtures", { date, timezone: "UTC" });
   const observedAt = new Date().toISOString();
+  const coverage = apiFootballFallbackCoverage(requestedDateFrom, requestedDateTo, date);
   const listing = await getApiFootballJson(sourceUrl);
   const unavailable = (reason: string, httpStatus: number | null, verificationStatus: z.infer<typeof fixtureEvidenceStatusSchema> = "UNVERIFIED") => ({
     diagnostic: {
       provider: "API-Football" as const, availability: "UNAVAILABLE" as const, reason, sourceUrl, observedAt, httpStatus,
       verificationStatus, confidenceCategory: "LOW" as const,
       confidenceReason: "No unique, independently corroborated target fixture was established.",
+      coverage,
     },
     fixtures: [] as z.infer<typeof providerQualifiedFixtureSchema>[],
   });
@@ -853,6 +880,7 @@ async function getApiFootballFallback(league: SoccerLeague, date: string, fixtur
       provider: "API-Football" as const, availability: "AVAILABLE" as const, reason: resultReason, sourceUrl, observedAt,
       httpStatus: listing.httpStatus, verificationStatus: resultVerification, confidenceCategory: "LOW" as const,
       confidenceReason: fixtureIdentity ? confidenceReason : "One provider supplied these fixtures; no independent source corroborated the target identity.",
+      coverage,
     },
     fixtures,
   };
@@ -943,8 +971,12 @@ async function getSoccerResearch(input: {
   limit: number; includeApiFootball: boolean;
 }): Promise<z.infer<typeof soccerResearchOutputSchema>> {
   const definition = SPORTS_COMPETITIONS[input.league];
-  const startDate = input.date ?? new Date().toISOString().slice(0, 10);
+  const startDate = input.date ?? input.fixtureIdentity?.kickoffUtc.slice(0, 10) ?? new Date().toISOString().slice(0, 10);
   const endDate = addDays(startDate, input.days);
+  const identityDate = input.fixtureIdentity?.kickoffUtc.slice(0, 10);
+  if (input.date !== undefined && identityDate !== undefined && (identityDate < startDate || identityDate > endDate)) {
+    throw new Error(`PS_FIXTURE_IDENTITY_DATE_OUT_OF_RANGE: fixtureIdentity kickoff date ${identityDate} is outside the requested range ${startDate} through ${endDate}.`);
+  }
   const observedAt = new Date().toISOString();
   const fixturesUrl = input.fixtureId
     ? footballDataUrl(`matches/${input.fixtureId}`)
@@ -966,9 +998,10 @@ async function getSoccerResearch(input: {
       primarySource.httpStatus = httpStatus;
       primarySource.reason = reason;
     }
-    const fallbackDate = input.fixtureIdentity?.kickoffUtc.slice(0, 10) ?? startDate;
-    const fallback = await getApiFootballFallback(input.league, fallbackDate, input.fixtureIdentity, input.fixtureId !== undefined);
+    const fallbackDate = identityDate ?? startDate;
+    const fallback = await getApiFootballFallback(input.league, fallbackDate, startDate, endDate, input.fixtureIdentity, input.fixtureId !== undefined);
     const hasFallbackFixtures = fallback.fixtures.length > 0;
+    const partialCoverage = fallback.diagnostic.coverage.status === "PARTIAL";
     sources.push({
       provider: "API-Football", purpose: "FIXTURES_AND_RESULTS", url: fallback.diagnostic.sourceUrl,
       observedAt: fallback.diagnostic.observedAt, availability: fallback.diagnostic.availability,
@@ -976,9 +1009,11 @@ async function getSoccerResearch(input: {
     });
     return soccerResearchOutputSchema.parse({
       availability: hasFallbackFixtures ? "AVAILABLE" : "UNAVAILABLE",
-      reason: hasFallbackFixtures ? null : `${reason} API-Football fallback: ${fallback.diagnostic.reason}`,
+      reason: hasFallbackFixtures ? partialCoverage ? fallback.diagnostic.coverage.continuationInstruction : null
+        : `${reason} API-Football fallback: ${fallback.diagnostic.reason} ${fallback.diagnostic.coverage.continuationInstruction}`,
       league: input.league, competition: definition.name, provider: "football-data.org", sources, observedAt,
-      season: null, leagueProviderId: input.league, coverage: hasFallbackFixtures ? "FALLBACK_MATCHES" : "UNAVAILABLE",
+      season: null, leagueProviderId: input.league, ...(hasFallbackFixtures ? { resultProvider: "API-Football" as const } : {}),
+      coverage: hasFallbackFixtures ? partialCoverage ? "PARTIAL_FALLBACK_MATCHES" as const : "FALLBACK_MATCHES" as const : "UNAVAILABLE" as const,
       returnedEventCount: fallback.fixtures.length, fixtures: [], fallbackProvider: fallback.diagnostic,
       fallbackFixtures: fallback.fixtures,
     });
@@ -1110,7 +1145,7 @@ async function getSoccerResearch(input: {
   }
   return soccerResearchOutputSchema.parse({
     availability: "AVAILABLE", reason: null, league: input.league, competition: definition.name,
-    provider: "football-data.org", sources, observedAt, season: null,
+    provider: "football-data.org", resultProvider: "football-data.org", sources, observedAt, season: null,
     leagueProviderId: input.league, coverage: "RETURNED_MATCHES", returnedEventCount: matches.length, fixtures,
   });
 }
@@ -1758,6 +1793,14 @@ function analyzeSoccerEdge(input: {
       if (requested6 > shares) uncertainty.push("Visible CLOB depth supports only a partial fill of the requested size; expected value uses the fillable shares only.");
     }
   }
+  const calculationAssumptions = [
+    "Polymarket CLOB BUY ask levels, requested size, estimated gross cost, and fees come from the supplied get_quote result; midpoint and Gamma indicative prices are not used.",
+    "The estimate covers only visible fillable shares; FAK may partially fill and discards the unfilled remainder.",
+    "Net edge per share equals modeled probability minus (estimated gross fill cost plus fees) divided by fillable shares.",
+    "Expected value is fillable shares multiplied by estimated net edge per share; it is not guaranteed profitability.",
+    `Market resolution rules supplied for the mapping: ${input.marketResolutionRules}`,
+  ];
+  if (fallbackFixture) calculationAssumptions.push("Identity and market evidence are host-agent attestations. PolyScope checks supplied fields for consistency but does not fetch source URLs or independently verify claims.");
   return soccerEdgeOutputSchema.parse({
     probabilityStatus: available ? "AVAILABLE" : "UNAVAILABLE", probabilityReason,
     model, edgeStatus, edgeReason,
@@ -1766,14 +1809,17 @@ function analyzeSoccerEdge(input: {
     bestBid: input.quote.bestBid, bestAsk: input.quote.bestAsk, spread: input.quote.spread, depthWeightedExecutionPrice: weightedPrice,
     estimatedFeesPusd: estimatedFees, effectiveBuyCostPerShare: effectiveCost, grossProbabilityPriceDifference: grossDifference,
     netEdgePerShare: netEdge, estimatedExpectedValuePusd: expectedValue, quoteObservedAt: input.quote.observedAt,
-    quoteFreshness: input.quote.freshness, calculationAssumptions: [
-      "Polymarket CLOB BUY ask levels, requested size, estimated gross cost, and fees come from the supplied get_quote result; midpoint and Gamma indicative prices are not used.",
-      "The estimate covers only visible fillable shares; FAK may partially fill and discards the unfilled remainder.",
-      "Net edge per share equals modeled probability minus (estimated gross fill cost plus fees) divided by fillable shares.",
-      "Expected value is fillable shares multiplied by estimated net edge per share; it is not guaranteed profitability.",
-      `Market resolution rules supplied for the mapping: ${input.marketResolutionRules}`,
-    ],
-    ...(fallbackFixture ? { identityEvidence: matchingIdentityEvidence, ...(mapping ? { marketMapping: mapping } : {}) } : {}),
+    quoteFreshness: input.quote.freshness, calculationAssumptions,
+    ...(fallbackFixture ? {
+      identityEvidence: matchingIdentityEvidence.map((evidence) => ({ ...evidence, attestationAuthority: "HOST_AGENT" as const })),
+      ...(mapping ? { marketMapping: { ...mapping, attestationAuthority: "HOST_AGENT" as const } } : {}),
+      evidenceAssessment: {
+        claimAuthority: "HOST_AGENT" as const,
+        sourceVerification: "NOT_PERFORMED_BY_POLYSCOPE" as const,
+        identityClaimMatchesFixture: matchingIdentityEvidence.length > 0,
+        marketClaimMatchesSuppliedQuoteAndFixture: mapping !== undefined && marketMappingMatches,
+      },
+    } : {}),
   });
 }
 
@@ -1971,7 +2017,7 @@ async function createServer() {
     "research_soccer",
     {
       title: "Research supported soccer fixtures",
-      description: "Reads football-data.org fixtures, results, and available recent form for PL, PD, SA, or CL. On provider failures or unusable responses, it makes one date-scoped API-Football fixture fallback request; a valid empty football-data.org response does not trigger fallback. API-Football-only fixtures use provider-qualified IDs and are not cross-provider verified. For exact fallback matching, provide fixtureIdentity with homeTeam, awayTeam, and kickoffUtc; a football-data.org fixtureId is never reused as an API-Football ID. Set includeApiFootball=true on an exact football-data.org fixture to keep the existing optional enrichment. Returns provider diagnostics and actual recent-result counts. These tools provide API evidence, not exhaustive research. When statistics, injuries, lineups or other relevant information are missing, continue with the host's web search/browser tools before writing the final analysis. If either structured provider fails or leaves material gaps, continue with host-native search/browser tools where available; do not claim browser work unless performed.",
+      description: "Reads football-data.org fixtures, results, and available recent form for PL, PD, SA, or CL. On provider failures or unusable responses, it makes one date-scoped API-Football fixture fallback request; a valid empty football-data.org response does not trigger fallback. API-Football-only fixtures use provider-qualified IDs and are not cross-provider verified. For exact fallback matching, provide fixtureIdentity with homeTeam, awayTeam, and kickoffUtc; a football-data.org fixtureId is never reused as an API-Football ID. Set includeApiFootball=true on an exact football-data.org fixture to keep the existing optional enrichment. The legacy provider field identifies the primary provider; availability is aggregate, and resultProvider identifies the source of returned fixtures (football-data.org or API-Football). Fallback coverage reports requested and queried dates. These tools provide API evidence, not exhaustive research. When statistics, injuries, lineups or other relevant information are missing, continue with the host's web search/browser tools before writing the final analysis. If either structured provider fails or leaves material gaps, continue with host-native search/browser tools where available; do not claim browser work unless performed.",
       inputSchema: z.object({
         league: z.enum(["PL", "PD", "SA", "CL"]),
         date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
@@ -1997,7 +2043,7 @@ async function createServer() {
     "analyze_soccer_edge",
     {
       title: "Estimate soccer probabilities and Polymarket net edge",
-      description: "Deterministically estimates regulation-time Home/Draw/Away probabilities from API-Football venue averages or football-data.org pre-kickoff same-venue form. For API-Football-only fallback fixtures, provide independently sourced VERIFIED fixture-identity evidence and an exact Polymarket market/outcome mapping; identity evidence is kept separate from model statistics. Without verified identity evidence, probabilities are UNAVAILABLE; without a matching market mapping and exact 90-minute resolution rules, market-specific edge is unavailable. Browser-researched statistics are not model inputs. This read-only analysis does not fetch providers, create orders, impose a trading gate, or authorize a trade.",
+      description: "Deterministically estimates regulation-time Home/Draw/Away probabilities from API-Football venue averages or football-data.org pre-kickoff same-venue form. For API-Football-only fallback fixtures, identityEvidence and marketMapping are host-agent attestations: their source URLs are not fetched or independently verified by PolyScope. PolyScope checks the supplied identity fields against the fixture and supplied market fields against the quote, fixture, and rules; evidenceAssessment reports these local checks separately from external source verification. Without a host-attested VERIFIED identity claim, probabilities are UNAVAILABLE; without a consistent market mapping and exact 90-minute resolution declaration, market-specific edge is unavailable. Browser-researched statistics are not model inputs. This read-only analysis does not fetch providers, create orders, impose a trading gate, or authorize a trade.",
       inputSchema: z.object({
         fixture: z.union([soccerFixtureSchema, providerQualifiedFixtureSchema]), quote: quoteResultSchema,
         outcome: z.enum(["HOME_WIN", "DRAW", "AWAY_WIN"]),

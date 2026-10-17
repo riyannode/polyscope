@@ -559,8 +559,54 @@ export async function testOfflineArtifact(root = process.cwd()) {
     }
   }
   const ordinarySuccess = await callTool(artifact, researchTool, { league: "PL", date: "2026-10-17" }, { fixtures: true, fixtureScenario: "no-unneeded-api" });
-  if (ordinarySuccess.structuredContent.availability !== "AVAILABLE" || ordinarySuccess.structuredContent.fallbackProvider !== undefined) {
+  if (ordinarySuccess.structuredContent.availability !== "AVAILABLE" || ordinarySuccess.structuredContent.fallbackProvider !== undefined
+    || ordinarySuccess.structuredContent.resultProvider !== "football-data.org" || ordinarySuccess.structuredContent.provider !== "football-data.org") {
     fail("normal football-data.org success did not remain primary-only", "soccer_fallback_invalid");
+  }
+  const startDateFallback = await callTool(artifact, researchTool, { league: "PL", date: "2026-10-17", days: 0, fixtureIdentity: fallbackIdentity },
+    { fixtures: true, fixtureScenario: "fallback-http-503" });
+  const startDateCoverage = startDateFallback.structuredContent.fallbackProvider?.coverage;
+  if (startDateFallback.structuredContent.availability !== "AVAILABLE" || startDateFallback.structuredContent.provider !== "football-data.org"
+    || startDateFallback.structuredContent.resultProvider !== "API-Football" || startDateFallback.structuredContent.coverage !== "FALLBACK_MATCHES"
+    || startDateCoverage?.requestedDateFrom !== "2026-10-17" || startDateCoverage?.requestedDateTo !== "2026-10-17"
+    || startDateCoverage?.queriedDate !== "2026-10-17" || startDateCoverage?.datesNotQueried.length !== 0 || startDateCoverage?.status !== "COMPLETE") {
+    fail("single-day API-Football fallback did not report complete date coverage and effective provider", "soccer_fallback_invalid");
+  }
+  const partialRangeFallback = await callTool(artifact, researchTool, { league: "PL", date: "2026-10-17", days: 7 },
+    { fixtures: true, fixtureScenario: "fallback-http-503" });
+  const partialRangeCoverage = partialRangeFallback.structuredContent.fallbackProvider?.coverage;
+  if (partialRangeFallback.structuredContent.availability !== "AVAILABLE" || partialRangeFallback.structuredContent.resultProvider !== "API-Football"
+    || partialRangeFallback.structuredContent.coverage !== "PARTIAL_FALLBACK_MATCHES" || partialRangeCoverage?.status !== "PARTIAL"
+    || partialRangeCoverage?.requestedDateFrom !== "2026-10-17" || partialRangeCoverage?.requestedDateTo !== "2026-10-24"
+    || partialRangeCoverage?.queriedDate !== "2026-10-17" || partialRangeCoverage?.datesNotQueried.length !== 7
+    || !partialRangeCoverage?.continuationInstruction.includes("2026-10-24")) {
+    fail("multi-day API-Football fallback implied full range coverage or omitted continuation guidance", "soccer_fallback_invalid");
+  }
+  const laterDateFixture = await callTool(artifact, researchTool, { league: "PL", date: "2026-10-17", days: 7 },
+    { fixtures: true, fixtureScenario: "fallback-later-date" });
+  const laterDateCoverage = laterDateFixture.structuredContent.fallbackProvider?.coverage;
+  if (laterDateFixture.structuredContent.fallbackFixtures?.some((fixture) => fixture.providerFixtureId === "90024")
+    || laterDateCoverage?.datesNotQueried.at(-1) !== "2026-10-24" || laterDateCoverage?.status !== "PARTIAL"
+    || !laterDateCoverage.continuationInstruction.includes("2026-10-24")) {
+    fail("later-date fixture omission was not represented as partial fallback coverage with continuation", "soccer_fallback_invalid");
+  }
+  const laterExactIdentity = { homeTeam: "Arsenal", awayTeam: "Chelsea", kickoffUtc: "2026-10-24T19:00:00.000Z" };
+  const laterExactFallback = await callTool(artifact, researchTool, { league: "PL", date: "2026-10-17", days: 7, fixtureIdentity: laterExactIdentity },
+    { fixtures: true, fixtureScenario: "fallback-later-date" });
+  if (laterExactFallback.structuredContent.fallbackFixtures?.[0]?.providerFixtureId !== "90024"
+    || laterExactFallback.structuredContent.fallbackFixtures[0]?.kickoffUtc !== laterExactIdentity.kickoffUtc
+    || laterExactFallback.structuredContent.fallbackProvider?.coverage.status !== "PARTIAL") {
+    fail("exact identity on a later in-range date was not matched while retaining partial range coverage", "soccer_fallback_invalid");
+  }
+  const outOfRangeIdentity = await runOperation(artifact, {
+    method: "tools/call", params: { name: researchTool.name, arguments: {
+      league: "PL", date: "2026-10-17", days: 7,
+      fixtureIdentity: { ...laterExactIdentity, kickoffUtc: "2026-10-25T19:00:00.000Z" },
+    } },
+  }, { fixtures: true, fixtureScenario: "fallback-range-conflict" });
+  if (outOfRangeIdentity.result?.isError !== true
+    || !JSON.stringify(outOfRangeIdentity.result.content).includes("PS_FIXTURE_IDENTITY_DATE_OUT_OF_RANGE")) {
+    fail("out-of-range fixture identity did not fail before provider research", "soccer_fallback_invalid");
   }
   const emptyPrimary = await callTool(artifact, researchTool, { league: "PL", date: "2026-10-17" }, { fixtures: true, fixtureScenario: "fallback-empty" });
   if (emptyPrimary.structuredContent.fallbackProvider !== undefined || emptyPrimary.structuredContent.fallbackFixtures !== undefined) {
@@ -650,7 +696,10 @@ export async function testOfflineArtifact(root = process.cwd()) {
     || unverifiedFallbackModel.structuredContent.model.homeWin !== null
     || unverifiedFallbackModel.structuredContent.edgeStatus !== "UNAVAILABLE"
     || unverifiedFallbackModel.structuredContent.netEdgePerShare !== null
-    || unverifiedFallbackModel.structuredContent.estimatedExpectedValuePusd !== null) {
+    || unverifiedFallbackModel.structuredContent.estimatedExpectedValuePusd !== null
+    || unverifiedFallbackModel.structuredContent.evidenceAssessment?.claimAuthority !== "HOST_AGENT"
+    || unverifiedFallbackModel.structuredContent.evidenceAssessment?.identityClaimMatchesFixture !== false
+    || unverifiedFallbackModel.structuredContent.evidenceAssessment?.sourceVerification !== "NOT_PERFORMED_BY_POLYSCOPE") {
     fail("API-Football-only identity without independent verification produced probabilities or edge", "soccer_edge_invalid");
   }
   const identityEvidence = [{ provider: "Official competition fixture page", url: "https://competition.example.test/fixtures/arsenal-chelsea",
@@ -668,9 +717,18 @@ export async function testOfflineArtifact(root = process.cwd()) {
   }, { fixtures: true });
   if (verifiedFallbackModel.structuredContent.probabilityStatus !== "AVAILABLE"
     || verifiedFallbackModel.structuredContent.edgeStatus !== "AVAILABLE"
+    || verifiedFallbackModel.structuredContent.evidenceAssessment?.claimAuthority !== "HOST_AGENT"
+    || verifiedFallbackModel.structuredContent.evidenceAssessment?.sourceVerification !== "NOT_PERFORMED_BY_POLYSCOPE"
+    || verifiedFallbackModel.structuredContent.evidenceAssessment?.identityClaimMatchesFixture !== true
+    || verifiedFallbackModel.structuredContent.evidenceAssessment?.marketClaimMatchesSuppliedQuoteAndFixture !== true
+    || verifiedFallbackModel.structuredContent.identityEvidence?.[0]?.attestationAuthority !== "HOST_AGENT"
+    || verifiedFallbackModel.structuredContent.marketMapping?.attestationAuthority !== "HOST_AGENT"
     || verifiedFallbackModel.structuredContent.identityEvidence?.[0]?.publishedAt !== null
     || verifiedFallbackModel.structuredContent.model.sources.some((source) => source.provider === "Official competition fixture page")) {
-    fail("verified API fallback did not keep browser identity provenance separate from model statistics", "soccer_edge_invalid");
+    fail("host-attested fallback evidence was presented as PolyScope source verification or model statistics", "soccer_edge_invalid");
+  }
+  if (verifiedFallbackModel.structuredContent.identityEvidence?.[0]?.url !== "https://competition.example.test/fixtures/arsenal-chelsea") {
+    fail("fabricated identity URL was not preserved as a host-attested claim", "soccer_edge_invalid");
   }
   const mismappedFallbackModel = await callTool(artifact, edgeTool, {
     fixture: fallbackFixtureForAnalysis, quote: fallbackQuote.structuredContent, outcome: "HOME_WIN",
@@ -679,7 +737,8 @@ export async function testOfflineArtifact(root = process.cwd()) {
   }, { fixtures: true });
   if (mismappedFallbackModel.structuredContent.probabilityStatus !== "AVAILABLE"
     || mismappedFallbackModel.structuredContent.edgeStatus !== "UNAVAILABLE"
-    || mismappedFallbackModel.structuredContent.netEdgePerShare !== null) {
+    || mismappedFallbackModel.structuredContent.netEdgePerShare !== null
+    || mismappedFallbackModel.structuredContent.evidenceAssessment?.marketClaimMatchesSuppliedQuoteAndFixture !== false) {
     fail("market identity mismatch produced a market-specific edge", "soccer_edge_invalid");
   }
   const apiOnlyIdentityEvidence = [{ ...identityEvidence[0], provider: "API-Football" }];
@@ -853,9 +912,10 @@ export async function testOfflineArtifact(root = process.cwd()) {
       "CLOB multilevel depth-weighted price, fee-inclusive cost, positive and negative edge, partial fill, no liquidity, unsupported market rules, and honest SELL limitation",
       "soccer skill continuation for missing xG, missing injury reports, and unavailable browser tools",
       "football-data.org HTTP/network/timeout/invalid-response fallback; valid empty response stays primary-only",
+      "fallback date coverage is complete only for queried days; later dates require explicit continuation",
       "API-Football fallback errors, empty data, date discovery, exact identity, and namespaced provider IDs",
       "fallback fixture ambiguity, kickoff conflicts, missing statistics, and source provenance",
-      "independent identity evidence and exact market mapping required for fallback probability/edge",
+      "host-attested identity evidence and exact market mapping consistency required for fallback probability/edge; source URLs are not fetched",
       "official v2 portfolio rows and cursor pagination completeness", "public portfolio address is not wallet proof", "13-tool catalog without an order from analysis",
     ],
   };

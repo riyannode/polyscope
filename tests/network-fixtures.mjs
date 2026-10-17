@@ -144,6 +144,15 @@ globalThis.fetch = async (input, init = {}) => {
     if (scenario === "fallback-api-invalid-json") return new Response("{", { headers: { "content-type": "application/json" } });
     if (scenario === "fallback-api-empty") return Response.json({ errors: [], response: [] });
     if (scenario === "fallback-api-invalid-shape") return Response.json({ errors: [], response: [{ fixture: { id: "bad" } }] });
+    if (scenario === "fallback-later-date") {
+      const date = url.searchParams.get("date");
+      const laterFixture = {
+        fixture: { id: 90024, date: "2026-10-24T19:00:00+00:00" },
+        league: { id: 39, name: apiFootballLeagueNames.PL, season: 2026 },
+        teams: { home: { id: 501, name: "Arsenal FC" }, away: { id: 502, name: "Chelsea" } },
+      };
+      return Response.json({ errors: [], response: date === "2026-10-24" ? [laterFixture] : [] });
+    }
     const kickoff = scenario === "api-football-kickoff-conflict" || scenario === "fallback-kickoff-conflict"
       ? "2026-10-17T20:00:00+00:00" : "2026-10-17T19:00:00+00:00";
     const fixture = {
@@ -168,6 +177,7 @@ globalThis.fetch = async (input, init = {}) => {
     } };
   } else if (url.hostname === "api.football-data.org" && url.pathname.startsWith("/v4/competitions/")) {
     const league = url.pathname.split("/")[3];
+    if (scenario === "fallback-range-conflict") throw new Error("unexpected provider request before fixture identity date validation");
     if (scenario?.startsWith("fallback-api-")) return new Response("provider unavailable", { status: 503 });
     if (scenario === "fallback-ambiguous" || scenario === "fallback-kickoff-conflict") return new Response("provider unavailable", { status: 503 });
     if (scenario === "fallback-network") throw new TypeError("fixture network unavailable");
@@ -176,6 +186,7 @@ globalThis.fetch = async (input, init = {}) => {
     if (scenario === "fallback-http-403") return new Response("forbidden", { status: 403 });
     if (scenario === "fallback-http-429") return new Response("rate limited", { status: 429 });
     if (scenario === "fallback-http-503") return new Response("provider unavailable", { status: 503 });
+    if (scenario === "fallback-later-date") return new Response("provider unavailable", { status: 503 });
     if (scenario === "fallback-invalid-json") return new Response("{", { headers: { "content-type": "application/json" } });
     if (scenario === "fallback-invalid-shape") return new Response(JSON.stringify({ matches: [{ id: "bad" }] }), { headers: { "content-type": "application/json" } });
     if (scenario === "fallback-empty") return Response.json({ matches: [] });
