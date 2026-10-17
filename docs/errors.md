@@ -11,7 +11,7 @@ Known order-preparation failures return `status: "REJECTED"`, `errorCode`, `reas
 | `PS_CLOB_TIME_UNAVAILABLE` | The CLOB server-time endpoint did not return a successful response. | Retry preparation after CLOB access is available; no local-clock fallback is used. | CLOB server time could not be read. |
 | `PS_CLOB_TIME_INVALID` | The CLOB server-time response was not a positive Unix timestamp in seconds. | Stop and check provider status. | CLOB returned an invalid server timestamp. |
 | `PS_MARKET_CLOSED` | Market is inactive or closed. | Refresh discovery later. | This market is not active. |
-| `PS_MARKET_UNSUPPORTED` | Required CLOB trading metadata is absent or the market is not accepting orders. | Use a supported market. | This market does not expose the supported single-market order path. |
+| `PS_MARKET_UNSUPPORTED` | Required CLOB trading metadata is absent, the market is not accepting orders, or redemption metadata does not identify a supported binary CTF/V2 route. | Use a supported market. | This market does not expose a supported order or redemption path. |
 | `PS_MARKET_IDENTITY` | Market, outcome asset, condition, or CLOB book does not match. | Re-run discovery and prepare a new order. | The selected outcome could not be matched to the live order book. |
 | `PS_MARKET_VERSION` | Gamma and CLOB disagree on exchange version or risk mode. | Refresh market metadata before preparing or submitting. | Polymarket trading metadata conflicts. |
 | `PS_MARKET_CHANGED` | Exchange version or risk mode changed after preparation, so the signed exchange domain is no longer compatible. | Prepare and sign a new order for the current exchange domain. | The market's exchange signing domain changed. |
@@ -42,6 +42,9 @@ Known order-preparation failures return `status: "REJECTED"`, `errorCode`, `reas
 | `PS_ORDER_NOT_FOUND` | CLOB returned HTTP 404 for the requested order ID. | Confirm the order ID; a missing record does not prove an earlier submission was rejected. | Polymarket returned no record for this order ID. |
 | `PS_CANCEL_UNKNOWN` | Cancel result was ambiguous and one read-only order read-back did not confirm the outcome. | Inspect the order before another cancellation request. PolyScope never repeats DELETE automatically. | Cancellation status is unknown. |
 | `PS_PORTFOLIO_INVALID` | Public positions response did not match the v2 shape or cursor metadata. | Retry the read after checking the Data API response. | This positions page could not be decoded. |
+| `PS_MARKET_NOT_FOUND` | Gamma returned no exact market match for the supplied redemption condition ID. | Verify the condition ID against Polymarket's market record. | No matching Polymarket market was returned. |
+| `PS_MARKET_DATA_UNAVAILABLE` | Gamma market metadata could not be read while preparing a redemption preview. | Retry the read after checking Gamma availability. | Polymarket market metadata is unavailable. |
+| `PS_CHAIN_READ_UNAVAILABLE` | A bounded Polygon RPC read for balance, approval, or on-chain resolution failed or timed out. | Retry the read; the affected value remains UNKNOWN until confirmed. | Polygon state could not be verified. |
 | `PS_PREFLIGHT_FAILED` | A provider or credential failure stopped execution before the order POST. | Resolve the reported provider or authentication issue first. | Trading preflight could not complete; no order was sent. |
 
 ## Preparation and execution
@@ -83,3 +86,5 @@ PolyScope recovers the supplied EIP-712 signature to the selected signing addres
 At submission, the adapter checks the exact signed price against the current book tick and exact signed share size against the current minimum. A changed value is not itself a rejection. If either exact value is now invalid, submission stops without modifying or re-signing the order. A changed exchange version or neg-risk mode remains a rejection because it changes the exchange signing domain.
 
 Soccer provider failures return `availability: "UNAVAILABLE"` with a provider reason and source timestamps. HTTP errors retain safe status-specific reasons. Response bodies and credentials are never included. PolyScope does not substitute incomplete form history or convert provider failure into coverage.
+
+`get_trading_readiness` is a read-only snapshot of the caller-selected account wallet. EOA allowlist eligibility and amount-specific balance sufficiency remain `UNKNOWN` unless an authoritative check is available. `prepare_redeem` returns transaction calldata only after on-chain resolution and position balances are verified; it never signs or broadcasts, and a prepared route reports `EXTERNAL_ACTION_REQUIRED`.
