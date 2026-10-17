@@ -1,13 +1,14 @@
 # PR #7 — thin PayBox + official Polymarket SDK adapter
 
-Checked 2026-10-17, Asia/Jakarta. **Validation checkpoint prepared before commit/push.** The user subsequently authorized committing, pushing, and updating canonical Draft PR #7 metadata. Final GitHub head is recorded in the PR and handoff message. No merge, upload, deployment, or live wallet signing was performed.
+Checked 2026-10-17, Asia/Jakarta. This report includes the PR #7 execution-path simplification and final local validation. The final Git commit carries this report. No merge, upload, deployment, or live wallet signing was performed.
 
 ## 1. Main and PR head
 
 - Canonical Draft PR: [#7](https://github.com/riyannode/polyscope/pull/7), branch `fix/clob-auth-recovery`.
 - Main at start and final remote read: `cd032a8b3f1a19268c4892b13c3ce2d102825ddf`.
-- PR #7 head / local HEAD at the pre-commit validation checkpoint: `9a755462d82dfa777ba24196e8b8d0852eb30597`. The refactor was validated as a working-tree diff against this head.
-- Local checkout: `/home/acer/codex-tasks/2026-10-17/https-developer-paybox-sh-requirements-md/work/polyscope`.
+- PR #7 original head for this task: `4fa9860b2ac852e8e90f811934c181c77ae4552a`.
+- PR #7 final commit: this report's Git commit.
+- Local checkout: `/home/acer/codex-tasks/2026-10-17/di/work/polyscope-pr7`.
 - PR #8 remains Draft at `7fa517d60c89875e0d9d2cd007eceb7a8954ece4`; this task made no changes to it and did not merge or cherry-pick it.
 
 ## 2. Main movement
@@ -18,15 +19,13 @@ No advancement was observed across the initial and final live GitHub/ref reads. 
 
 - `README.md`
 - `docs/errors.md`
-- `package.json`
-- `pnpm-lock.yaml`
-- `pnpm-workspace.yaml`
-- `patches/@polymarket__bindings@0.13.0.patch`
 - `scripts/conformance.mjs`
 - `src/plugin.ts`
 - `tests/network-fixtures.mjs`
 - `outputs/POLYSCOPE_COMPATIBILITY.md`
 - `outputs/plugin.mjs`
+
+These are the seven files changed by this finalization task. Dependency manifests and patches are unchanged.
 
 `src/paybox.ts`, `starter-version.json`, the safe `search_markets` sample in `paybox-plugin.json`, and the research skill remain unchanged. No repository or ancestor `AGENTS.md` was found; the task's supplied instructions were applied. Soccer research implementation, probability/edge functions, and research tool definitions were compared against HEAD and are unchanged.
 
@@ -39,9 +38,9 @@ Removed manual ClobAuth field construction, L1 headers and credential HTTP reque
 ## 5. Small compatibility/product code that remains
 
 - External signer callbacks expose SDK-generated unsigned authentication data and refuse all actual signing/message signing/transaction sends. The SDK public preparation workflows require an authenticated client, which explains the schema changes below.
-- A stateless finalizer reattaches saved SDK fields to the SDK `SignedOrder` interface, verifies exact user intent, and compares the saved signing template with a newly generated SDK template while preserving the original salt/timestamp. The SDK exposes no supported public method for finalizing an externally returned signature in another sandbox.
+- A stateless finalizer reattaches the saved SDK-generated EIP-712 fields and PayBox signature to the SDK `SignedOrder` interface. A local field-by-field check proves that the wire order matches the saved signed payload; submission does not generate a second order or refresh market metadata.
 - Owner Deposit Wallet signatures use a short ERC-7739 envelope made from the saved SDK types/domain and generic viem hashes. A regression compares it byte-for-byte with the official SDK's completed preparation workflow. No private SDK implementation is copied or deep-imported. Session-key wallet signing is explicitly unsupported by this finalizer.
-- Exact integer share/price/fee-cap checks remain product constraints. SDK maker/taker amounts must equal the approved intent or preparation rejects. No `maxSpend` resizer is used. The SDK exposes no equivalent public exact-share worst-case fee-cap API, so the existing conservative cap arithmetic remains; fee descriptors are fetched/decoded by `fetchMarketInfo`.
+- The order preparation contract contains no enforced spending-cap fields. SDK maker/taker amounts and effective rounded size are presented for PayBox approval. `fetchMarketInfo` remains for informational quote fee estimates only; fees are not refreshed after signing and do not block submission.
 - Small public Gamma/book adapters retain quote provenance and raw timestamp/version diagnostics absent from SDK-normalized book output. They do not construct orders or choose exchange addresses.
 - A scoped HTTP adapter prevents another transmission of a non-read request within one SDK operation, including SDK DELETE retries, and retains the first mutation response status. Successful HTTP statuses are observed rather than inferred. It neither implements auth/HMAC nor builds CLOB request bodies.
 - A pnpm patch corrects two invalid mapped-type references in the published bindings declaration. It changes no SDK runtime code, adds no `skipLibCheck`, and retains the starter's TypeScript version. The same upstream declaration errors were reproduced under TypeScript 5.9.3 and 6.0.2 before choosing the declaration-only correction.
@@ -54,8 +53,8 @@ Exact dependencies: `@polymarket/client@0.13.0`, `@polymarket/bindings@0.13.0`, 
 |---|---|
 | Auth payload, wallet classification, secure client and L2 auth | `createPublicClient`, `createSecureClient` |
 | Invocation-local credentials | `createOrDeriveApiKey` |
-| Market fee metadata | `fetchMarketInfo` |
-| Exact-share amounts, salt, tick rules, protocol/exchange routing and signing data | `prepareLimitOrder` |
+| Informational quote fee metadata | `fetchMarketInfo` |
+| Amount rounding, salt, tick rules, protocol/exchange routing and signing data | `prepareLimitOrder` |
 | Wire formatting and POST | `client.postOrder` |
 | Authenticated order reads | `client.fetchOrder` |
 | Cancellation | `client.cancelOrder` |
@@ -63,7 +62,7 @@ Exact dependencies: `@polymarket/client@0.13.0`, `@polymarket/bindings@0.13.0`, 
 | Position/market state | `client.listPositions`, `client.listMarkets` |
 | Unsigned redemption calls | `prepareRedeemMarketPositions`, `prepareRedeemPosition` |
 
-The SDK limit-order workflow supplies exact-share signing data; the approved immediate execution type is passed separately to `postOrder` as FAK/FOK, as supported by the SDK `SignedOrder` interface. Visible depth never determines FOK success.
+The SDK limit-order workflow supplies the signed order fields; SDK-rounded effective quantities are shown to PayBox for approval. The trusted prepared approval context binds FAK/FOK because order type is posted separately from the EIP-712 Order. Visible depth never determines FOK success. FAK may partially fill.
 
 ## 7. PayBox responsibilities
 
@@ -118,27 +117,26 @@ Executed with **Node 24.21.0 / pnpm 11.11.0 / Linux x64**, starter **1.0.2**:
 
 | Command | Result |
 |---|---|
-| `pnpm install --frozen-lockfile` | PASS (exit 0) |
-| `pnpm typecheck` | PASS (exit 0) |
-| `pnpm test` | PASS (exit 0) |
-| `pnpm conformance` | PASS (exit 0) |
-| `pnpm audit --prod` | PASS (exit 0) |
-| `pnpm build` | PASS (exit 0) |
-| `pnpm build` | PASS (exit 0) |
+| `pnpm install --frozen-lockfile` | PASS (exit 0; already up to date) |
+| `pnpm typecheck` | PASS (exit 0; also run by `pnpm test`) |
+| `pnpm test` | PASS (exit 0; 188.5 seconds; includes two builds and all deterministic fixtures) |
+| `pnpm conformance` | PASS (exit 0; 16 tools discovered; read-only provider sample below) |
+| `pnpm audit --prod` | PASS (exit 0; no known vulnerabilities) |
+| `pnpm build` twice | PASS (exit 0; identical byte count and SHA-256) |
 | `git diff --check` | PASS (exit 0) |
 
-Regression coverage includes discovery with no network access; self-contained schemas; complete typed data in text-only output; exact five-share FAK/FOK; cap rejection without resizing; EOA type 0; owner Deposit Wallet type 3 and an SDK byte-for-byte signature oracle; reused ClobAuth; optional validators; SDK POST/status/cancel; observed HTTP 201 status; no retry after ambiguous POST/DELETE; read-only reconciliation; no secret output; indexed read-only readiness; SDK CTF/V2 unsigned redemption, multiple outcomes and mismatched-owner/asset rejection; and unchanged research regressions.
+Regression coverage includes discovery with no network access; self-contained schemas; complete typed data in text-only output; SDK effective amount presentation; local rejection of signed-field mutation; EOA type 0; owner Deposit Wallet type 3 and an SDK byte-for-byte signature oracle; reusable ClobAuth; optional validators; no post-sign Gamma/book/fee refresh; provider-owned minimum-size rejection; FAK/FOK approval-context binding; order-ID read-back matching; one POST/DELETE with read-only ambiguity reconciliation; no secret output; informational readiness; SDK CTF/V2 unsigned redemption; and unchanged research regressions.
 
 Resolved setup failures: the initial `pnpm test` baseline returned `startup_failed` because the task-local pnpm shim was not executable; its executable permission was corrected and validation rerun. Initial `pnpm typecheck` reported upstream bindings TS2536 errors under both tested TypeScript versions; the declaration-only patch above resolves them. No final validation command remains failed or unavailable.
 
-Production audit: **no known vulnerabilities found**. Local conformance discovered 16 tools and passed its read-only sample. Live public-provider details are narrower than that protocol pass: football-data.org and API-Football returned HTTP 403, so soccer API availability was UNAVAILABLE; the quote sample returned NO_LIQUIDITY / STALE. Live authenticated preparation was not run because it requires signed ClobAuth. Fixture success is not live wallet/provider execution proof.
+Production audit: **no known vulnerabilities found**. Local conformance discovered 16 tools. Live read-only sample: `search_markets`, `get_soccer_news`, and `get_quote` passed; the quote was FRESH. football-data.org and API-Football returned HTTP 403, so soccer API availability was UNAVAILABLE. Live authenticated preparation was not run because it requires signed ClobAuth. Fixture success is not live wallet/provider execution proof.
 
 Starter manifest checks match `starter-version.json`, `src/paybox.ts`, `scripts/process.mjs`, `scripts/report.mjs`, `scripts/schema.mjs`, `tsconfig.json` and `.gitignore`. The existing custom test runner remains unchanged. No starter release files were mixed.
 
 ## 12. Bundle
 
-- Bytes: **1,347,807**, below **10,485,760** (10 MiB).
-- SHA-256: `4793013b91e1a0febd8a8e5502855a87730a1f1d256804d51f12e1680008960d`.
+- Bytes: **1,341,564**, below **10,485,760** (10 MiB).
+- SHA-256: `fe1ab83d52ad25d59cc83b7d0201424e1928e87283070ff0a402581fe7a9bbcf`.
 - Both final builds have identical bytes and SHA-256.
 - `dist/plugin.mjs` and tracked `outputs/plugin.mjs` are byte-identical, confirmed with `cmp` and SHA-256.
 - The bundle remains local; it was not uploaded or installed.
@@ -155,6 +153,18 @@ Sources: [official TypeScript SDK](https://github.com/Polymarket/ts-sdk), [PayBo
 
 ## Credential boundary correction
 
-The follow-up patch was validated against PR #7 commit `36b8fea5db1f05de43e343175cedb91ede79c0e0`. Inspection of the installed official SDK 0.13.0 confirmed that public `createOrDeriveApiKey` owns the create-first / HTTP-400-then-derive workflow. PolyScope now calls that API directly and retains only safe authentication error mapping. The externally signed order finalizer and Deposit Wallet compatibility wrapper are unchanged.
+The installed SDK's `createOrDeriveApiKey` remains responsible for create-first / HTTP-400-then-derive credential handling. The final submission runs this SDK authentication setup in parallel with the standalone geoblock request, then posts exactly once through `client.postOrder`. Fixture assertions cover both fresh and existing credential paths, blocked geolocation, exact signed-wire fields, no post-sign Gamma/book/fee requests, and one mutation with read-only reconciliation after ambiguity.
 
-Regression fixtures enforce fresh credentials (`create → order`), existing credentials (`create → 400 → derive → order`), and sanitized authentication rejection on either route. Request-time assertions enforce the sequence before successful responses; they do not rely solely on child-process exit hooks. The corrected fixture rejected the previous implementation, and the complete final `pnpm test` and `pnpm conformance` passed using Node 24.21.0 / pnpm 11.11.0. `pnpm test` includes typecheck and two byte-identical builds. Dependencies, schemas, and research behavior did not change; the preceding frozen install and production audit remain applicable. The bundle section above reflects this corrected build. No live signing or trading was performed.
+### Execution-path finalization
+
+- Deleted `validateExecutionSnapshot()` and removed its Gamma, CLOB book, fee, tick, minimum-size, market-version, and spending checks from submission. Its geoblock request is isolated in `checkGeoblock()`.
+- Deleted `assertSdkBinding()` and does not call `sdkOrderPayload()` after signing. The only `sdkOrderPayload()` call is in preparation; submission locally reconstructs `SignedOrder` and checks every signed field before calling `postOrder()`.
+- `validatePreparedOrder()` now checks safe serialization and equality between the saved typed data and prepared order fields. PayBox signature recovery, expected signer binding, FAK/FOK context, and exact wire-field binding remain local checks.
+- Removed `maxNominalPusd`, `maxGrossPusd`, `maxFeePusd`, fee-rate/exponent fields, and market eligibility metadata from the preparation contract. Quote fee calculation remains informational.
+- The standalone geoblock request uses the official Polymarket endpoint and runs alongside SDK credential setup. SDK financial requests have no locally imposed 1.5-second timeout; caller cancellation is preserved and redirects are rejected.
+- Approximate call-graph comparison from the audited EOA create-success path: preparation **7 requests / 6 sequential stages → about 5 / 4**; submission including POST **9 / 5 → about 4 / 3**. These are architecture estimates, not hardcoded fixture assertions. Current preparation retains one product-mapping Gamma read and the SDK credential/order-preparation requests. Submission has parallel credential/geoblock work, one POST, and only on ambiguity one read-only order lookup.
+- Order status and ambiguous submission reconciliation reject a returned provider order ID when it differs from the requested order ID. Omitted provider IDs are not fabricated.
+- FAK/FOK remains bound to the trusted prepared context. FAK partial fills and FOK provider results are reflected from authoritative read-back; visible depth and local minimum-size rules do not gate the order.
+- Static source search found no `validateExecutionSnapshot`, `assertSdkBinding`, custom HMAC/L2 signer, custom domain/tick routing tables, Polygon approval scanner, short financial timeout, or post-sign Gamma/book/fee refresh. `/order` remains only as SDK-owned calls in plugin code and HTTP fixture routes in tests. `feeMicros` remains only for informational quotes; `PS_AMOUNT_PRECISION` remains for read-only quote parsing.
+
+No live ClobAuth signing, order submission, cancellation, funding, approval, or redemption was performed. Hosted wallet/provider acceptance remains unverified as described above.
