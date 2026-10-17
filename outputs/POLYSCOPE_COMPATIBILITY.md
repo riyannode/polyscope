@@ -1,12 +1,11 @@
-# PolyScope PR #7 compatibility and validation
+# PolyScope compatibility and validation
 
 ## Repository state
 
 - Repository: [riyannode/polyscope](https://github.com/riyannode/polyscope)
-- Existing PR: [#7](https://github.com/riyannode/polyscope/pull/7), Draft and unmerged
-- Branch: `fix/clob-auth-recovery`
-- Base and PR head were checked before editing; no newer PR head was found.
-- This patch has not been merged, deployed, uploaded, or installed.
+- Documentation cleanup starts from current `main`, commit `62739172ad9facfb4753b0f04ac279e1440e35a1`.
+- PR [#7](https://github.com/riyannode/polyscope/pull/7) and PR [#9](https://github.com/riyannode/polyscope/pull/9) are merged into `main`.
+- This submission-readiness change updates documentation only; plugin behavior is unchanged.
 
 ## Public MCP contract
 
@@ -36,20 +35,32 @@ The public catalog was reduced from the historical 16-tool catalog. `get_quote`,
 - `get_positions` retains the Data API v2 OPEN single-market pagination semantics.
 - Current news and lineup research continues through host-native browser/search capabilities, not a PolyScope news feed.
 
-## Validation evidence
+## Local validation evidence (2026-10-18)
 
 Validated with Node.js 24.21.0 and pnpm 11.11.0:
 
 | Command | Result |
 |---|---|
 | `pnpm install --frozen-lockfile` | PASS |
-| `pnpm test` | PASS, 150.7 seconds; includes typecheck, two deterministic builds, and offline fixture suite |
-| `pnpm conformance` | PASS; 11 tools discovered; read-only search and quote passed; soccer APIs returned HTTP 403; authenticated preparation not run |
+| `pnpm typecheck` | PASS |
+| `pnpm test` | PASS, 149.4 seconds; includes typecheck, two deterministic builds, and offline fixture suite |
+| `pnpm conformance` | PASS; 11 tools discovered; live search and fresh quote passed; local soccer calls returned `UNAVAILABLE` / HTTP 403; authenticated preparation not run |
+| `pnpm build` | PASS |
 | `pnpm audit --prod` | PASS; no known vulnerabilities reported |
 | `git diff --check` | PASS |
 
-The built bundle is **1,259,935 bytes** (below the 10 MiB limit), SHA-256 `f91354be099ceed811857ff25d82f6504e638b3394158660393ab4b433abc25d`. `dist/plugin.mjs` and `outputs/plugin.mjs` are byte-identical. Fixture success does not establish hosted PayBox behavior or live provider execution.
+The built bundle is **1,259,531 bytes** (below the 10 MiB limit), SHA-256 `b9753481c5a1e391d755e466f29713f97c3f405ecc5d93831178bca460d15e07`. `dist/plugin.mjs` and `outputs/plugin.mjs` are byte-identical. Fixture success does not establish hosted PayBox behavior or live provider execution. The local soccer calls had no configured provider credentials; they do not reproduce the supplied hosted research validation. Gitleaks 8.30.1 scanned all 14 existing commits and found no leaks.
 
 ## Hosted and live status
 
-PayBox-hosted schema discovery and signing handoff, hosted credential binding, authenticated provider acceptance, actual FAK/FOK submission/fill/status/cancellation, and current account approval state remain **UNVERIFIED** by this local patch. No live ClobAuth signing, order submission, cancellation, funding, approval, transfer, or redemption was performed. No transaction or order receipt is claimed.
+The following records the supplied live validation results, separate from the local checks above:
+
+- Research / quotes: verified live.
+- PayBox-hosted ClobAuth EIP-712 signing: verified live.
+- PayBox-hosted Deposit Wallet Type-3 order signing: verified live.
+- Wallet binding: owner/signing EOA `0x7bdE0dd8acC78f04AAcE3e7b488E369F60a3CB9B`; Deposit Wallet / maker `0xB4BC85B0C28C3d27955c44dAf0Aa2aaf98c78059`.
+- After PR #9, a live `submit_order` reached the official Polymarket CLOB and returned HTTP 403 / `PS_CLOB_FORBIDDEN`. No order was created and no funds were spent.
+- The exact reason for the hosted CLOB 403 is unproven. Local Indonesia connectivity reports `blocked=false`; the hosted rejection is not proven to be a geoblock.
+- Successful fill and cancellation remain **UNVERIFIED**.
+
+No live signing, order submission, or cancellation was performed during this documentation cleanup. Signing success does not establish provider order acceptance or a completed trade.
