@@ -29,7 +29,7 @@ The public catalog was reduced from the historical 16-tool catalog. `get_quote`,
 ## Contract corrections and safety
 
 - `prepare_order` requires an explicit FAK or FOK `orderType` and returns SDK-effective signed amounts. `submit_order` verifies the same prepared type and signed fields before one SDK POST.
-- Existing local signature validation, signer binding, geoblock preflight, and FAK/FOK binding remain in place.
+- Existing local signature validation, signer binding, and FAK/FOK binding remain in place.
 - Ambiguous submission and cancellation outcomes receive at most one read-only reconciliation. The plugin never retries a POST or DELETE automatically.
 - `get_order_status` and `cancel_order` require both `signerAddress` and `accountWalletAddress`; callers no longer supply order size or type. Size and type are read from the matching provider record and remain null when the record does not establish them.
 - `get_trading_approvals` returns the SDK's indexed aggregate state and missing ERC-20/ERC-1155 requirements. It does not claim wallet balance, gas, per-order sufficiency, fresh finality, or trading eligibility.
