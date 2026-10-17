@@ -9,6 +9,9 @@ if (scenario === "unexpected-failure") {
   Object.defineProperty(globalThis.crypto, "getRandomValues", { value: () => { throw new Error("fixture unexpected programming failure"); } });
 }
 let orderPosts = 0;
+let orderReadbacks = 0;
+let cancelDeletes = 0;
+const cancelCalls = [];
 const authAndOrderCalls = [];
 process.on("exit", () => {
   if (scenario?.startsWith("snapshot-") && !["snapshot-min-increase", "snapshot-min-zero", "snapshot-tick-invalid", "snapshot-risk-changed"].includes(scenario) && orderPosts !== 1) process.exitCode = 92;
@@ -16,6 +19,21 @@ process.on("exit", () => {
   if (["submit-valid", "existing-api-key", "submit-deposit-wallet", "submit-ambiguous"].includes(scenario) && authAndOrderCalls.join(",") !== "derive,order") process.exitCode = 95;
   if (["submit-rejected-l1-auth", "missing-credentials", "l1-derive-401"].includes(scenario) && authAndOrderCalls.join(",") !== "derive") process.exitCode = 97;
   if (scenario?.startsWith("order-status-") && authAndOrderCalls.join(",") !== "derive") process.exitCode = 99;
+  if (["submit-valid", "existing-api-key", "submit-deposit-wallet", "submit-ambiguous", "submit-ambiguous-429", "submit-ambiguous-503", "submit-malformed-success", "submit-malformed-order-id", "submit-reconciled", "submit-l2-401", "submit-400", "submit-403"].includes(scenario)
+    && (authAndOrderCalls.join(",") !== "derive,order" || orderPosts !== 1)) process.exitCode = 101;
+  if (scenario?.startsWith("submit-ambiguous") || scenario === "submit-malformed-success" || scenario === "submit-malformed-order-id" || scenario === "submit-reconciled") {
+    if (orderPosts !== 1 || orderReadbacks !== 1) process.exitCode = 102;
+  }
+  const expectedCancelCalls = {
+    "cancel-valid": "derive,delete",
+    "cancel-l1-401": "derive",
+    "cancel-l2-401": "derive,delete",
+    "cancel-403": "derive,delete",
+    "cancel-ambiguous": "derive,delete,read",
+    "cancel-reconciled": "derive,delete,read",
+  };
+  if (scenario in expectedCancelCalls && (cancelCalls.join(",") !== expectedCancelCalls[scenario]
+    || cancelDeletes !== (scenario === "cancel-l1-401" ? 0 : 1))) process.exitCode = 103;
   if (scenario === "identity-mismatch" && authAndOrderCalls.length !== 0) process.exitCode = 100;
 });
 
@@ -124,16 +142,17 @@ globalThis.fetch = async (input, init = {}) => {
     authAndOrderCalls.push("create");
     const expectedSigner = process.env.POLYSCOPE_TEST_EXPECTED_SIGNER;
     if (expectedSigner && init.headers?.POLY_ADDRESS?.toLowerCase() !== expectedSigner.toLowerCase()) process.exit(84);
-    if (scenario === "submit-rejected-l1-auth" || scenario === "missing-credentials") {
+    if (scenario === "submit-rejected-l1-auth" || scenario === "missing-credentials" || scenario === "cancel-l1-401") {
       return new Response("apiKey=SECRET_SENTINEL; secret=SECRET_SENTINEL; passphrase=SECRET_SENTINEL; signature=SECRET_SENTINEL", { status: 401 });
     }
     if (scenario === "existing-api-key") return new Response("already exists", { status: 400 });
     body = { apiKey: "fixture-api-key", secret: "dGVzdA==", passphrase: "fixture-passphrase" };
   } else if (url.hostname === "clob.polymarket.com" && url.pathname === "/auth/derive-api-key") {
     authAndOrderCalls.push("derive");
+    if (scenario?.startsWith("cancel-")) cancelCalls.push("derive");
     const expectedSigner = process.env.POLYSCOPE_TEST_EXPECTED_SIGNER;
     if (expectedSigner && init.headers?.POLY_ADDRESS?.toLowerCase() !== expectedSigner.toLowerCase()) process.exit(84);
-    if (scenario === "submit-rejected-l1-auth" || scenario === "missing-credentials") {
+    if (scenario === "submit-rejected-l1-auth" || scenario === "missing-credentials" || scenario === "cancel-l1-401") {
       return new Response("apiKey=SECRET_SENTINEL; secret=SECRET_SENTINEL; passphrase=SECRET_SENTINEL; signature=SECRET_SENTINEL", { status: 401 });
     }
     if (scenario === "l1-derive-401") return new Response("apiKey=SECRET_SENTINEL; secret=SECRET_SENTINEL; passphrase=SECRET_SENTINEL; signature=SECRET_SENTINEL", { status: 401 });
@@ -143,6 +162,22 @@ globalThis.fetch = async (input, init = {}) => {
   } else if (url.hostname === "clob.polymarket.com" && url.pathname.startsWith("/data/order/")) {
     const expectedSigner = process.env.POLYSCOPE_TEST_EXPECTED_SIGNER;
     if (expectedSigner && init.headers?.POLY_ADDRESS?.toLowerCase() !== expectedSigner.toLowerCase()) process.exit(84);
+    if (scenario?.startsWith("submit-ambiguous") || scenario === "submit-malformed-success" || scenario === "submit-malformed-order-id" || scenario === "submit-reconciled") {
+      orderReadbacks += 1;
+      if (scenario === "submit-reconciled") return Response.json({
+        id: url.pathname.split("/").at(-1), status: "MATCHED", order_type: "FAK", original_size: "10", size_matched: "10",
+        associate_trades: ["fixture-trade"], asset_id: "123", side: "BUY",
+      });
+      return new Response("not found", { status: 404 });
+    }
+    if (scenario?.startsWith("cancel-")) {
+      cancelCalls.push("read");
+      if (scenario === "cancel-reconciled") return Response.json({
+        id: url.pathname.split("/").at(-1), status: "CANCELED", order_type: "FAK", original_size: "10", size_matched: "0",
+        associate_trades: [], asset_id: "123", side: "BUY",
+      });
+      return new Response("not found", { status: 404 });
+    }
     if (scenario === "order-status-l2-401") return new Response("apiKey=SECRET_SENTINEL; secret=SECRET_SENTINEL; passphrase=SECRET_SENTINEL; signature=SECRET_SENTINEL", { status: 401 });
     if (scenario === "order-status-503") return new Response("apiKey=SECRET_SENTINEL; secret=SECRET_SENTINEL", { status: 503 });
     if (scenario === "order-status-timeout") throw new DOMException("fixture timeout", "TimeoutError");
@@ -151,10 +186,19 @@ globalThis.fetch = async (input, init = {}) => {
       associate_trades: ["fixture-trade"], asset_id: "123", side: "BUY",
     });
     return new Response("not found", { status: 404 });
+  } else if (url.hostname === "clob.polymarket.com" && url.pathname === "/order" && init.method === "DELETE") {
+    cancelDeletes += 1;
+    cancelCalls.push("delete");
+    const canceledOrder = JSON.parse(init.body);
+    if (canceledOrder.orderID !== `0x${"a".repeat(64)}` || cancelDeletes !== 1) process.exit(104);
+    if (scenario === "cancel-l2-401") return new Response("apiKey=SECRET_SENTINEL; secret=SECRET_SENTINEL; passphrase=SECRET_SENTINEL; signature=SECRET_SENTINEL", { status: 401 });
+    if (scenario === "cancel-403") return new Response("apiKey=SECRET_SENTINEL; signature=SECRET_SENTINEL", { status: 403 });
+    if (scenario === "cancel-ambiguous" || scenario === "cancel-reconciled") return new Response("fixture provider unavailable secret=SECRET_SENTINEL", { status: 503 });
+    return Response.json({ canceled: [`0x${"a".repeat(64)}`] });
   } else if (url.hostname === "clob.polymarket.com" && url.pathname === "/order" && init.method === "POST") {
     orderPosts += 1;
     authAndOrderCalls.push("order");
-    if (!["submit-valid", "existing-api-key", "submit-deposit-wallet", "restricted-submit", "submit-stale-book", "submit-future-book", "missing-book-timestamp", "submit-ambiguous", "snapshot-min-decrease", "snapshot-tick-valid"].includes(scenario) || orderPosts !== 1) process.exit(89);
+    if (!["submit-valid", "existing-api-key", "submit-deposit-wallet", "restricted-submit", "submit-stale-book", "submit-future-book", "missing-book-timestamp", "submit-ambiguous", "submit-ambiguous-429", "submit-ambiguous-503", "submit-malformed-success", "submit-malformed-order-id", "submit-reconciled", "submit-l2-401", "submit-400", "submit-403", "snapshot-min-decrease", "snapshot-tick-valid"].includes(scenario) || orderPosts !== 1) process.exit(89);
     const postedOrder = JSON.parse(init.body);
     if (postedOrder.orderType !== "FAK" || postedOrder.order.side !== "BUY"
       || postedOrder.order.makerAmount !== "5000000" || postedOrder.order.takerAmount !== "10000000"
@@ -164,6 +208,14 @@ globalThis.fetch = async (input, init = {}) => {
     if (expectedMaker && (postedOrder.order.maker.toLowerCase() !== expectedMaker.toLowerCase()
       || postedOrder.order.signer.toLowerCase() !== expectedMaker.toLowerCase())) process.exit(85);
     if (scenario === "submit-ambiguous") throw new Error("fixture connection reset after request body");
+    if (scenario === "submit-ambiguous-429") return new Response("signature=SECRET_SENTINEL; apiKey=SECRET_SENTINEL", { status: 429 });
+    if (scenario === "submit-ambiguous-503") return new Response("signature=SECRET_SENTINEL; apiKey=SECRET_SENTINEL", { status: 503 });
+    if (scenario === "submit-reconciled") return new Response("signature=SECRET_SENTINEL; apiKey=SECRET_SENTINEL", { status: 503 });
+    if (scenario === "submit-malformed-success") return new Response("{", { status: 200 });
+    if (scenario === "submit-malformed-order-id") return Response.json({ success: true, orderID: "not-an-order-hash" });
+    if (scenario === "submit-l2-401") return new Response("signature=SECRET_SENTINEL; apiKey=SECRET_SENTINEL", { status: 401 });
+    if (scenario === "submit-400") return new Response("signature=SECRET_SENTINEL; apiKey=SECRET_SENTINEL", { status: 400 });
+    if (scenario === "submit-403") return new Response("signature=SECRET_SENTINEL; apiKey=SECRET_SENTINEL", { status: 403 });
     if (["submit-valid", "existing-api-key", "submit-deposit-wallet", "restricted-submit", "submit-stale-book", "submit-future-book", "missing-book-timestamp", "snapshot-min-decrease", "snapshot-tick-valid"].includes(scenario)) {
       return new Response(JSON.stringify({ success: true, orderID: `0x${"a".repeat(64)}`, status: "MATCHED", tradeIDs: [] }), {
         status: 200, headers: { "content-type": "application/json" },

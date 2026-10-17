@@ -326,6 +326,7 @@ export async function testOfflineArtifact(root = process.cwd()) {
     fail("valid Deposit Wallet signing data did not reach its single intercepted CLOB POST without Polygon RPC", "deposit_wallet_submit_invalid");
   }
   const statusTool = tools.find((tool) => tool.name === "get_order_status");
+  const cancelTool = tools.find((tool) => tool.name === "cancel_order");
   const statusOrderId = `0x${"a".repeat(64)}`;
   const l1DerivationRejected = await callTool(artifact, statusTool, {
     orderId: statusOrderId, requestedSize: "10", signerAddress: replaySigner.address, clobAuth,
@@ -420,9 +421,68 @@ export async function testOfflineArtifact(root = process.cwd()) {
   if (changedFee.structuredContent.errorCode !== "PS_SPENDING_CAP") {
     fail("current fee increase was not bounded by the user-approved all-in spending cap", "spending_cap_invalid");
   }
-  const ambiguous = await callTool(artifact, submitTool, submitArgs, { fixtures: true, fixtureScenario: "submit-ambiguous" });
-  if (ambiguous.structuredContent.status !== "UNKNOWN" || ambiguous.structuredContent.errorCode !== "PS_SUBMISSION_UNKNOWN") {
-    fail("ambiguous order POST was retried or presented as a confirmed result", "ambiguous_submit_invalid");
+  for (const [scenario, httpStatus] of [
+    ["submit-ambiguous", 404], ["submit-ambiguous-429", 429], ["submit-ambiguous-503", 503],
+    ["submit-malformed-success", 200], ["submit-malformed-order-id", 200],
+  ]) {
+    const ambiguous = await callTool(artifact, submitTool, submitArgs, { fixtures: true, fixtureScenario: scenario });
+    if (ambiguous.structuredContent.status !== "UNKNOWN" || ambiguous.structuredContent.errorCode !== "PS_SUBMISSION_UNKNOWN"
+      || ambiguous.structuredContent.httpStatus !== httpStatus || JSON.stringify(ambiguous.structuredContent).includes("SECRET_SENTINEL")) {
+      fail(`${scenario} did not retain a sanitized unknown result and the single POST status`, "ambiguous_submit_invalid");
+    }
+  }
+  const submissionReconciled = await callTool(artifact, submitTool, submitArgs, { fixtures: true, fixtureScenario: "submit-reconciled" });
+  if (submissionReconciled.structuredContent.status !== "FILLED" || submissionReconciled.structuredContent.filledSize !== "10"
+    || submissionReconciled.structuredContent.httpStatus !== 503) {
+    fail("authoritative order read-back did not resolve an ambiguous POST while preserving the POST HTTP status", "ambiguous_submit_invalid");
+  }
+  for (const [scenario, errorCode, httpStatus] of [
+    ["submit-l2-401", "PS_CLOB_PRIVATE_AUTH_REJECTED", 401],
+    ["submit-400", "PS_CLOB_REJECTED", 400],
+    ["submit-403", "PS_CLOB_FORBIDDEN", 403],
+  ]) {
+    const rejected = await callTool(artifact, submitTool, submitArgs, { fixtures: true, fixtureScenario: scenario });
+    if (rejected.structuredContent.status !== "REJECTED" || rejected.structuredContent.errorCode !== errorCode
+      || rejected.structuredContent.httpStatus !== httpStatus || JSON.stringify(rejected.structuredContent).includes("SECRET_SENTINEL")) {
+      fail(`${scenario} did not retain its sanitized CLOB rejection classification`, "clob_submit_failure_invalid");
+    }
+  }
+  if (!cancelTool) fail("cancel_order was not returned by tools/list", "tool_catalog_invalid");
+  const cancelArgs = {
+    orderId: statusOrderId, requestedSize: "10", signerAddress: replaySigner.address, clobAuth, confirmCancel: true,
+  };
+  const canceled = await callTool(artifact, cancelTool, cancelArgs, {
+    fixtures: true, fixtureScenario: "cancel-valid", expectedSignerAddress: replaySigner.address,
+  });
+  if (canceled.structuredContent.status !== "CANCELLED" || canceled.structuredContent.httpStatus !== 200) {
+    fail("confirmed cancellation did not return the structured CLOB result", "cancel_result_invalid");
+  }
+  for (const [scenario, errorCode, httpStatus] of [
+    ["cancel-l1-401", "PS_CLOB_AUTH_REJECTED", 401],
+    ["cancel-l2-401", "PS_CLOB_PRIVATE_AUTH_REJECTED", 401],
+    ["cancel-403", "PS_CLOB_FORBIDDEN", 403],
+  ]) {
+    const rejected = await callTool(artifact, cancelTool, cancelArgs, {
+      fixtures: true, fixtureScenario: scenario, expectedSignerAddress: replaySigner.address,
+    });
+    if (!["FAILED", "REJECTED"].includes(rejected.structuredContent.status)
+      || rejected.structuredContent.errorCode !== errorCode || rejected.structuredContent.httpStatus !== httpStatus
+      || JSON.stringify(rejected.structuredContent).includes("SECRET_SENTINEL")) {
+      fail(`${scenario} did not return a schema-valid sanitized cancellation failure`, "cancel_result_invalid");
+    }
+  }
+  const cancelUnknown = await callTool(artifact, cancelTool, cancelArgs, {
+    fixtures: true, fixtureScenario: "cancel-ambiguous", expectedSignerAddress: replaySigner.address,
+  });
+  if (cancelUnknown.structuredContent.status !== "UNKNOWN" || cancelUnknown.structuredContent.errorCode !== "PS_CANCEL_UNKNOWN"
+    || cancelUnknown.structuredContent.httpStatus !== 503) {
+    fail("ambiguous cancellation did not preserve its single DELETE status and bounded read-back result", "cancel_result_invalid");
+  }
+  const cancelReconciled = await callTool(artifact, cancelTool, cancelArgs, {
+    fixtures: true, fixtureScenario: "cancel-reconciled", expectedSignerAddress: replaySigner.address,
+  });
+  if (cancelReconciled.structuredContent.status !== "CANCELLED" || cancelReconciled.structuredContent.httpStatus !== 503) {
+    fail("authoritative order read-back did not resolve an ambiguous cancellation", "cancel_result_invalid");
   }
   const sell = await callTool(artifact, prepareTool, { ...base, side: "SELL", priceLimit: "0.49" }, { fixtures: true });
   const sellOrder = sell.structuredContent.preparedOrder.order;
@@ -1129,7 +1189,7 @@ export async function testOfflineArtifact(root = process.cwd()) {
     deterministicCases: [
       "BUY FAK preserves exact signed limit, size, precision, and fee-inclusive cap", "lack of visible liquidity does not block bounded FAK preparation", "no ExecutionApproval signature is required", "signed order is accepted for exactly one intercepted CLOB POST", "undocumented 300-second ClobAuth cutoff removed", "undocumented order-timestamp freshness cutoff removed", "SELL FAK preserves exact signed minimum price and size", "market fee descriptor and exact fee calculation",
       "reject invalid Polymarket order signature", "reject real provider geoblock", "missing CLOB credentials handled", "Deposit Wallet TypedDataSign preparation", "local smart-wallet signer recovery is distinct from deferred CLOB acceptance", "Deposit Wallet ERC-7739 order reaches exactly one intercepted CLOB POST without Polygon RPC",
-      "121s book age is informational for preparation", "future, invalid, missing, and stale book timestamps do not block bounded FAK execution", "changed minimum decrease and still-valid tick are accepted", "increased minimum and invalid current tick reject the exact signed order", "zero current minimum is rejected as invalid provider data", "changed risk mode rejects an incompatible exchange domain", "restricted Gamma metadata omitted and does not reject preparation/submission", "market and quote responses omit removed eligibility metadata", "unsigned book metadata does not change EIP-712 signature validation", "51s quote remains labeled stale", "51s book age alone does not block bounded FAK execution", "ambiguous submission is reconciled once and never reposted", "provider-invalid structured diagnostics", "reject unsafe CLOB salt precision", "reject fee-inclusive cap overrun", "reject wrong outcome asset",
+      "121s book age is informational for preparation", "future, invalid, missing, and stale book timestamps do not block bounded FAK execution", "changed minimum decrease and still-valid tick are accepted", "increased minimum and invalid current tick reject the exact signed order", "zero current minimum is rejected as invalid provider data", "changed risk mode rejects an incompatible exchange domain", "restricted Gamma metadata omitted and does not reject preparation/submission", "market and quote responses omit removed eligibility metadata", "unsigned book metadata does not change EIP-712 signature validation", "51s quote remains labeled stale", "51s book age alone does not block bounded FAK execution", "timeout, HTTP 429/5xx, malformed success, and malformed order IDs reconcile once, retain status, and never repost; authoritative read-back resolves a confirmed fill", "HTTP 400/401/403 POST errors retain sanitized classifications and status", "cancel_order reports structured L1/L2/403 failures, issues one DELETE, and reconciles ambiguous outcomes at most once", "provider-invalid structured diagnostics", "reject unsafe CLOB salt precision", "reject fee-inclusive cap overrun", "reject wrong outcome asset",
       "team-attributed news", "PL/PD/SA/CL fixture mapping", "documented team-form filters with mixed-competition history filtering", "form counts and explanations for 5/5, 5/4, 5/0, and 0/0 histories",
       "safe team-form HTTP 403 permission and 429 rate-limit diagnostics", "API-Football competition-scoped enrichment, upstream cross-year season reuse, independent IDs, exact fixture matching, and cutoff date",
       "provider 403, 204, HTTP 200 error envelope, unavailable/missing stats, mismatched names, kickoff conflicts, and ambiguous duplicates do not replace baseline data", "Poisson probability normalization and venue-specific API-Football and football-data fallback inputs",

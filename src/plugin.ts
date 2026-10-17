@@ -1557,6 +1557,29 @@ async function clobPrivateRequest(
   return { status: response.status, data };
 }
 
+function clobPrivateHttpFailure(status: number): { code: string; message: string } {
+  if (status === 401) return {
+    code: "PS_CLOB_PRIVATE_AUTH_REJECTED",
+    message: "Polymarket rejected L2 order authentication; verify the derived CLOB credentials.",
+  };
+  if (status === 403) return {
+    code: "PS_CLOB_FORBIDDEN",
+    message: "Polymarket denied this CLOB request.",
+  };
+  if (status === 400) return {
+    code: "PS_CLOB_REJECTED",
+    message: "Polymarket rejected the CLOB request.",
+  };
+  if (status === 429 || status >= 500) return {
+    code: "PS_PROVIDER_UNAVAILABLE",
+    message: `Polymarket CLOB request failed with HTTP ${status}.`,
+  };
+  return {
+    code: "PS_CLOB_REQUEST_REJECTED",
+    message: `Polymarket rejected the CLOB request with HTTP ${status}.`,
+  };
+}
+
 async function validateExecutionSnapshot(prepared: PreparedOrder): Promise<{
   market: z.infer<typeof gammaMarketSchema>; book: z.infer<typeof bookSchema>;
   feeRate: string; feeExponent: number; blocked: boolean;
@@ -2507,55 +2530,45 @@ async function createServer() {
         orderType: FAK,
         owner: credentials.apiKey,
       });
+      const reconcileSubmission = async (httpStatus?: number, orderId: string = orderHash, tradeIds: string[] = []) => {
+        const reconciled = await clobPrivateRequest(credentials, prepared.wallet.signingAddress, "GET", `/data/order/${orderHash}`).catch(() => null);
+        const known = reconciled?.status === 200 && reconciled.data !== null
+          ? orderStatusResult({ orderId: orderHash, requestedSize: prepared.order.size, record: reconciled.data }) : null;
+        if (known && known.status !== "UNKNOWN") return tradeToolResult({ ...known, httpStatus: httpStatus ?? reconciled?.status });
+        return tradeToolResult({
+          status: "UNKNOWN", orderId, orderType: FAK, requestedSize: prepared.order.size,
+          filledSize: null, remainingSize: null, tradeIds,
+          message: "Polymarket did not authoritatively confirm the order outcome. Do not resubmit; reconcile the order before taking further action.",
+          errorCode: "PS_SUBMISSION_UNKNOWN",
+          ...((httpStatus ?? reconciled?.status) === undefined ? {} : { httpStatus: httpStatus ?? reconciled?.status }),
+        });
+      };
       let posted: { status: number; data: unknown | null };
       try {
         posted = await clobPrivateRequest(credentials, prepared.wallet.signingAddress, "POST", "/order", orderBody, "/order");
       } catch {
-        const reconciled = await clobPrivateRequest(credentials, prepared.wallet.signingAddress, "GET", `/data/order/${orderHash}`).catch(() => null);
-        const known = reconciled?.status === 200 && reconciled.data !== null
-          ? orderStatusResult({ orderId: orderHash, requestedSize: prepared.order.size, record: reconciled.data }) : null;
-        return tradeToolResult(known ?? {
-          status: "UNKNOWN", orderId: orderHash, orderType: FAK, requestedSize: prepared.order.size,
-          filledSize: null, remainingSize: null, tradeIds: [],
-          message: "Order submission timed out or returned no response. Bounded read-only reconciliation did not confirm a result within this invocation; do not resubmit.",
-          errorCode: "PS_SUBMISSION_UNKNOWN",
-        });
+        return reconcileSubmission();
       }
       const response = posted.data === null ? null : clobOrderResponseSchema.safeParse(posted.data);
-      if (posted.status >= 500 || response === null || !response.success) {
-        if (posted.status >= 400 && posted.status < 500 && posted.status !== 429) return tradeToolResult({
+      if (posted.status >= 400 && posted.status < 500 && posted.status !== 408 && posted.status !== 429) {
+        const failure = clobPrivateHttpFailure(posted.status);
+        return tradeToolResult({
           status: "REJECTED", orderId: null, orderType: FAK, requestedSize: prepared.order.size,
           filledSize: null, remainingSize: prepared.order.size, tradeIds: [],
-          message: "Polymarket rejected the FAK request; no accepted order ID was returned.",
-          errorCode: "PS_CLOB_REJECTED", httpStatus: posted.status,
-        });
-        const reconciled = await clobPrivateRequest(credentials, prepared.wallet.signingAddress, "GET", `/data/order/${orderHash}`).catch(() => null);
-        const known = reconciled?.status === 200 && reconciled.data !== null
-          ? orderStatusResult({ orderId: orderHash, requestedSize: prepared.order.size, record: reconciled.data }) : null;
-        return tradeToolResult(known ?? {
-          status: "UNKNOWN", orderId: orderHash, orderType: FAK, requestedSize: prepared.order.size,
-          filledSize: null, remainingSize: null, tradeIds: [],
-          message: "Polymarket returned an ambiguous submission result. Bounded read-only reconciliation did not confirm a result within this invocation; do not resubmit.",
-          errorCode: "PS_SUBMISSION_UNKNOWN",
+          message: failure.message, errorCode: failure.code, httpStatus: posted.status,
         });
       }
-      if (response.data.success === false) return tradeToolResult({
+      if (posted.status === 408 || posted.status === 429 || posted.status >= 500) return reconcileSubmission(posted.status);
+      if (response?.success && response.data.success === false) return tradeToolResult({
         status: "REJECTED", orderId: null, orderType: FAK, requestedSize: prepared.order.size,
         filledSize: null, remainingSize: prepared.order.size, tradeIds: [],
         message: "Polymarket rejected the FAK order before accepting it.",
-        errorCode: "PS_CLOB_REJECTED",
+        errorCode: "PS_CLOB_REJECTED", httpStatus: posted.status,
       });
-      const orderId = response.data.orderID;
-      if (posted.status < 200 || posted.status >= 300 || response.data.success !== true || !orderId) {
-        const reconciled = await clobPrivateRequest(credentials, prepared.wallet.signingAddress, "GET", `/data/order/${orderHash}`).catch(() => null);
-        const known = reconciled?.status === 200 && reconciled.data !== null
-          ? orderStatusResult({ orderId: orderHash, requestedSize: prepared.order.size, record: reconciled.data }) : null;
-        return tradeToolResult(known ?? {
-          status: "UNKNOWN", orderId: orderId ?? orderHash, orderType: FAK, requestedSize: prepared.order.size,
-          filledSize: null, remainingSize: null, tradeIds: response.data.tradeIDs ?? [],
-          message: "The CLOB response did not confirm acceptance and fill state. Bounded read-only reconciliation did not confirm a result within this invocation; do not resubmit.",
-          errorCode: "PS_SUBMISSION_UNKNOWN",
-        });
+      const responseOrderId = response?.success ? response.data.orderID : undefined;
+      const orderId = responseOrderId !== undefined && /^0x[0-9a-fA-F]{64}$/.test(responseOrderId) ? responseOrderId : undefined;
+      if (posted.status < 200 || posted.status >= 300 || !response?.success || response.data.success !== true || !orderId) {
+        return reconcileSubmission(posted.status, orderId ?? orderHash, response?.success ? response.data.tradeIDs ?? [] : []);
       }
       return tradeToolResult({
         status: "SUBMITTED", orderId, orderType: FAK, requestedSize: prepared.order.size,
@@ -2609,10 +2622,8 @@ async function createServer() {
       });
       if (result.status < 200 || result.status >= 300) return tradeToolResult({
         status: "UNKNOWN", orderId, orderType: FAK, requestedSize, filledSize: null, remainingSize: null, tradeIds: [],
-        message: result.status >= 500 || result.status === 429
-          ? `Polymarket order-status read failed with HTTP ${result.status}; order status is unconfirmed.`
-          : `Polymarket rejected the order-status read with HTTP ${result.status}; order status is unconfirmed.`,
-        errorCode: result.status >= 500 || result.status === 429 ? "PS_PROVIDER_UNAVAILABLE" : "PS_CLOB_REQUEST_REJECTED",
+        message: `${clobPrivateHttpFailure(result.status).message} Order status is unconfirmed.`,
+        errorCode: clobPrivateHttpFailure(result.status).code,
         httpStatus: result.status,
       });
       const known = result.data === null ? null : orderStatusResult({ orderId, requestedSize, record: result.data });
@@ -2634,18 +2645,60 @@ async function createServer() {
       annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
     },
     async ({ orderId, requestedSize, signerAddress, clobAuth }) => {
-      const credentials = await deriveClobCredentials(clobAuth, signerAddress);
-      const body = JSON.stringify({ orderID: orderId });
-      const canceled = await clobPrivateRequest(credentials, signerAddress, "DELETE", "/order", body).catch(() => null);
-      if (canceled?.status === 200 && canceled.data !== null) {
-        const result = z.object({ canceled: z.array(z.string()).optional(), not_canceled: z.record(z.string(), z.string()).optional() }).passthrough().safeParse(canceled.data);
-        if (result.success && result.data.canceled?.some((id) => id.toLowerCase() === orderId.toLowerCase())) return tradeToolResult({
-          status: "CANCELLED", orderId, orderType: FAK, requestedSize, filledSize: null, remainingSize: null, tradeIds: [], message: "Polymarket confirmed the order cancellation.",
+      let credentials: ClobCredentials;
+      try {
+        credentials = await deriveClobCredentials(clobAuth, signerAddress);
+      } catch (error) {
+        const failure = clobRequestFailure(error, "PS_CLOB_AUTH_FAILED", "Polymarket CLOB credentials could not be derived.");
+        return tradeToolResult({
+          status: "FAILED", orderId, orderType: FAK, requestedSize, filledSize: null, remainingSize: null, tradeIds: [],
+          message: failure.message, errorCode: failure.code,
+          ...(failure.httpStatus === undefined ? {} : { httpStatus: failure.httpStatus }),
         });
       }
-      const readback = await clobPrivateRequest(credentials, signerAddress, "GET", `/data/order/${encodeURIComponent(orderId)}`).catch(() => null);
-      const known = readback?.status === 200 && readback.data !== null ? orderStatusResult({ orderId, requestedSize, record: readback.data }) : null;
-      return tradeToolResult(known ?? { status: "UNKNOWN", orderId, orderType: FAK, requestedSize, filledSize: null, remainingSize: null, tradeIds: [], message: "Cancellation result is ambiguous and no authoritative order status was returned; do not retry blindly.", errorCode: "PS_CANCEL_UNKNOWN" });
+      const reconcileCancellation = async (deleteStatus?: number) => {
+        const readback = await clobPrivateRequest(credentials, signerAddress, "GET", `/data/order/${encodeURIComponent(orderId)}`).catch(() => null);
+        const known = readback?.status === 200 && readback.data !== null
+          ? orderStatusResult({ orderId, requestedSize, record: readback.data }) : null;
+        if (known && known.status !== "UNKNOWN") return tradeToolResult({ ...known, httpStatus: deleteStatus ?? readback?.status });
+        const httpStatus = deleteStatus ?? readback?.status;
+        return tradeToolResult({
+          status: "UNKNOWN", orderId, orderType: FAK, requestedSize,
+          filledSize: null, remainingSize: null, tradeIds: [],
+          message: "Cancellation was not authoritatively confirmed. Inspect the order before any further cancellation request.",
+          errorCode: "PS_CANCEL_UNKNOWN", ...(httpStatus === undefined ? {} : { httpStatus }),
+        });
+      };
+      const body = JSON.stringify({ orderID: orderId });
+      let canceled: { status: number; data: unknown | null };
+      try {
+        canceled = await clobPrivateRequest(credentials, signerAddress, "DELETE", "/order", body);
+      } catch {
+        return reconcileCancellation();
+      }
+      if (canceled.status >= 400 && canceled.status < 500 && canceled.status !== 408 && canceled.status !== 429) {
+        const failure = clobPrivateHttpFailure(canceled.status);
+        return tradeToolResult({
+          status: canceled.status === 400 ? "REJECTED" : "FAILED", orderId, orderType: FAK, requestedSize,
+          filledSize: null, remainingSize: null, tradeIds: [], message: failure.message,
+          errorCode: failure.code, httpStatus: canceled.status,
+        });
+      }
+      if (canceled.status === 408 || canceled.status === 429 || canceled.status >= 500) {
+        return reconcileCancellation(canceled.status);
+      }
+      if (canceled.status >= 200 && canceled.status < 300 && canceled.data !== null) {
+        const result = z.object({ canceled: z.array(z.string()).optional(), not_canceled: z.record(z.string(), z.string()).optional() }).passthrough().safeParse(canceled.data);
+        if (result.success && result.data.canceled?.some((id) => id.toLowerCase() === orderId.toLowerCase())) return tradeToolResult({
+          status: "CANCELLED", orderId, orderType: FAK, requestedSize, filledSize: null, remainingSize: null, tradeIds: [],
+          message: "Polymarket confirmed the order cancellation.", httpStatus: canceled.status,
+        });
+        if (result.success && result.data.not_canceled && Object.keys(result.data.not_canceled).some((id) => id.toLowerCase() === orderId.toLowerCase())) return tradeToolResult({
+          status: "REJECTED", orderId, orderType: FAK, requestedSize, filledSize: null, remainingSize: null, tradeIds: [],
+          message: "Polymarket did not cancel the requested order.", errorCode: "PS_CLOB_REJECTED", httpStatus: canceled.status,
+        });
+      }
+      return reconcileCancellation(canceled.status);
     },
   );
 
