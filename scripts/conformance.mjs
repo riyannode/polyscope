@@ -26,6 +26,7 @@ const MAX_CURSOR_BYTES = 1024;
 const OPERATION_TIMEOUT_MS = 10_000;
 const ctfRedeemAbi = parseAbi(["function redeemPositions(address collateralToken, bytes32 parentCollectionId, bytes32 conditionId, uint256[] indexSets)"]);
 const v2RedeemAbi = parseAbi(["function redeem(bytes31 conditionId, uint256 outcomeIndex, uint256 amount)"]);
+const textOnlyToolCoverage = new Set();
 
 export async function testArtifact(root = process.cwd()) {
   const artifact = resolve(root, "dist/plugin.mjs");
@@ -122,13 +123,114 @@ async function callTool(artifact, tool, argumentsValue, options = {}) {
   }, options);
   validateCallResult(response.result);
   if (response.result.isError === true) fail(`${tool.name} tools/call returned isError: true`, "tool_failed");
+  readTextOnlyResult(response.result, tool.name);
   validateSample(tool, argumentsValue, response.result);
   return response.result;
+}
+
+function readTextOnlyResult(value, toolName) {
+  const response = object(value, `${toolName} text-only tools/call result`);
+  if (!Array.isArray(response.content)) fail(`${toolName} did not return content for a text-only client`, "text_output_invalid");
+  const textItems = response.content.filter((item) => item && typeof item === "object" && item.type === "text");
+  if (textItems.length !== 1 || typeof textItems[0].text !== "string") {
+    fail(`${toolName} must return exactly one text response`, "text_output_invalid");
+  }
+  let decoded;
+  try { decoded = JSON.parse(textItems[0].text); }
+  catch { fail(`${toolName} text response must be machine-readable JSON`, "text_output_invalid"); }
+  const envelope = object(decoded, `${toolName} text response`, "text_output_invalid");
+  if (envelope.tool !== toolName) fail(`${toolName} text response has the wrong tool label`, "text_output_invalid");
+  if (typeof envelope.result !== "object" || envelope.result === null || Array.isArray(envelope.result)) {
+    fail(`${toolName} text response must contain an object result`, "text_output_invalid");
+  }
+  if (/(?:SECRET_SENTINEL|"(?:apiKey|secret|passphrase|authorization|privateKey)"\s*:)/i.test(textItems[0].text)) {
+    fail(`${toolName} text response exposed credential material`, "text_output_secret");
+  }
+  textOnlyToolCoverage.add(toolName);
+  return envelope.result;
+}
+
+async function callTextOnlyTool(artifact, toolName, argumentsValue, options = {}) {
+  const response = await runOperation(artifact, {
+    method: "tools/call", params: { name: toolName, arguments: argumentsValue },
+  }, options);
+  validateCallResult(response.result);
+  if (response.result.isError === true) fail(`${toolName} text-only call returned isError: true`, "tool_failed");
+  return readTextOnlyResult(response.result, toolName);
+}
+
+async function testTextOnlyOrderWorkflow(artifact) {
+  const signer = privateKeyToAccount(generatePrivateKey());
+  const markets = await callTextOnlyTool(artifact, "search_markets", { query: "Sample market", limit: 3 }, { fixtures: true });
+  const market = markets.markets.find((item) => item.acceptingOrders === true && item.outcomes.length > 0);
+  if (!market || !market.marketId || !market.conditionId || !market.outcomes[0].assetId
+    || "resolutionRules" in market || "resolutionSource" in market) {
+    fail("compact text-only market search omitted actionable IDs or included full resolution rules", "text_output_invalid");
+  }
+  const outcome = market.outcomes[0];
+  const quote = await callTextOnlyTool(artifact, "get_quote", {
+    marketId: market.marketId, assetId: outcome.assetId, side: "BUY", size: "10", depth: 5,
+  }, { fixtures: true });
+  if (quote.marketId !== market.marketId || quote.assetId !== outcome.assetId || quote.outcome !== outcome.name
+    || quote.side !== "BUY" || quote.tickSize === undefined || quote.minOrderSize === undefined
+    || quote.estimatedFeePusd === undefined || quote.bookAgeMs === undefined) {
+    fail("text-only quote omitted fields required to prepare the next order", "text_output_invalid");
+  }
+
+  const clobAuth = await callTextOnlyTool(artifact, "prepare_clob_auth", { signerAddress: signer.address, nonce: "0" }, { fixtures: true });
+  if (clobAuth.typedData?.primaryType !== "ClobAuth" || JSON.stringify(clobAuth.typedData) !== JSON.stringify(clobAuth.requestWalletSignIntent?.typedData)) {
+    fail("text-only ClobAuth response omitted its exact PayBox signing payload", "text_output_invalid");
+  }
+  const clobAuthSignature = await signer.signTypedData(clobAuth.typedData);
+  const clobAuthValidation = await callTextOnlyTool(artifact, "validate_clob_auth_signature", {
+    signerAddress: signer.address, timestamp: clobAuth.timestamp, nonce: clobAuth.nonce, signature: clobAuthSignature,
+  }, { fixtures: true });
+  if (clobAuthValidation.valid !== true || clobAuthValidation.expectedSignerAddress.toLowerCase() !== signer.address.toLowerCase()) {
+    fail("text-only ClobAuth validation did not preserve its signer result", "text_output_invalid");
+  }
+  const auth = { timestamp: clobAuth.timestamp, nonce: clobAuth.nonce, signature: clobAuthSignature };
+  const prepared = await callTextOnlyTool(artifact, "prepare_order_signing", {
+    marketId: market.marketId, assetId: outcome.assetId,
+    makerAddress: signer.address, signingAddress: signer.address,
+    walletType: "EOA", side: "BUY", priceLimit: "0.50", size: "10", maxNominalPusd: "5.13",
+  }, { fixtures: true });
+  if (prepared.status !== "PREPARED" || prepared.preparedOrder.order.orderType !== "FAK"
+    || prepared.preparedOrder.wallet.makerAddress.toLowerCase() !== signer.address.toLowerCase()
+    || JSON.stringify(prepared.preparedOrder.typedData) !== JSON.stringify(prepared.requestWalletSignIntent?.typedData)) {
+    fail("text-only order preparation omitted wallet binding, FAK default, or exact EIP-712 data", "text_output_invalid");
+  }
+  const orderSignature = await signer.signTypedData(prepared.requestWalletSignIntent.typedData);
+  const orderValidation = await callTextOnlyTool(artifact, "validate_order_signature", {
+    preparedOrder: prepared.preparedOrder, signature: orderSignature,
+  }, { fixtures: true });
+  if (orderValidation.localSignerVerified !== true || "signedOrderSignature" in orderValidation) {
+    fail("text-only order validation omitted its result or exposed the signed signature", "text_output_invalid");
+  }
+  const submitted = await callTextOnlyTool(artifact, "submit_order", {
+    preparedOrder: prepared.preparedOrder, orderSignature, clobAuth: auth, orderType: "FAK",
+  }, { fixtures: true, fixtureScenario: "submit-valid", expectedSignerAddress: signer.address, expectedMakerAddress: signer.address });
+  if (submitted.status !== "SUBMITTED" || submitted.orderType !== "FAK" || !submitted.orderId) {
+    fail("text-only FAK submission did not return its authoritative provider response fields", "text_output_invalid");
+  }
+
+  const fokPrepared = await callTextOnlyTool(artifact, "prepare_order_signing", {
+    marketId: market.marketId, assetId: outcome.assetId,
+    makerAddress: signer.address, signingAddress: signer.address,
+    walletType: "EOA", side: "BUY", orderType: "FOK", priceLimit: "0.50", size: "10", maxNominalPusd: "5.13",
+  }, { fixtures: true });
+  const fokSignature = await signer.signTypedData(fokPrepared.requestWalletSignIntent.typedData);
+  const fokRejected = await callTextOnlyTool(artifact, "submit_order", {
+    preparedOrder: fokPrepared.preparedOrder, orderSignature: fokSignature, clobAuth: auth, orderType: "FOK",
+  }, { fixtures: true, fixtureScenario: "submit-fok-insufficient-depth", expectedSignerAddress: signer.address, expectedMakerAddress: signer.address });
+  if (fokRejected.status !== "REJECTED" || fokRejected.orderType !== "FOK" || !fokRejected.message.includes("FOK")) {
+    fail("text-only FOK response did not preserve the provider's FOK rejection", "text_output_invalid");
+  }
 }
 
 export async function testOfflineArtifact(root = process.cwd()) {
   const artifact = resolve(root, "dist/plugin.mjs");
   const tools = await listTools(artifact);
+  textOnlyToolCoverage.clear();
   if (tools.length !== 16) fail(`expected 16 MCP tools, received ${tools.length}`, "tool_catalog_invalid");
   const removedSchemaFields = ["ExecutionApproval", "executionApprovalSignature", "executionApprovalSigningIntent", "marketRestricted", "accountGeoblockChecked"];
   for (const tool of tools) {
@@ -151,6 +253,7 @@ export async function testOfflineArtifact(root = process.cwd()) {
   if (submitOrderTool.inputSchema.properties.orderType?.enum?.join(",") !== "FAK,FOK") {
     fail("submit_order did not expose the exact FAK/FOK choices", "schema_invalid");
   }
+  await testTextOnlyOrderWorkflow(artifact);
   if ("executionApprovalSignature" in submitTool.inputSchema.properties) {
     fail("submit schema still requires a PolyScope execution approval signature", "schema_invalid");
   }
@@ -1394,6 +1497,8 @@ export async function testOfflineArtifact(root = process.cwd()) {
     fail("unresolved V2 position was offered for redemption", "redemption_preview_invalid");
   }
   const toolNames = new Set(tools.map((tool) => tool.name));
+  const textOnlyUncovered = [...toolNames].filter((name) => !textOnlyToolCoverage.has(name));
+  if (textOnlyUncovered.length > 0) fail(`text-only client did not exercise: ${textOnlyUncovered.join(", ")}`, "text_output_coverage_invalid");
   for (const name of ["submit_order", "submit_fak_order", "get_order_status", "cancel_order", "get_portfolio", "get_trading_readiness", "prepare_redeem"]) {
     if (!toolNames.has(name)) fail(`${name} was not registered`, "tool_catalog_invalid");
   }
@@ -1404,6 +1509,7 @@ export async function testOfflineArtifact(root = process.cwd()) {
       "EOA Type 0 FAK BUY remains compatible through submit_fak_order", "EOA Type 0 FOK SELL reaches one POST with its exact prepared type and amounts", "Deposit Wallet Type 3 FAK BUY uses the shared submit_order handler", "Deposit Wallet Type 3 FOK BUY preserves ERC-7739 wrapping and FOK", "insufficient visible depth does not locally reject FOK; the CLOB's rejection remains FOK", "mismatched legacy FAK submission rejects a prepared FOK without a POST", "ambiguous FOK outcome remains UNKNOWN after one POST and one read-only reconciliation", "FAK partial fill and CLOB-canceled remainder are reflected by status read-back", "FOK full fill is reflected by authoritative status read-back",
       "reject invalid Polymarket order signature", "reject real provider geoblock", "missing CLOB credentials handled", "Deposit Wallet TypedDataSign preparation", "local smart-wallet signer recovery is distinct from deferred CLOB acceptance", "Deposit Wallet ERC-7739 order reaches exactly one intercepted CLOB POST without Polygon RPC",
       "121s book age is informational for preparation", "future, invalid, missing, and stale book timestamps do not block bounded FAK execution", "changed minimum decrease and still-valid tick are accepted", "increased minimum and invalid current tick reject the exact signed order", "zero current minimum is rejected as invalid provider data", "changed risk mode rejects an incompatible exchange domain", "restricted Gamma metadata omitted and does not reject preparation/submission", "market and quote responses omit removed eligibility metadata", "unsigned book metadata does not change EIP-712 signature validation", "51s quote remains labeled stale", "51s book age alone does not block bounded FAK execution", "timeout, HTTP 429/5xx, malformed success, and malformed order IDs reconcile once, retain status, and never repost; authoritative read-back resolves a confirmed fill", "HTTP 400/401/403 POST errors retain sanitized classifications and status", "cancel_order reports structured L1/L2/403 failures, issues one DELETE, and reconciles ambiguous outcomes at most once", "provider-invalid structured diagnostics", "reject unsafe CLOB salt precision", "reject fee-inclusive cap overrun", "reject wrong outcome asset",
+      "all 16 MCP tools return machine-readable JSON content for text-only clients", "search-to-quote-to-PayBox-signing-to-validation-to-submission workflow using content text only", "FOK text response preserves provider rejection without local depth guarantees",
       "team-attributed news", "PL/PD/SA/CL fixture mapping", "documented team-form filters with mixed-competition history filtering", "form counts and explanations for 5/5, 5/4, 5/0, and 0/0 histories",
       "safe team-form HTTP 403 permission and 429 rate-limit diagnostics", "API-Football competition-scoped enrichment, upstream cross-year season reuse, independent IDs, exact fixture matching, and cutoff date",
       "provider 403, 204, HTTP 200 error envelope, unavailable/missing stats, mismatched names, kickoff conflicts, and ambiguous duplicates do not replace baseline data", "Poisson probability normalization and venue-specific API-Football and football-data fallback inputs",

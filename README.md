@@ -43,6 +43,8 @@ FAK may partially fill and its remainder does not rest. FOK is all-or-cancel: th
 | `prepare_redeem` | Read position ownership, resolution, approvals, and an official transaction preview for one wallet and condition. It never signs or broadcasts. |
 | `get_portfolio` | Read one cursor-paginated page of public OPEN single-market positions and PnL from Data API v2. OPEN may include held `REDEEMABLE` positions after resolution; those rows are preserved. |
 
+Every successful tool returns a machine-readable JSON object serialized in `content[].text`, alongside its existing `structuredContent`. Market search text keeps exact market, condition, and outcome asset IDs while omitting verbose resolution rules. Signing tools include the complete EIP-712 payload in text so text-only MCP clients can continue the PayBox signing flow. Signature validation text reports signer and encoding results without echoing the signed order signature.
+
 ## Architecture
 
 - **Runtime:** TypeScript MCP server over stdio, following the PayBox starter 1.0.2 structure.

@@ -1855,9 +1855,44 @@ function validatePreparedOrder(prepared: PreparedOrder): {
   return { priceUnits, sizeUnits, quoteUnits, capUnits, feeRateMicros, feeExponent };
 }
 
-function tradeToolResult(value: unknown) {
+function textToolResult(tool: string, structuredContent: unknown) {
+  let result = structuredContent;
+  if (tool === "search_markets") {
+    const output = z.object({ markets: z.array(marketResultSchema), resultCount: z.number().int() }).parse(structuredContent);
+    result = {
+      resultCount: output.resultCount,
+      markets: output.markets.map((market) => ({
+        eventTitle: market.eventTitle, marketId: market.marketId, question: market.question,
+        conditionId: market.conditionId, version: market.version, negRisk: market.negRisk,
+        acceptingOrders: market.acceptingOrders, endDate: market.endDate,
+        volume: market.volume, volume24h: market.volume24h, liquidity: market.liquidity,
+        outcomes: market.outcomes, yesAssetId: market.yesAssetId, noAssetId: market.noAssetId,
+        observedAt: market.observedAt,
+      })),
+    };
+  } else if (tool === "validate_order_signature") {
+    const output = z.object({
+      localSignerVerified: z.boolean(), expectedSignerAddress: addressSchema,
+      recoveredSignerAddress: addressSchema.nullable(), signatureEncoding: z.enum(["EIP-712", "ERC-7739"]),
+      signedOrderSignature: z.string().nullable(), contractWalletAcceptance: z.enum(["NOT_APPLICABLE", "DEFERRED_TO_CLOB"]),
+    }).parse(structuredContent);
+    result = {
+      localSignerVerified: output.localSignerVerified,
+      expectedSignerAddress: output.expectedSignerAddress,
+      recoveredSignerAddress: output.recoveredSignerAddress,
+      signatureEncoding: output.signatureEncoding,
+      contractWalletAcceptance: output.contractWalletAcceptance,
+    };
+  }
+  return {
+    content: [{ type: "text" as const, text: JSON.stringify({ tool, result }) ?? "{}" }],
+    structuredContent,
+  };
+}
+
+function tradeToolResult(value: unknown, tool = "order_result") {
   const result = executionResultSchema.parse(value);
-  return { content: [{ type: "text" as const, text: result.message }], structuredContent: result };
+  return textToolResult(tool, result);
 }
 
 function decimalUnits(value: string, decimals: number): bigint | null {
@@ -2160,10 +2195,7 @@ async function createServer() {
         }
         if (markets.length >= 20) break;
       }
-      return {
-        content: [{ type: "text", text: `Found ${markets.length} active markets with mapped outcome identifiers.` }],
-        structuredContent: { markets, resultCount: markets.length },
-      };
+      return textToolResult("search_markets", { markets, resultCount: markets.length });
     },
   );
 
@@ -2274,7 +2306,7 @@ async function createServer() {
         observedAt,
         source: "Polymarket CLOB",
       });
-      return { content: [{ type: "text", text: `Read the current public ${side} quote. No order was created.` }], structuredContent };
+      return textToolResult("get_quote", structuredContent);
     },
   );
 
@@ -2289,7 +2321,7 @@ async function createServer() {
     },
     async ({ teams, limit }) => {
       const structuredContent = await getSoccerNews(limit, teams);
-      return { content: [{ type: "text", text: structuredContent.availability === "AVAILABLE" ? `Read ${structuredContent.items.length} ESPN soccer headlines.` : `ESPN soccer news is unavailable: ${structuredContent.reason}` }], structuredContent };
+      return textToolResult("get_soccer_news", structuredContent);
     },
   );
 
@@ -2313,9 +2345,7 @@ async function createServer() {
     async ({ league, date, days, fixtureId, fixtureIdentity, limit, includeApiFootball }) => {
       if (date !== undefined && !validDate(date)) throw new Error("PS_DATE_INVALID: Use a valid UTC calendar date in YYYY-MM-DD format.");
       const structuredContent = await getSoccerResearch({ league, date, days, fixtureId, fixtureIdentity, limit, includeApiFootball });
-      return { content: [{ type: "text", text: structuredContent.availability === "AVAILABLE"
-        ? structuredContent.fallbackFixtures?.length ? `Read ${structuredContent.fallbackFixtures.length} API-Football fallback fixtures for ${structuredContent.competition}.` : `Read ${structuredContent.fixtures.length} ${structuredContent.competition} fixtures from football-data.org.`
-        : `${structuredContent.competition} data is unavailable: ${structuredContent.reason}` }], structuredContent };
+      return textToolResult("research_soccer", structuredContent);
     },
   );
 
@@ -2336,9 +2366,7 @@ async function createServer() {
     },
     async (input) => {
       const result = analyzeSoccerEdge(input);
-      return { content: [{ type: "text", text: result.edgeStatus === "AVAILABLE"
-        ? `Calculated ${result.outcome} probability and CLOB net edge for ${result.fillableShares} fillable shares.`
-        : `Soccer edge calculation ${result.edgeStatus.toLowerCase()}: ${result.edgeReason ?? result.probabilityReason}` }], structuredContent: result };
+      return textToolResult("analyze_soccer_edge", result);
     },
   );
 
@@ -2357,16 +2385,13 @@ async function createServer() {
       const timestamp = await clobServerTimestamp();
       const typedData = wireTypedData(clobAuthTypedData(signer, timestamp, nonce));
       const intent = { op: "typedData" as const, typedData };
-      return {
-        content: [{ type: "text", text: "ClobAuth typed data prepared from CLOB server time. Nothing was signed; sign and use it promptly." }],
-        structuredContent: {
-          signingAddress: signer,
-          timestamp,
-          nonce,
-          typedData,
-          requestWalletSignIntent: intent,
-        },
-      };
+      return textToolResult("prepare_clob_auth", {
+        signingAddress: signer,
+        timestamp,
+        nonce,
+        typedData,
+        requestWalletSignIntent: intent,
+      });
     },
   );
 
@@ -2502,19 +2527,19 @@ async function createServer() {
         const typedData = wireTypedData(signingPayload(preparedBase));
         const preparedOrder = preparedOrderSchema.parse({ ...preparedBase, typedData });
         const intent = { op: "typedData" as const, typedData };
-        return {
-          content: [{ type: "text", text: `Prepared a bounded ${side} ${orderType} order for PayBox approval and Polymarket signing; no order was submitted.` }],
-          structuredContent: { status: "PREPARED" as const, preparedOrder, requestWalletSignIntent: intent, submitsOrder: false as const, maxNominalIncludesFees: true as const, preparationFreshness },
-        };
+        return textToolResult("prepare_order_signing", {
+          status: "PREPARED" as const, preparedOrder, requestWalletSignIntent: intent,
+          submitsOrder: false as const, maxNominalIncludesFees: true as const, preparationFreshness,
+        });
       } catch (error) {
         if (!(error instanceof Error)) throw error;
         const code = preparationErrorCodeSchema.safeParse(error.message.split(":", 1)[0]);
         if (!code.success) throw error;
         const reason = error.message.slice(code.data.length + 1).trim();
-        return {
-          content: [{ type: "text" as const, text: `Preparation rejected (${code.data}): ${reason} No order or signing intent was created.` }],
-          structuredContent: { status: "REJECTED" as const, errorCode: code.data, reason, submitsOrder: false as const, preparationFreshness },
-        };
+        return textToolResult("prepare_order_signing", {
+          status: "REJECTED" as const, errorCode: code.data, reason,
+          submitsOrder: false as const, preparationFreshness,
+        });
       }
     },
   );
@@ -2544,12 +2569,7 @@ async function createServer() {
         recovered = null;
       }
       const valid = recovered?.toLowerCase() === expected.toLowerCase();
-      return {
-        content: [{ type: "text", text: valid
-          ? "ClobAuth signature matches the expected signer. Timestamp freshness and CLOB acceptance are not verified."
-          : "ClobAuth signature is invalid or belongs to a different signer. Prepare and sign a new ClobAuth for the expected owner EOA." }],
-        structuredContent: { valid, expectedSignerAddress: expected, recoveredSignerAddress: recovered },
-      };
+      return textToolResult("validate_clob_auth_signature", { valid, expectedSignerAddress: expected, recoveredSignerAddress: recovered });
     },
   );
 
@@ -2573,34 +2593,33 @@ async function createServer() {
       const validation = await validateWalletSignature(prepared, signatureValue);
       const expected = address(prepared.wallet.signingAddress);
       const valid = validation.valid;
-      return {
-        content: [{ type: "text", text: valid ? "Order signature recovers to the selected signer locally; smart-wallet contract acceptance remains for Polymarket CLOB. No order was submitted." : "Order signature does not recover to the expected signer; no order was submitted." }],
-        structuredContent: {
-          localSignerVerified: valid,
-          expectedSignerAddress: expected,
-          recoveredSignerAddress: validation.recovered,
-          signatureEncoding: validation.encoding,
-          signedOrderSignature: validation.signedSignature,
-          contractWalletAcceptance: validation.contractWalletAcceptance,
-        },
-      };
+      return textToolResult("validate_order_signature", {
+        localSignerVerified: valid,
+        expectedSignerAddress: expected,
+        recoveredSignerAddress: validation.recovered,
+        signatureEncoding: validation.encoding,
+        signedOrderSignature: validation.signedSignature,
+        contractWalletAcceptance: validation.contractWalletAcceptance,
+      });
     },
   );
 
   const submitOrderHandler = async (args: {
-    preparedOrder: PreparedOrder; orderSignature: string; clobAuth: z.infer<typeof clobAuthSchema>; orderType: "FAK" | "FOK";
+    preparedOrder: PreparedOrder; orderSignature: string; clobAuth: z.infer<typeof clobAuthSchema>;
+    orderType: "FAK" | "FOK"; resultTool: "submit_order" | "submit_fak_order";
   }) => {
-      const { preparedOrder: inputOrder, orderSignature, clobAuth, orderType } = args;
+      const { preparedOrder: inputOrder, orderSignature, clobAuth, orderType, resultTool } = args;
+      const orderResult = (value: unknown) => tradeToolResult(value, resultTool);
       const prepared = preparedOrderSchema.parse(inputOrder);
       validatePreparedOrder(prepared);
-      if (prepared.order.orderType !== orderType) return tradeToolResult({
+      if (prepared.order.orderType !== orderType) return orderResult({
         status: "REJECTED", orderId: null, orderType, requestedSize: prepared.order.size,
         filledSize: null, remainingSize: prepared.order.size, tradeIds: [],
         message: `The submitted ${orderType} does not match the prepared ${prepared.order.orderType}; no order was sent.`,
         errorCode: "PS_ORDER_TYPE_MISMATCH",
       });
       const orderValidation = await validateWalletSignature(prepared, signatureHex(orderSignature));
-      if (!orderValidation.valid) return tradeToolResult({
+      if (!orderValidation.valid) return orderResult({
         status: "REJECTED", orderId: null, orderType, requestedSize: prepared.order.size,
         filledSize: null, remainingSize: prepared.order.size, tradeIds: [],
         message: "The order signature does not recover to the approved PayBox signer; no order was sent.",
@@ -2615,7 +2634,7 @@ async function createServer() {
           validateExecutionSnapshot(prepared),
         ]);
         if (snapshot.blocked) {
-          return tradeToolResult({
+          return orderResult({
             status: "REJECTED", orderId: null, orderType, requestedSize: prepared.order.size,
             filledSize: null, remainingSize: prepared.order.size, tradeIds: [],
             message: "Polymarket geoblock reports this request as blocked; no order was sent.",
@@ -2624,7 +2643,7 @@ async function createServer() {
         }
       } catch (error) {
         const failure = clobRequestFailure(error, "PS_PREFLIGHT_FAILED", "Polymarket preflight could not be completed; no order was sent.");
-        return tradeToolResult({
+        return orderResult({
           status: "FAILED", orderId: null, orderType, requestedSize: prepared.order.size,
           filledSize: null, remainingSize: prepared.order.size, tradeIds: [], message: failure.message,
           errorCode: failure.code, ...(failure.httpStatus === undefined ? {} : { httpStatus: failure.httpStatus }),
@@ -2656,8 +2675,8 @@ async function createServer() {
         const reconciled = await clobPrivateRequest(credentials, prepared.wallet.signingAddress, "GET", `/data/order/${orderHash}`).catch(() => null);
         const known = reconciled?.status === 200 && reconciled.data !== null
           ? orderStatusResult({ orderId: orderHash, requestedSize: prepared.order.size, record: reconciled.data, orderType }) : null;
-        if (known && known.status !== "UNKNOWN") return tradeToolResult({ ...known, httpStatus: httpStatus ?? reconciled?.status });
-        return tradeToolResult({
+        if (known && known.status !== "UNKNOWN") return orderResult({ ...known, httpStatus: httpStatus ?? reconciled?.status });
+        return orderResult({
           status: "UNKNOWN", orderId, orderType, requestedSize: prepared.order.size,
           filledSize: null, remainingSize: null, tradeIds,
           message: "Polymarket did not authoritatively confirm the order outcome. Do not resubmit; reconcile the order before taking further action.",
@@ -2674,14 +2693,14 @@ async function createServer() {
       const response = posted.data === null ? null : clobOrderResponseSchema.safeParse(posted.data);
       if (posted.status >= 400 && posted.status < 500 && posted.status !== 408 && posted.status !== 429) {
         const failure = clobPrivateHttpFailure(posted.status);
-        return tradeToolResult({
+        return orderResult({
           status: "REJECTED", orderId: null, orderType, requestedSize: prepared.order.size,
           filledSize: null, remainingSize: prepared.order.size, tradeIds: [],
           message: failure.message, errorCode: failure.code, httpStatus: posted.status,
         });
       }
       if (posted.status === 408 || posted.status === 429 || posted.status >= 500) return reconcileSubmission(posted.status);
-      if (response?.success && response.data.success === false) return tradeToolResult({
+      if (response?.success && response.data.success === false) return orderResult({
         status: "REJECTED", orderId: null, orderType, requestedSize: prepared.order.size,
         filledSize: null, remainingSize: prepared.order.size, tradeIds: [],
         message: `Polymarket rejected the ${orderType} order before accepting it.`,
@@ -2692,7 +2711,7 @@ async function createServer() {
       if (posted.status < 200 || posted.status >= 300 || !response?.success || response.data.success !== true || !orderId) {
         return reconcileSubmission(posted.status, orderId ?? orderHash, response?.success ? response.data.tradeIDs ?? [] : []);
       }
-      return tradeToolResult({
+      return orderResult({
         status: "SUBMITTED", orderId, orderType, requestedSize: prepared.order.size,
         filledSize: null, remainingSize: null, tradeIds: response.data.tradeIDs ?? [],
         message: `Polymarket accepted the ${orderType} order. Fill state is not confirmed; call get_order_status for authenticated read-back.`,
@@ -2712,7 +2731,7 @@ async function createServer() {
       outputSchema: executionResultSchema,
       annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
     },
-    submitOrderHandler,
+    async (args) => submitOrderHandler({ ...args, resultTool: "submit_order" }),
   );
 
   server.registerTool(
@@ -2726,7 +2745,7 @@ async function createServer() {
       outputSchema: executionResultSchema,
       annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
     },
-    async (args) => submitOrderHandler({ ...args, orderType: FAK }),
+    async (args) => submitOrderHandler({ ...args, orderType: FAK, resultTool: "submit_fak_order" }),
   );
 
   server.registerTool(
@@ -2747,7 +2766,7 @@ async function createServer() {
           status: "FAILED", orderId, orderType, requestedSize, filledSize: null, remainingSize: null, tradeIds: [],
           message: failure.message, errorCode: failure.code,
           ...(failure.httpStatus === undefined ? {} : { httpStatus: failure.httpStatus }),
-        });
+        }, "get_order_status");
       }
       let result: { status: number; data: unknown | null };
       try {
@@ -2758,30 +2777,30 @@ async function createServer() {
           status: "UNKNOWN", orderId, orderType, requestedSize, filledSize: null, remainingSize: null, tradeIds: [],
           message: failure.message, errorCode: failure.code,
           ...(failure.httpStatus === undefined ? {} : { httpStatus: failure.httpStatus }),
-        });
+        }, "get_order_status");
       }
       if (result.status === 401) return tradeToolResult({
         status: "UNKNOWN", orderId, orderType, requestedSize, filledSize: null, remainingSize: null, tradeIds: [],
         message: "Polymarket rejected L2 order-status authentication (HTTP 401); verify the CLOB credentials. Order status is unconfirmed.",
         errorCode: "PS_CLOB_PRIVATE_AUTH_REJECTED", httpStatus: result.status,
-      });
+      }, "get_order_status");
       if (result.status === 404) return tradeToolResult({
         status: "UNKNOWN", orderId, orderType, requestedSize, filledSize: null, remainingSize: null, tradeIds: [],
         message: "Polymarket returned HTTP 404 for this order ID; no order record was found.",
         errorCode: "PS_ORDER_NOT_FOUND", httpStatus: result.status,
-      });
+      }, "get_order_status");
       if (result.status < 200 || result.status >= 300) return tradeToolResult({
         status: "UNKNOWN", orderId, orderType, requestedSize, filledSize: null, remainingSize: null, tradeIds: [],
         message: `${clobPrivateHttpFailure(result.status).message} Order status is unconfirmed.`,
         errorCode: clobPrivateHttpFailure(result.status).code,
         httpStatus: result.status,
-      });
+      }, "get_order_status");
       const known = result.data === null ? null : orderStatusResult({ orderId, requestedSize, record: result.data, orderType });
       if (known === null) return tradeToolResult({
         status: "UNKNOWN", orderId, orderType, requestedSize, filledSize: null, remainingSize: null, tradeIds: [],
         message: "Polymarket returned no authoritative order record.", errorCode: "PS_ORDER_STATUS_UNKNOWN", httpStatus: result.status,
-      });
-      return tradeToolResult({ ...known, httpStatus: result.status });
+      }, "get_order_status");
+      return tradeToolResult({ ...known, httpStatus: result.status }, "get_order_status");
     },
   );
 
@@ -2804,20 +2823,20 @@ async function createServer() {
           status: "FAILED", orderId, orderType: FAK, requestedSize, filledSize: null, remainingSize: null, tradeIds: [],
           message: failure.message, errorCode: failure.code,
           ...(failure.httpStatus === undefined ? {} : { httpStatus: failure.httpStatus }),
-        });
+        }, "cancel_order");
       }
       const reconcileCancellation = async (deleteStatus?: number) => {
         const readback = await clobPrivateRequest(credentials, signerAddress, "GET", `/data/order/${encodeURIComponent(orderId)}`).catch(() => null);
         const known = readback?.status === 200 && readback.data !== null
           ? orderStatusResult({ orderId, requestedSize, record: readback.data }) : null;
-        if (known && known.status !== "UNKNOWN") return tradeToolResult({ ...known, httpStatus: deleteStatus ?? readback?.status });
+        if (known && known.status !== "UNKNOWN") return tradeToolResult({ ...known, httpStatus: deleteStatus ?? readback?.status }, "cancel_order");
         const httpStatus = deleteStatus ?? readback?.status;
         return tradeToolResult({
           status: "UNKNOWN", orderId, orderType: FAK, requestedSize,
           filledSize: null, remainingSize: null, tradeIds: [],
           message: "Cancellation was not authoritatively confirmed. Inspect the order before any further cancellation request.",
           errorCode: "PS_CANCEL_UNKNOWN", ...(httpStatus === undefined ? {} : { httpStatus }),
-        });
+        }, "cancel_order");
       };
       const body = JSON.stringify({ orderID: orderId });
       let canceled: { status: number; data: unknown | null };
@@ -2832,7 +2851,7 @@ async function createServer() {
           status: canceled.status === 400 ? "REJECTED" : "FAILED", orderId, orderType: FAK, requestedSize,
           filledSize: null, remainingSize: null, tradeIds: [], message: failure.message,
           errorCode: failure.code, httpStatus: canceled.status,
-        });
+        }, "cancel_order");
       }
       if (canceled.status === 408 || canceled.status === 429 || canceled.status >= 500) {
         return reconcileCancellation(canceled.status);
@@ -2842,11 +2861,11 @@ async function createServer() {
         if (result.success && result.data.canceled?.some((id) => id.toLowerCase() === orderId.toLowerCase())) return tradeToolResult({
           status: "CANCELLED", orderId, orderType: FAK, requestedSize, filledSize: null, remainingSize: null, tradeIds: [],
           message: "Polymarket confirmed the order cancellation.", httpStatus: canceled.status,
-        });
+        }, "cancel_order");
         if (result.success && result.data.not_canceled && Object.keys(result.data.not_canceled).some((id) => id.toLowerCase() === orderId.toLowerCase())) return tradeToolResult({
           status: "REJECTED", orderId, orderType: FAK, requestedSize, filledSize: null, remainingSize: null, tradeIds: [],
           message: "Polymarket did not cancel the requested order.", errorCode: "PS_CLOB_REJECTED", httpStatus: canceled.status,
-        });
+        }, "cancel_order");
       }
       return reconcileCancellation(canceled.status);
     },
@@ -2938,10 +2957,7 @@ async function createServer() {
         eoaTradingEligibility: walletType === "EOA" ? "UNKNOWN" : "NOT_APPLICABLE",
         reason: reasons.join(" "), nextAction,
       });
-      return {
-        content: [{ type: "text", text: `${status}: ${structuredContent.reason}` }],
-        structuredContent,
-      };
+      return textToolResult("get_trading_readiness", structuredContent);
     },
   );
 
@@ -2979,7 +2995,7 @@ async function createServer() {
       };
       const respond = (status: z.infer<typeof preparedRedeemSchema>["status"], overrides: Record<string, unknown> = {}) => {
         const structuredContent = preparedRedeemSchema.parse({ ...base, status, ...overrides });
-        return { content: [{ type: "text" as const, text: `Redemption preparation status: ${status}. No transaction was signed or broadcast.` }], structuredContent };
+        return textToolResult("prepare_redeem", structuredContent);
       };
       const marketUrl = new URL(`${GAMMA_API}/markets`);
       marketUrl.searchParams.set("condition_ids", conditionId);
@@ -3147,14 +3163,11 @@ async function createServer() {
         throw new Error("PS_PORTFOLIO_INVALID: Polymarket returned an unsupported positions page or inconsistent cursor metadata.");
       }
       const { data: positions, pagination } = page.data;
-      return {
-        content: [{ type: "text", text: `Read ${positions.length} public single-market positions for the supplied address; ${pagination.has_more ? "more pages remain" : "this is the final page"}.` }],
-        structuredContent: {
-          walletAddress, addressBinding: "PUBLIC_ADDRESS_UNVERIFIED", observedAt: new Date().toISOString(),
-          sourceUrl: url.toString(), positions, complete: !pagination.has_more,
-          hasMore: pagination.has_more, nextCursor: pagination.next_cursor,
-        },
-      };
+      return textToolResult("get_portfolio", {
+        walletAddress, addressBinding: "PUBLIC_ADDRESS_UNVERIFIED", observedAt: new Date().toISOString(),
+        sourceUrl: url.toString(), positions, complete: !pagination.has_more,
+        hasMore: pagination.has_more, nextCursor: pagination.next_cursor,
+      });
     },
   );
 
