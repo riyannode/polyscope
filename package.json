@@ -1,11 +1,11 @@
 {
   "name": "polyscope",
-  "description": "AI-assisted Polymarket research and user-approved FAK trading tools for PayBox.",
+  "description": "AI-assisted Polymarket research and user-approved FAK/FOK trading tools for PayBox.",
   "version": "0.1.0",
   "private": true,
   "type": "module",
   "engines": {
-    "node": "24.x",
+    "node": "24.21.0",
     "pnpm": "11.11.0"
   },
   "packageManager": "pnpm@11.11.0",
@@ -18,6 +18,9 @@
   },
   "dependencies": {
     "@modelcontextprotocol/server": "2.0.0",
+    "@polymarket/bindings": "0.13.0",
+    "@polymarket/client": "0.13.0",
+    "@polymarket/types": "0.2.0",
     "fast-xml-parser": "5.11.2",
     "viem": "2.51.3",
     "zod": "4.4.3"
