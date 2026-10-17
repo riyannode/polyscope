@@ -1,12 +1,12 @@
 # PolyScope error codes
 
-Errors from public reads and order preparation include the stable code in the message. Execution tools return it in `errorCode`. `UNAVAILABLE` provider output is a data status, not a successful coverage result.
+Errors from public reads include the stable code in the message. Known order-preparation failures return `status: "REJECTED"`, `errorCode`, and a human-readable `reason` as schema-valid structured output, with `submitsOrder: false` and no prepared order or signing intents. Unexpected programming failures remain MCP errors. Execution tools return failures in `errorCode`. `UNAVAILABLE` provider output is a data status, not a successful coverage result.
 
 | Code | Cause | Retry behavior | User-facing explanation |
 |---|---|---|---|
 | `PS_PROVIDER_UNAVAILABLE` | Polymarket read failed or returned a non-success HTTP status. | Retry a read after checking host access; never retry an ambiguous order submission. | Polymarket data could not be read. |
 | `PS_PROVIDER_TIMEOUT` | Polymarket read exceeded its request timeout. | Reads may be retried; a timed-out order POST is `UNKNOWN` and must be reconciled. | Polymarket data did not respond in time. |
-| `PS_PROVIDER_INVALID` | Polymarket returned invalid JSON, missing market text, or malformed order-book levels. | Retry after checking provider status; do not prepare an order from malformed data. | Polymarket returned incomplete or unreadable data. |
+| `PS_PROVIDER_INVALID` | Polymarket returned invalid JSON, an invalid preparation market/book schema, invalid or future book timestamp, missing market text, or malformed book numeric data. | Retry after checking provider status; do not prepare an order from malformed data. | Polymarket returned incomplete or unreadable data. |
 | `PS_RESPONSE_TOO_LARGE` | A Polymarket response exceeded 1 MiB. | Do not retry unchanged; reduce the requested result size where possible. | The provider response was too large to process. |
 | `PS_MARKET_CLOSED` | Market is inactive, closed, restricted, or not accepting orders. | Refresh discovery later; do not submit. | This market is not currently accepting the selected order. |
 | `PS_MARKET_UNSUPPORTED` | Required CLOB trading metadata is absent. | Do not submit; use a supported market. | This market does not expose the supported single-market order path. |
@@ -14,7 +14,8 @@ Errors from public reads and order preparation include the stable code in the me
 | `PS_MARKET_VERSION` | Gamma and CLOB disagree on exchange version or risk mode. | Do not submit; refresh market metadata. | Polymarket trading metadata changed or conflicts. |
 | `PS_FEE_INVALID` | The CLOB market fee descriptor is missing its required shape or exceeds supported precision. | Do not submit; refresh market metadata and confirm the official fee descriptor. | Polymarket's current trading fee could not be verified. |
 | `PS_MARKET_CHANGED` | Tick, minimum size, exchange version, or risk mode changed after approval. | Prepare and approve a new order. | Trading constraints changed after approval. |
-| `PS_STALE_BOOK` | Order-book timestamp is invalid or older than 30 seconds. | Fetch a fresh quote and prepare again. | The order book is stale. |
+| `PS_STALE_BOOK` | Refreshed execution book timestamp is invalid or older than 30 seconds. | Fetch a fresh book before submission; never execute an old quote. | The execution order book is stale. |
+| `PS_PREPARATION_STALE_BOOK` | Book is older than 120,000 ms at unsigned preparation. | Prepare again from a newer book and obtain new authorization. | The book is too old to prepare an unsigned draft. |
 | `PS_PRICE_INVALID` | Price is outside 0–1 or does not match the current tick. | Correct the price and request new approval. | Price does not meet Polymarket's current price increment. |
 | `PS_AMOUNT_INVALID` | Amount is not a supported nonnegative decimal string. | Correct the value without exponent notation and retry. | Enter the amount as a nonnegative decimal. |
 | `PS_SIZE_BELOW_MINIMUM` | Share size is below the market minimum. | Choose an allowed size and request new approval. | Order size is below the market minimum. |
@@ -51,3 +52,21 @@ Errors from public reads and order preparation include the stable code in the me
 | `PS_PREFLIGHT_FAILED` | An unexpected preflight check failed before any order POST. | Review the other status fields and retry only after resolving the preflight issue. | Trading preflight could not complete; no order was sent. |
 
 Football provider failures return `availability: "UNAVAILABLE"` with a provider reason and source timestamps. football-data.org HTTP failures retain safe status-specific reasons: 400 request parameters, 401 token authentication, 403 access or plan permissions, 404 resource, 429 rate limit, and 5xx temporary provider failure. Timeout, invalid JSON, oversized response, and network failures have separate safe reasons. Response bodies and credentials are never included. PolyScope does not substitute incomplete form history or convert a provider failure into coverage.
+
+## Unsigned preparation contract
+
+`prepare_order_signing` returns a discriminated structured result. `status: "PREPARED"` retains the complete existing `preparedOrder`, `requestWalletSignIntent`, `executionApprovalSigningIntent`, `submitsOrder: false`, and `maxNominalIncludesFees: true`. It adds `preparationFreshness: { bookAgeMs, staleAfterMs: 120000 }` outside the signed order. Age is null when a usable timestamp is unavailable. A rejection contains `status: "REJECTED"`, `errorCode`, `reason`, `submitsOrder: false`, and the same freshness metadata, without order or signing intents. Check status before requesting signatures.
+
+Only explicitly enumerated preparation errors are converted to structured rejections. Provider market/book validation is performed at ingestion; internal output validation and unexpected failures are not masked. Invalid fee descriptors retain `PS_FEE_INVALID`. Quote freshness remains 30 seconds. Submission independently re-fetches its book and rejects ages over 30 seconds; the preparation allowance never authorizes execution. Prepared orders and ClobAuth retain their five-minute validity. If human interaction outlasts validity, prepare again and obtain new authorization.
+
+## PayBox registration
+
+Local `tools/list` inspection of the rebuilt bundle confirms that Zod's discriminated union is emitted as JSON Schema 2020-12 with root `type: "object"` and two `oneOf` object branches. Each branch has `additionalProperties: false` and requires its `status` discriminator with a distinct `const`: `PREPARED` or `REJECTED`. PREPARED requires the existing order, both signing intents, `submitsOrder`, `maxNominalIncludesFees`, and `preparationFreshness`; REJECTED requires `errorCode`, `reason`, `submitsOrder`, and `preparationFreshness`, without order or signing-intent properties. Both fixture result variants validate against this actual advertised schema. No nonstandard discriminator extension is required by the emitted schema.
+
+Public preparation conformance uses a nonnegative safe-integer `bookAgeMs` through 120,000 ms, independently of the quote's 30-second FRESH/STALE label. Unknown, invalid, or older ages are ineligible; preparation still re-fetches its book and may return a structured stale rejection if it ages out.
+
+The hosted PolyScope contract inspected on 2026-10-17 has a strict, success-only preparation output schema (`additionalProperties: false`). The new discriminated schema is intentionally a registration change: existing success payload fields and signed contents remain usable, but both new success metadata and rejections fail validation against the old persisted schema. The observed `invalid_result: plugin result omitted its declared structured output` is consistent with the old handler throwing an MCP error without structured output while PayBox expects the declared success schema.
+
+After review, rebuild and re-upload the bundle and refresh the hosted tool registration together so PayBox persists the new `tools/list` output schema. Re-discover the contract and verify both PREPARED and REJECTED results against it before accepting the hosted change. No wallet, emoji approval, native signing, hostname, secret, or financial configuration change is required. Local JSON Schema/MCP validation does not establish hosted acceptance; no upload or registration update was performed for this patch.
+
+The original PayBox `invalid_result` is therefore **fix implemented, hosted verification pending**. Validating the local `tools/list` representation does not establish that PayBox accepts or persists `oneOf` correctly. Only a separately approved upload/registration refresh followed by inspection of the persisted contract and hosted PREPARED/REJECTED calls can establish compatibility and resolution of the original host error. Live signing and trading are not established by these checks.

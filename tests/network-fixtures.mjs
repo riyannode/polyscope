@@ -1,3 +1,14 @@
+const scenario = process.env.POLYSCOPE_TEST_SCENARIO;
+const ageScenario = /^book-(\d+)$/.exec(scenario ?? "");
+if (ageScenario || scenario === "invalid-timestamp" || scenario === "future-timestamp") {
+  const observedNow = Date.now();
+  Date.now = () => observedNow;
+}
+if (scenario === "unexpected-failure") {
+  Object.defineProperty(globalThis.crypto, "getRandomValues", { value: () => { throw new Error("fixture unexpected programming failure"); } });
+}
+let orderPosts = 0;
+
 const conditionId = `0x${"1".repeat(64)}`;
 const market = {
   id: "1", question: "Will the sample team win?", description: "The sample market resolves from the match result.",
@@ -58,40 +69,50 @@ const mixedHistory = (teamId) => [
 
 globalThis.fetch = async (input, init = {}) => {
   const url = new URL(typeof input === "string" ? input : input.url);
-  const scenario = process.env.POLYSCOPE_TEST_SCENARIO;
   if (scenario === "submit-budget" && url.hostname !== "api.football-data.org" && url.pathname !== "/order") {
     await new Promise((resolve) => setTimeout(resolve, 1_400));
   }
   let body;
   if (url.hostname === "gamma-api.polymarket.com" && url.pathname === "/markets/1") {
-    body = market;
+    if (scenario === "provider-invalid-json") return new Response("{", { headers: { "content-type": "application/json" } });
+    if (scenario === "provider-unavailable") return new Response("unavailable", { status: 503 });
+    body = scenario === "provider-invalid" ? { id: false } : { ...market };
+    if (scenario === "wrong-market") body.id = "2";
+    if (scenario === "restricted") body.restricted = true;
   } else if (url.hostname === "clob.polymarket.com" && url.pathname === "/book" && ["123", "124", "999"].includes(url.searchParams.get("token_id") ?? "")) {
     const assetId = url.searchParams.get("token_id");
     body = {
       asset_id: assetId, market: conditionId,
-      timestamp: assetId === "124" ? String(Math.floor(Date.now() / 1000) - 120) : String(Math.floor(Date.now() / 1000)),
+      timestamp: String(Date.now() - (ageScenario ? Number(ageScenario[1]) : assetId === "124" ? 121_000 : 0)),
       bids: [{ price: "0.49", size: "100" }], asks: [{ price: "0.50", size: "100" }],
       min_order_size: "5", tick_size: "0.01", neg_risk: false, version: "v1",
     };
+    if (scenario === "wrong-book") body.asset_id = "999";
+    if (scenario === "invalid-timestamp") body.timestamp = "0";
+    if (scenario === "future-timestamp") body.timestamp = String(Date.now() + 1);
+    if (scenario === "invalid-level") body.asks = [{ price: "NaN", size: "100" }];
+    if (scenario === "price-bound") body.asks = [{ price: "0.51", size: "100" }];
   } else if (url.hostname === "clob.polymarket.com" && url.pathname === `/clob-markets/${conditionId}`) {
-    body = { fd: { r: 0.05, e: 1 } };
+    body = { fd: { r: scenario === "fee-changed" ? 0.06 : 0.05, e: 1 } };
   } else if (url.hostname === "clob.polymarket.com" && url.pathname === "/auth/derive-api-key") {
     body = { apiKey: "fixture-api-key", secret: "dGVzdA==", passphrase: "fixture-passphrase" };
   } else if (url.hostname === "clob.polymarket.com" && url.pathname === "/auth/ban-status/closed-only") {
-    body = { closed_only: false };
+    body = { closed_only: scenario === "close-only" };
   } else if (url.hostname === "clob.polymarket.com" && url.pathname === "/balance-allowance/update") {
     body = {};
   } else if (url.hostname === "clob.polymarket.com" && url.pathname === "/balance-allowance") {
     body = {
-      balance: "100000000",
-      allowances: { "0xE111180000d2663C0091e4f400237545B87B996B": "100000000" },
+      balance: scenario === "low-balance" ? "1" : "100000000",
+      allowances: { "0xE111180000d2663C0091e4f400237545B87B996B": scenario === "low-allowance" ? "1" : "100000000" },
     };
   } else if (url.hostname === "clob.polymarket.com" && url.pathname === "/order" && init.method === "POST") {
-    return new Response(JSON.stringify({ success: false, errorMsg: "offline fixture blocks order submission" }), {
+    orderPosts += 1;
+    if (scenario !== "submit-fresh" || orderPosts !== 1) process.exit(89);
+    return new Response(JSON.stringify({ success: false, errorMsg: "offline fixture blocks order submission; attempts=1" }), {
       status: 403, headers: { "content-type": "application/json" },
     });
   } else if (url.hostname === "polymarket.com" && url.pathname === "/api/geoblock") {
-    body = { blocked: false };
+    body = { blocked: scenario === "geoblocked" };
   } else if (url.hostname === "api.football-data.org" && url.pathname.startsWith("/v4/competitions/")) {
     const league = url.pathname.split("/")[3];
     if (url.searchParams.get("dateFrom") === "2026-11-01") return new Response("provider unavailable", { status: 403 });
