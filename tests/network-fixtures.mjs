@@ -23,21 +23,21 @@ const authAndOrderCalls = [];
 process.on("exit", () => {
   if (scenario?.startsWith("snapshot-") && !["snapshot-min-increase", "snapshot-min-zero", "snapshot-tick-invalid", "snapshot-risk-changed"].includes(scenario) && orderPosts !== 1) process.exitCode = 92;
   if (["snapshot-min-increase", "snapshot-min-zero", "snapshot-tick-invalid", "snapshot-risk-changed"].includes(scenario) && orderPosts !== 0) process.exitCode = 93;
-  if (["submit-exact-five-fak", "submit-exact-five-fok", "submit-valid", "existing-api-key", "submit-deposit-wallet", "submit-fok-eoa", "submit-fok-deposit-wallet", "submit-fok-insufficient-depth", "submit-fok-ambiguous-503", "submit-ambiguous"].includes(scenario) && authAndOrderCalls.join(",") !== "derive,order") process.exitCode = 95;
-  if (["submit-rejected-l1-auth", "missing-credentials", "l1-derive-401"].includes(scenario) && authAndOrderCalls.join(",") !== "derive") process.exitCode = 97;
-  if (scenario?.startsWith("order-status-") && authAndOrderCalls.join(",") !== "derive") process.exitCode = 99;
+  if (["submit-exact-five-fak", "submit-exact-five-fok", "submit-valid", "existing-api-key", "submit-deposit-wallet", "submit-fok-eoa", "submit-fok-deposit-wallet", "submit-fok-insufficient-depth", "submit-fok-ambiguous-503", "submit-ambiguous"].includes(scenario) && authAndOrderCalls.join(",") !== (scenario === "existing-api-key" ? "create,derive,order" : "create,order")) process.exitCode = 95;
+  if (["submit-rejected-l1-auth", "missing-credentials", "l1-derive-401"].includes(scenario) && authAndOrderCalls.join(",") !== (scenario === "l1-derive-401" ? "create,derive" : "create")) process.exitCode = 97;
+  if (scenario?.startsWith("order-status-") && authAndOrderCalls.join(",") !== "create") process.exitCode = 99;
   if (["submit-exact-five-fak", "submit-exact-five-fok", "submit-valid", "existing-api-key", "submit-deposit-wallet", "submit-fok-eoa", "submit-fok-deposit-wallet", "submit-fok-insufficient-depth", "submit-fok-ambiguous-503", "submit-ambiguous", "submit-ambiguous-429", "submit-ambiguous-503", "submit-malformed-success", "submit-malformed-order-id", "submit-reconciled", "submit-l2-401", "submit-400", "submit-403"].includes(scenario)
-    && (authAndOrderCalls.join(",") !== "derive,order" || orderPosts !== 1)) process.exitCode = 101;
+    && (authAndOrderCalls.join(",") !== (scenario === "existing-api-key" ? "create,derive,order" : "create,order") || orderPosts !== 1)) process.exitCode = 101;
   if (scenario?.startsWith("submit-ambiguous") || scenario === "submit-fok-ambiguous-503" || scenario === "submit-malformed-success" || scenario === "submit-malformed-order-id" || scenario === "submit-reconciled") {
     if (orderPosts !== 1 || orderReadbacks !== 1) process.exitCode = 102;
   }
   const expectedCancelCalls = {
-    "cancel-valid": "derive,delete",
-    "cancel-l1-401": "derive",
-    "cancel-l2-401": "derive,delete",
-    "cancel-403": "derive,delete",
-    "cancel-ambiguous": "derive,delete,read",
-    "cancel-reconciled": "derive,delete,read",
+    "cancel-valid": "create,delete",
+    "cancel-l1-401": "create",
+    "cancel-l2-401": "create,delete",
+    "cancel-403": "create,delete",
+    "cancel-ambiguous": "create,delete,read",
+    "cancel-reconciled": "create,delete,read",
   };
   if (scenario in expectedCancelCalls && (cancelCalls.join(",") !== expectedCancelCalls[scenario]
     || cancelDeletes !== (scenario === "cancel-l1-401" ? 0 : 1))) process.exitCode = 103;
@@ -278,15 +278,18 @@ globalThis.fetch = async (input, init = {}) => {
     body = 1_800_000_000;
   } else if (url.hostname === "clob.polymarket.com" && url.pathname === "/auth/api-key" && init.method === "POST") {
     authAndOrderCalls.push("create");
+    if (authAndOrderCalls.join(",") !== "create") process.exit(95);
+    if (scenario?.startsWith("cancel-")) cancelCalls.push("create");
     const expectedSigner = process.env.POLYSCOPE_TEST_EXPECTED_SIGNER;
     if (expectedSigner && init.headers?.POLY_ADDRESS?.toLowerCase() !== expectedSigner.toLowerCase()) process.exit(84);
     if (scenario === "submit-rejected-l1-auth" || scenario === "missing-credentials" || scenario === "cancel-l1-401") {
       return new Response("apiKey=SECRET_SENTINEL; secret=SECRET_SENTINEL; passphrase=SECRET_SENTINEL; signature=SECRET_SENTINEL", { status: 401 });
     }
-    if (scenario === "existing-api-key") return new Response("already exists", { status: 400 });
+    if (["existing-api-key", "l1-derive-401"].includes(scenario)) return new Response("already exists", { status: 400 });
     body = { apiKey: "fixture-api-key", secret: "dGVzdA==", passphrase: "fixture-passphrase" };
   } else if (url.hostname === "clob.polymarket.com" && url.pathname === "/auth/derive-api-key") {
     authAndOrderCalls.push("derive");
+    if (!["existing-api-key", "l1-derive-401"].includes(scenario) || authAndOrderCalls.join(",") !== "create,derive") process.exit(95);
     if (scenario?.startsWith("cancel-")) cancelCalls.push("derive");
     const expectedSigner = process.env.POLYSCOPE_TEST_EXPECTED_SIGNER;
     if (expectedSigner && init.headers?.POLY_ADDRESS?.toLowerCase() !== expectedSigner.toLowerCase()) process.exit(84);
@@ -344,6 +347,7 @@ globalThis.fetch = async (input, init = {}) => {
   } else if (url.hostname === "clob.polymarket.com" && url.pathname === "/order" && init.method === "POST") {
     orderPosts += 1;
     authAndOrderCalls.push("order");
+    if (authAndOrderCalls.join(",") !== (scenario === "existing-api-key" ? "create,derive,order" : "create,order")) process.exit(95);
     if (!["submit-exact-five-fak", "submit-exact-five-fok", "submit-valid", "existing-api-key", "submit-deposit-wallet", "submit-fok-eoa", "submit-fok-deposit-wallet", "submit-fok-insufficient-depth", "submit-fok-ambiguous-503", "restricted-submit", "submit-stale-book", "submit-future-book", "missing-book-timestamp", "submit-ambiguous", "submit-ambiguous-429", "submit-ambiguous-503", "submit-malformed-success", "submit-malformed-order-id", "submit-reconciled", "submit-l2-401", "submit-400", "submit-403", "snapshot-min-decrease", "snapshot-tick-valid"].includes(scenario) || orderPosts !== 1) process.exit(89);
     const postedOrder = JSON.parse(init.body);
     const fokSell = scenario === "submit-fok-eoa" || scenario === "submit-fok-ambiguous-503";

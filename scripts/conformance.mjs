@@ -429,7 +429,7 @@ export async function testOfflineArtifact(root = process.cwd()) {
     fixtures: true, fixtureScenario: "existing-api-key", expectedSignerAddress: replaySigner.address,
   });
   if (existingApiKeySubmit.structuredContent.status !== "SUBMITTED" || !existingApiKeySubmit.structuredContent.orderId) {
-    fail("existing CLOB account did not derive credentials before its single FAK submission", "clob_auth_creation_invalid");
+    fail("existing CLOB account did not create then derive credentials before its single FAK submission", "clob_auth_creation_invalid");
   }
   const invalidClobAuth = await callTool(artifact, submitTool, {
     ...submitArgs, clobAuth: { ...clobAuth, signature: `0x${"0".repeat(130)}` },

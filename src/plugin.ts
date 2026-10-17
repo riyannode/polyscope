@@ -6,7 +6,7 @@ import {
   createPublicClient as createPolymarketClient, createSecureClient, OrderSide, OrderType, SignerType,
   RequestRejectedError, RateLimitError, type Signer, type SignedOrder, type TypedDataPayload,
 } from "@polymarket/client";
-import { deriveApiKey, createApiKey, fetchMarketInfo, prepareLimitOrder, prepareRedeemMarketPositions, prepareRedeemPosition } from "@polymarket/client/actions";
+import { createOrDeriveApiKey, fetchMarketInfo, prepareLimitOrder, prepareRedeemMarketPositions, prepareRedeemPosition } from "@polymarket/client/actions";
 import { toTokenId } from "@polymarket/bindings";
 import { expectEvmAddress, expectEvmSignature, expectErc1271Signature, expectHexString } from "@polymarket/types";
 import {
@@ -1389,11 +1389,10 @@ async function deriveClobCredentials(auth: z.infer<typeof clobAuthSchema>, signe
     const publicClient = createPolymarketClient();
     const request = { address: expectEvmAddress(signer), nonce: Number(auth.nonce), timestamp: Number(auth.timestamp), signature: expectEvmSignature(auth.signature) };
     let credentials;
-    try { credentials = await deriveApiKey(publicClient, request); }
+    try { credentials = await createOrDeriveApiKey(publicClient, request); }
     catch (error) {
       if (error instanceof RequestRejectedError && error.status === 401) throw new ClobRequestError("PS_CLOB_AUTH_REJECTED", "Polymarket rejected authentication; prepare and sign a new ClobAuth explicitly.", 401);
-      if (!(error instanceof RequestRejectedError) || error.status !== 400) throw error;
-      credentials = await createApiKey(publicClient, request);
+      throw error;
     }
     let reauthenticationRequested = false;
     try {

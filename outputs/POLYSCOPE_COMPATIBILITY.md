@@ -34,7 +34,7 @@ No advancement was observed across the initial and final live GitHub/ref reads. 
 
 Removed manual ClobAuth field construction, L1 headers and credential HTTP requests, HMAC/L2 signing, `l2Signature`, `clobPrivateRequest`, authenticated GET/DELETE and `/order` wire bodies, exchange/domain address tables, `DOMAIN_BY_MARKET`, `TICK_RULES`, salt generation, order typed-data construction, broad Polygon contract scanning, position-ID decoding, redemption ABIs, calldata encoding and route-address inventories.
 
-`src/plugin.ts`: **3,177 → 2,786 lines**, net **391 fewer**. Its diff removes 658 old lines and adds 267 lines of SDK integration and binding code. The removed protocol identifiers and contract/calldata helpers are absent. Research was not redesigned.
+`src/plugin.ts`: **3,177 → 2,785 lines**, net **392 fewer**. The removed protocol identifiers and contract/calldata helpers are absent. Research was not redesigned.
 
 ## 5. Small compatibility/product code that remains
 
@@ -53,7 +53,7 @@ Exact dependencies: `@polymarket/client@0.13.0`, `@polymarket/bindings@0.13.0`, 
 | Responsibility | SDK API |
 |---|---|
 | Auth payload, wallet classification, secure client and L2 auth | `createPublicClient`, `createSecureClient` |
-| Invocation-local credentials | `deriveApiKey`, `createApiKey` |
+| Invocation-local credentials | `createOrDeriveApiKey` |
 | Market fee metadata | `fetchMarketInfo` |
 | Exact-share amounts, salt, tick rules, protocol/exchange routing and signing data | `prepareLimitOrder` |
 | Wire formatting and POST | `client.postOrder` |
@@ -77,7 +77,7 @@ prepare_order_signing(FAK, clobAuth) → PayBox signs exact FAK Order → submit
 prepare_order_signing(FOK, same clobAuth) → PayBox signs exact FOK Order → submit_order(FOK, same clobAuth)
 ```
 
-Each order gets its own prepared payload and Order signature. `validate_clob_auth_signature` and `validate_order_signature` are optional diagnostics. Each authenticated invocation derives/creates credentials with SDK APIs; no API key, secret or passphrase is returned or persisted. Provider authentication rejection requires explicit fresh authentication; preparing another order does not request a new ClobAuth signature.
+Each order gets its own prepared payload and Order signature. `validate_clob_auth_signature` and `validate_order_signature` are optional diagnostics. Each authenticated invocation uses SDK `createOrDeriveApiKey` (create first; derive only after HTTP 400); no API key, secret or passphrase is returned or persisted. Provider authentication rejection requires explicit fresh authentication; preparing another order does not request a new ClobAuth signature.
 
 Schema changes: `prepare_order_signing` adds required `clobAuth`; `prepare_redeem` adds required `signingAddress` and `clobAuth`. The public SDK requires a secure client for these workflows. The public SDK nonce is limited to a nonnegative JavaScript-safe integer. README and conformance fixtures describe these changes.
 
@@ -137,8 +137,8 @@ Starter manifest checks match `starter-version.json`, `src/paybox.ts`, `scripts/
 
 ## 12. Bundle
 
-- Bytes: **1,347,869**, below **10,485,760** (10 MiB).
-- SHA-256: `1645e8824526c08eb1b710b7396e3d1901a13049975ffa80200bd3b08b459f57`.
+- Bytes: **1,347,807**, below **10,485,760** (10 MiB).
+- SHA-256: `4793013b91e1a0febd8a8e5502855a87730a1f1d256804d51f12e1680008960d`.
 - Both final builds have identical bytes and SHA-256.
 - `dist/plugin.mjs` and tracked `outputs/plugin.mjs` are byte-identical, confirmed with `cmp` and SHA-256.
 - The bundle remains local; it was not uploaded or installed.
@@ -152,3 +152,9 @@ The SDK uses read-only `relayer-v2.polymarket.com` deployment-state checks for s
 Only finite CLI/MCP validation children were started; starter lifecycle handling stopped them. No persistent server, watcher, tunnel, daemon or listener was created, so no persistent-process cleanup was required.
 
 Sources: [official TypeScript SDK](https://github.com/Polymarket/ts-sdk), [PayBox plugin requirements and starter 1.0.2](https://developer.paybox.sh/requirements.md). SDK source inspection was checked against the installed published package, not assumed from the repository's latest branch.
+
+## Credential boundary correction
+
+The follow-up patch was validated against PR #7 commit `36b8fea5db1f05de43e343175cedb91ede79c0e0`. Inspection of the installed official SDK 0.13.0 confirmed that public `createOrDeriveApiKey` owns the create-first / HTTP-400-then-derive workflow. PolyScope now calls that API directly and retains only safe authentication error mapping. The externally signed order finalizer and Deposit Wallet compatibility wrapper are unchanged.
+
+Regression fixtures enforce fresh credentials (`create → order`), existing credentials (`create → 400 → derive → order`), and sanitized authentication rejection on either route. Request-time assertions enforce the sequence before successful responses; they do not rely solely on child-process exit hooks. The corrected fixture rejected the previous implementation, and the complete final `pnpm test` and `pnpm conformance` passed using Node 24.21.0 / pnpm 11.11.0. `pnpm test` includes typecheck and two byte-identical builds. Dependencies, schemas, and research behavior did not change; the preceding frozen install and production audit remain applicable. The bundle section above reflects this corrected build. No live signing or trading was performed.
