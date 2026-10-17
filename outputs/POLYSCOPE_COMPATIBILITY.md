@@ -119,8 +119,9 @@ Toolchain used: Node.js `24.22.0`, pnpm `11.11.0`.
 |---|---|
 | `pnpm install --frozen-lockfile` | PASS — frozen lockfile unchanged; already up to date |
 | `pnpm typecheck` | PASS — `tsc --noEmit` |
-| `pnpm test` | PASS — deterministic build and 21 offline cases; includes numeric PL/PD/SA/CL team-form filters and safe 403/429 diagnostics; no live order submission |
-| `pnpm conformance` | PASS — market/news/quote reads succeeded; live quote was stale and FAK preparation was skipped. PL, PD, SA, and CL calls returned HTTP 403 without local PayBox secret injection and were reported `UNAVAILABLE` with a safe permission/plan reason. |
+| `pnpm test` | PASS — repeat builds were byte-identical and all offline cases passed, including restricted=true metadata omission, preflight behavior, and metadata-free signature validation; no live order submission |
+| `pnpm conformance` | PASS — market/news/quote reads succeeded. Live quote age was 81,472 ms (STALE); preparation succeeded within the 120-second limit. PL, PD, SA, and CL calls returned HTTP 403 without local PayBox secret injection and were reported `UNAVAILABLE`. |
+| `pnpm build` | PASS — Node.js 24.22.0 and pnpm 11.11.0; generated `dist/plugin.mjs` matches tracked `outputs/plugin.mjs` (582,998 bytes, SHA-256 `599c414615a9cc1bd0a1f334dd7458098c835a5c47a2e04ae8547f180ececc68`). |
 | `pnpm audit --prod` | PASS — no known production dependency vulnerabilities reported |
 | `git diff --check` | PASS after source, report, and bundle updates |
 | Temporary-copy frozen install and build (Node.js `24.20.0`, pnpm `11.11.0`) | PASS — lockfile resolved without changes; generated `dist/plugin.mjs` was byte-identical to tracked `outputs/plugin.mjs` (581,357 bytes, SHA-256 `c5a2cb19ff0af7043a8d4efabd2752b9ddca6870c8fb15ca142d2913d82fc740`). The tracked/uploaded bundle was not modified. |
@@ -130,16 +131,16 @@ Offline cases include BUY/SELL FAK, fee-inclusive cap and exact order-hash/signi
 
 **Not covered locally:** PayBox `request_wallet_sign` handoff and wallet binding, actual EOA/Proxy/Safe/Deposit Wallet account binding, successful ERC-1271 validation, authenticated L2 credential derivation, live balance/allowance/geoblock behavior, partial-fill read-back, cancellation, or ambiguous POST reconciliation. These require hosted PayBox behavior and/or authenticated CLOB responses; local transport fixtures do not establish them. They remain release gates, not passing test claims.
 
-The latest public CLOB book was 60,388 ms old, so the conformance harness skipped order preparation rather than use stale data. Market/news/quote read checks still passed. Local plugin conformance had no football-data.org token and returned 403 for all four leagues. Separately, the controlled direct API calls verified PL history for Brentford and Liverpool as described above; this does not substitute for a PayBox hosted retest or establish PD/SA/CL form coverage.
+The latest public CLOB book was 81,472 ms old, so the quote was marked stale under its 30-second threshold; preparation succeeded under its separate 120-second threshold. Local plugin conformance had no football-data.org token and returned 403 for all four leagues. Separately, the controlled direct API calls verified PL history for Brentford and Liverpool as described above; this does not substitute for a PayBox hosted retest or establish PD/SA/CL form coverage.
 
 ## Artifact
 
 - Path: `dist/plugin.mjs` (matching tracked copy at `outputs/plugin.mjs`)
-- Size: **581,357 bytes** (567.7 KiB; below 10 MiB)
-- SHA-256: `c5a2cb19ff0af7043a8d4efabd2752b9ddca6870c8fb15ca142d2913d82fc740`
+- Size: **582,998 bytes** (569.3 KiB; below 10 MiB)
+- SHA-256: `599c414615a9cc1bd0a1f334dd7458098c835a5c47a2e04ae8547f180ececc68`
 
 ## Readiness decision and next gate
 
 **Hosted PayBox Marketplace BUY/SELL: NOT PROVEN.** The source contains a FAK order path that performs the documented Polymarket checks and submission contract, but no authenticated order or fill was attempted. The final local public quote was stale; the last local soccer conformance calls returned 403 without local PayBox secret injection. PayBox's native signing handoff and actual 10-second cold-start budget have not been exercised, and no authenticated CLOB BUY/SELL was attempted. Hosted compatibility and separate explicit live-trading approval remain required before claiming an end-to-end trade works.
 
-No new bundle was uploaded and no live signature, order broadcast, deposit, deployment, merge, or project resubmission was performed by this documentation update. The `Submitted` status above is the project owner's reported hackathon status, not an action taken in this update.
+The tracked bundle was rebuilt in this PR and was not uploaded to hosted PayBox. No live signature, order broadcast, deposit, deployment, merge, or project resubmission was performed. The `Submitted` status above is the project owner's reported hackathon status, not an action taken in this update.
