@@ -5,6 +5,7 @@ import { basename, dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { realpathSync } from "node:fs";
 import { createInterface } from "node:readline";
+import { decodeFunctionData, parseAbi } from "viem";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 
 import { checkEnvironment, ConformanceError, release, reportConformance } from "./report.mjs";
@@ -23,6 +24,8 @@ const MAX_TOOL_NAME_BYTES = 128;
 const MAX_ARGUMENT_BYTES = 64 * 1024;
 const MAX_CURSOR_BYTES = 1024;
 const OPERATION_TIMEOUT_MS = 10_000;
+const ctfRedeemAbi = parseAbi(["function redeemPositions(address collateralToken, bytes32 parentCollectionId, bytes32 conditionId, uint256[] indexSets)"]);
+const v2RedeemAbi = parseAbi(["function redeem(bytes31 conditionId, uint256 outcomeIndex, uint256 amount)"]);
 
 export async function testArtifact(root = process.cwd()) {
   const artifact = resolve(root, "dist/plugin.mjs");
@@ -126,7 +129,7 @@ async function callTool(artifact, tool, argumentsValue, options = {}) {
 export async function testOfflineArtifact(root = process.cwd()) {
   const artifact = resolve(root, "dist/plugin.mjs");
   const tools = await listTools(artifact);
-  if (tools.length !== 13) fail(`expected 13 MCP tools, received ${tools.length}`, "tool_catalog_invalid");
+  if (tools.length !== 15) fail(`expected 15 MCP tools, received ${tools.length}`, "tool_catalog_invalid");
   const removedSchemaFields = ["ExecutionApproval", "executionApprovalSignature", "executionApprovalSigningIntent", "marketRestricted", "accountGeoblockChecked"];
   for (const tool of tools) {
     const schemas = JSON.stringify({ inputSchema: tool.inputSchema, outputSchema: tool.outputSchema });
@@ -1022,8 +1025,101 @@ export async function testOfflineArtifact(root = process.cwd()) {
     || portfolioNextPage.structuredContent.hasMore !== false || portfolioNextPage.structuredContent.nextCursor !== null) {
     fail("portfolio did not mark the final v2 cursor page complete", "portfolio_pagination_invalid");
   }
+  const readinessTool = tools.find((tool) => tool.name === "get_trading_readiness");
+  const redeemTool = tools.find((tool) => tool.name === "prepare_redeem");
+  if (!readinessTool || !redeemTool) fail("read-only trading readiness and redemption preview tools were not returned", "tool_catalog_invalid");
+  if (readinessTool.annotations?.readOnlyHint !== true || redeemTool.annotations?.readOnlyHint !== true) {
+    fail("trading readiness and redemption preview must remain read-only", "tool_catalog_invalid");
+  }
+  const accountWallet = "0x0000000000000000000000000000000000000001";
+  const otherWallet = "0x0000000000000000000000000000000000000002";
+  const readiness = await callTool(artifact, readinessTool, { walletAddress: accountWallet, walletType: "EOA" }, { fixtures: true, fixtureScenario: "readiness-ready" });
+  if (readiness.structuredContent.wallet.address.toLowerCase() !== accountWallet.toLowerCase()
+    || readiness.structuredContent.wallet.addressRole !== "ACCOUNT_WALLET"
+    || readiness.structuredContent.pUsdBalance.baseUnits !== "8500000"
+    || readiness.structuredContent.polBalance.status !== "NONZERO"
+    || readiness.structuredContent.allowances.length !== 6 || readiness.structuredContent.operatorApprovals.length !== 8
+    || readiness.structuredContent.eoaTradingEligibility !== "UNKNOWN"
+    || !readiness.structuredContent.unknownRequirements.some((item) => item.includes("allowlist"))) {
+    fail("readiness did not report on-chain balances, fourteen spot approval checks, wallet scope, and unknown EOA eligibility", "trading_readiness_invalid");
+  }
+  const missingApprovals = await callTool(artifact, readinessTool, { walletAddress: accountWallet, walletType: "EOA" }, { fixtures: true, fixtureScenario: "readiness-missing-approvals" });
+  if (missingApprovals.structuredContent.status !== "ACTION_REQUIRED"
+    || missingApprovals.structuredContent.allowances.some((check) => check.status !== "MISSING")
+    || missingApprovals.structuredContent.operatorApprovals.some((check) => check.status !== "MISSING")) {
+    fail("missing CLOB allowances and ERC-1155 approvals were not identified", "trading_readiness_invalid");
+  }
+  const emptyReadiness = await callTool(artifact, readinessTool, { walletAddress: accountWallet, walletType: "EOA" }, { fixtures: true, fixtureScenario: "readiness-empty" });
+  if (emptyReadiness.structuredContent.pUsdBalance.status !== "ZERO" || emptyReadiness.structuredContent.polBalance.status !== "ZERO"
+    || emptyReadiness.structuredContent.status !== "ACTION_REQUIRED") {
+    fail("zero collateral and POL balances were not reported as missing readiness requirements", "trading_readiness_invalid");
+  }
+  const unavailableReadiness = await callTool(artifact, readinessTool, { walletAddress: accountWallet, walletType: "EOA" }, { fixtures: true, fixtureScenario: "chain-read-unavailable" });
+  if (unavailableReadiness.structuredContent.status !== "UNKNOWN"
+    || unavailableReadiness.structuredContent.pUsdBalance.status !== "UNKNOWN"
+    || unavailableReadiness.structuredContent.polBalance.status !== "UNKNOWN"
+    || unavailableReadiness.structuredContent.eoaTradingEligibility !== "UNKNOWN") {
+    fail("unavailable chain reads or allowlist eligibility were treated as approval", "trading_readiness_invalid");
+  }
+  const conditionId = `0x${"1".repeat(64)}`;
+  const redeemArgs = { walletAddress: accountWallet, walletType: "EOA", conditionId };
+  const unresolvedRedeem = await callTool(artifact, redeemTool, redeemArgs, { fixtures: true, fixtureScenario: "redeem-unresolved" });
+  if (unresolvedRedeem.structuredContent.status !== "UNRESOLVED" || unresolvedRedeem.structuredContent.resolution !== "UNRESOLVED"
+    || unresolvedRedeem.structuredContent.transactionPreview.length !== 0) {
+    fail("an unresolved market was offered for redemption", "redemption_preview_invalid");
+  }
+  const wrongOwnerRedeem = await callTool(artifact, redeemTool, { ...redeemArgs, walletAddress: otherWallet }, { fixtures: true, fixtureScenario: "redeem-wrong-owner" });
+  if (wrongOwnerRedeem.structuredContent.status !== "NO_POSITION"
+    || wrongOwnerRedeem.structuredContent.wallet.address.toLowerCase() !== otherWallet.toLowerCase()
+    || wrongOwnerRedeem.structuredContent.positions.some((position) => position.ownership !== "NOT_HELD")
+    || wrongOwnerRedeem.structuredContent.transactionPreview.length !== 0) {
+    fail("redemption did not use the explicit position-owning wallet address", "redemption_preview_invalid");
+  }
+  const insufficientPosition = await callTool(artifact, redeemTool, redeemArgs, { fixtures: true, fixtureScenario: "redeem-insufficient-balance" });
+  if (insufficientPosition.structuredContent.status !== "NO_POSITION" || insufficientPosition.structuredContent.transactionPreview.length !== 0) {
+    fail("zero on-chain outcome-token balances produced a redemption preview", "redemption_preview_invalid");
+  }
+  const preparedRedeem = await callTool(artifact, redeemTool, redeemArgs, { fixtures: true, fixtureScenario: "redeem-resolved" });
+  const ctfPreview = preparedRedeem.structuredContent.transactionPreview[0];
+  const decodedCtfPreview = ctfPreview ? decodeFunctionData({ abi: ctfRedeemAbi, data: ctfPreview.data }) : null;
+  if (preparedRedeem.structuredContent.status !== "PREPARED" || preparedRedeem.structuredContent.execution !== "EXTERNAL_ACTION_REQUIRED"
+    || preparedRedeem.structuredContent.positionLedger !== "Conditional Tokens"
+    || ctfPreview?.to !== "0xAdA100Db00Ca00073811820692005400218FcE1f"
+    || decodedCtfPreview?.functionName !== "redeemPositions"
+    || decodedCtfPreview.args[0].toLowerCase() !== "0xc011a7e12a19f7b1f670d46f03b03f3342e82dfb"
+    || decodedCtfPreview.args[2].toLowerCase() !== conditionId.toLowerCase()
+    || decodedCtfPreview.args[3].length !== 2) {
+    fail("standard CTF redemption did not return the official read-only adapter transaction preview", "redemption_preview_invalid");
+  }
+  const missingRedeemApproval = await callTool(artifact, redeemTool, redeemArgs, { fixtures: true, fixtureScenario: "redeem-missing-approval" });
+  if (missingRedeemApproval.structuredContent.routeApproval?.status !== "MISSING"
+    || missingRedeemApproval.structuredContent.transactionPreview.length !== 1
+    || missingRedeemApproval.structuredContent.execution !== "EXTERNAL_ACTION_REQUIRED") {
+    fail("missing redemption approval was not reported as an external action requirement", "redemption_preview_invalid");
+  }
+  const negRiskRedeem = await callTool(artifact, redeemTool, redeemArgs, { fixtures: true, fixtureScenario: "redeem-negative-risk" });
+  if (negRiskRedeem.structuredContent.market.negRisk !== true
+    || negRiskRedeem.structuredContent.positionLedger !== "NegRisk Adapter"
+    || negRiskRedeem.structuredContent.routeApproval?.tokenLedger !== "Conditional Tokens"
+    || negRiskRedeem.structuredContent.transactionPreview[0]?.to !== "0xadA2005600Dec949baf300f4C6120000bDB6eAab") {
+    fail("negative-risk redemption did not separate its position ledger from the approved collateral adapter", "redemption_preview_invalid");
+  }
+  const v2ConditionId = `0x01${"11".repeat(30)}00`;
+  const v2Redeem = await callTool(artifact, redeemTool, { ...redeemArgs, conditionId: v2ConditionId }, { fixtures: true, fixtureScenario: "redeem-v2-resolved" });
+  const v2Preview = v2Redeem.structuredContent.transactionPreview[0];
+  const decodedV2Preview = v2Preview ? decodeFunctionData({ abi: v2RedeemAbi, data: v2Preview.data }) : null;
+  if (v2Redeem.structuredContent.status !== "PREPARED" || v2Redeem.structuredContent.positionLedger !== "PositionManager"
+    || v2Preview?.to !== "0x12121212006e4CD160D18e3f00711DA5c3372600"
+    || decodedV2Preview?.functionName !== "redeem" || decodedV2Preview.args[1] !== 0n
+    || decodedV2Preview.args[2] !== 10_000_000n) {
+    fail("Polymarket V2 redemption did not select the Router or use the actual outcome balance", "redemption_preview_invalid");
+  }
+  const unresolvedV2Redeem = await callTool(artifact, redeemTool, { ...redeemArgs, conditionId: v2ConditionId }, { fixtures: true, fixtureScenario: "redeem-v2-unresolved" });
+  if (unresolvedV2Redeem.structuredContent.status !== "UNRESOLVED" || unresolvedV2Redeem.structuredContent.transactionPreview.length !== 0) {
+    fail("unresolved V2 position was offered for redemption", "redemption_preview_invalid");
+  }
   const toolNames = new Set(tools.map((tool) => tool.name));
-  for (const name of ["submit_fak_order", "get_order_status", "cancel_order", "get_portfolio"]) {
+  for (const name of ["submit_fak_order", "get_order_status", "cancel_order", "get_portfolio", "get_trading_readiness", "prepare_redeem"]) {
     if (!toolNames.has(name)) fail(`${name} was not registered`, "tool_catalog_invalid");
   }
   return {
@@ -1044,7 +1140,9 @@ export async function testOfflineArtifact(root = process.cwd()) {
       "API-Football competition IDs, starting-year season selection, wrong league/season rejection, unknown-season no-request diagnostics, and response cap",
       "fallback fixture ambiguity, kickoff conflicts, missing statistics, and source provenance",
       "host-attested identity evidence and exact market mapping consistency required for fallback probability/edge; source URLs are not fetched",
-      "official v2 OPEN portfolio includes REDEEMABLE positions and preserves cursor pagination", "public portfolio address is not wallet proof", "13-tool catalog without an order from analysis",
+      "official v2 OPEN portfolio includes REDEEMABLE positions and preserves cursor pagination", "public portfolio address is not wallet proof", "15-tool catalog without an order from analysis",
+      "trading readiness reads pUSD, POL, spot CLOB allowances, and operator approvals for one selected wallet", "missing balances and approvals are reported while EOA allowlist eligibility remains UNKNOWN",
+      "redemption requires on-chain resolution and actual position-owner balances", "standard and negative-risk CTF redemption previews use their official adapters", "Polymarket V2 redemption previews use the Router and exact on-chain outcome balance", "read-only tools never sign or broadcast redemption transactions",
       "ClobAuth and Order intents match PayBox's documented typedData object contract",
     ],
   };

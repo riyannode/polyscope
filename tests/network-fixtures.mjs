@@ -1,3 +1,5 @@
+import { decodeFunctionData, encodeAbiParameters, parseAbi } from "viem";
+
 const scenario = process.env.POLYSCOPE_TEST_SCENARIO;
 const ageScenario = /^book-(\d+)$/.exec(scenario ?? "");
 if (ageScenario || scenario === "invalid-timestamp" || scenario === "future-timestamp") {
@@ -15,6 +17,18 @@ process.on("exit", () => {
 });
 
 const conditionId = `0x${"1".repeat(64)}`;
+const v2ConditionId = `0x01${"11".repeat(30)}00`;
+const v2PositionIds = [BigInt(v2ConditionId).toString(), (BigInt(v2ConditionId) + 1n).toString()];
+const rpcReadAbis = {
+  erc20: parseAbi(["function balanceOf(address account) view returns (uint256)", "function allowance(address owner, address spender) view returns (uint256)"]),
+  erc1155: parseAbi(["function balanceOf(address account, uint256 id) view returns (uint256)", "function isApprovedForAll(address account, address operator) view returns (bool)"]),
+  ctf: parseAbi(["function payoutDenominator(bytes32 conditionId) view returns (uint256)"]),
+  positionManager: parseAbi(["function moduleById(uint8 moduleId) view returns (address)"]),
+  v2Module: parseAbi(["function hasResult(bytes31 conditionId) view returns (bool)"]),
+};
+function rpcWord(value) {
+  return `0x${BigInt(value).toString(16).padStart(64, "0")}`;
+}
 const market = {
   id: "1", question: "Will the sample team win?", description: "The sample market resolves from the match result.",
   resolutionSource: "https://example.test/rules", conditionId,
@@ -77,7 +91,89 @@ const mixedHistory = (teamId) => [
 globalThis.fetch = async (input, init = {}) => {
   const url = new URL(typeof input === "string" ? input : input.url);
   let body;
-  if (url.hostname === "gamma-api.polymarket.com" && url.pathname === "/markets/1") {
+  if (url.hostname === "polygon.drpc.org") {
+    const request = JSON.parse(init.body);
+    const rpcResponse = (entry) => {
+      if (["eth_sendTransaction", "eth_sendRawTransaction", "personal_sign", "eth_signTypedData_v4"].includes(entry.method)) process.exit(110);
+      if (scenario === "chain-read-unavailable") return { jsonrpc: "2.0", id: entry.id, error: { code: -32000, message: "fixture RPC unavailable" } };
+      if (entry.method === "eth_chainId") return { jsonrpc: "2.0", id: entry.id, result: "0x89" };
+      if (entry.method === "eth_blockNumber") return { jsonrpc: "2.0", id: entry.id, result: "0x100" };
+      if (entry.method === "eth_getBalance") {
+        const address = entry.params[0].toLowerCase();
+        const isEmpty = scenario === "readiness-empty";
+        const balance = isEmpty || address.endsWith("0002") ? 0n : 1_000_000_000_000_000_000n;
+        return { jsonrpc: "2.0", id: entry.id, result: `0x${balance.toString(16)}` };
+      }
+      if (entry.method !== "eth_call") process.exit(111);
+      const call = entry.params[0];
+      const target = call.to.toLowerCase();
+      let decoded;
+      let value;
+      if (target === "0xc011a7e12a19f7b1f670d46f03b03f3342e82dfb") {
+        decoded = decodeFunctionData({ abi: rpcReadAbis.erc20, data: call.data });
+        if (decoded.functionName === "balanceOf") {
+          const owner = decoded.args[0].toLowerCase();
+          value = scenario === "readiness-empty" || owner.endsWith("0002") ? 0n : 8_500_000n;
+        } else {
+          const allowance = scenario === "readiness-empty" || scenario === "readiness-missing-approvals" ? 0n : 100_000_000n;
+          value = allowance;
+        }
+      } else if (target === "0x4d97dcd97ec945f40cf65f87097ace5ea0476045") {
+        try { decoded = decodeFunctionData({ abi: rpcReadAbis.erc1155, data: call.data }); }
+        catch { decoded = decodeFunctionData({ abi: rpcReadAbis.ctf, data: call.data }); }
+        if (decoded.functionName === "payoutDenominator") value = scenario === "redeem-unresolved" ? 0n : 1n;
+        else if (decoded.functionName === "isApprovedForAll") {
+          value = scenario === "readiness-missing-approvals" || scenario === "redeem-missing-approval" ? 0n : 1n;
+        } else {
+          const owner = decoded.args[0].toLowerCase();
+          const tokenId = decoded.args[1];
+          const noPosition = scenario === "redeem-wrong-owner" || scenario === "redeem-insufficient-balance" || owner.endsWith("0002") || scenario === "readiness-empty";
+          value = noPosition ? 0n : tokenId === BigInt("123") ? 10_000_000n : 0n;
+        }
+      } else if (target === "0xd91e80cf2e7be2e162c6513ced06f1dd0da35296") {
+        decoded = decodeFunctionData({ abi: rpcReadAbis.erc1155, data: call.data });
+        const owner = decoded.args[0].toLowerCase();
+        const noPosition = scenario === "redeem-wrong-owner" || scenario === "redeem-insufficient-balance" || owner.endsWith("0002") || scenario === "readiness-empty";
+        value = noPosition ? 0n : decoded.args[1] === BigInt("123") ? 10_000_000n : 0n;
+      } else if (target === "0x006f54f7f9a22e0000cc2ab60031000000ae9fef") {
+        try { decoded = decodeFunctionData({ abi: rpcReadAbis.erc1155, data: call.data }); }
+        catch { decoded = decodeFunctionData({ abi: rpcReadAbis.positionManager, data: call.data }); }
+        if (decoded.functionName === "moduleById") {
+          value = "0x00000000000000000000000000000000000000a1";
+        } else if (decoded.functionName === "isApprovedForAll") {
+          value = scenario === "readiness-missing-approvals" || scenario === "redeem-missing-approval" ? 0n : 1n;
+        } else {
+          const owner = decoded.args[0].toLowerCase();
+          const tokenId = decoded.args[1];
+          const noPosition = scenario === "redeem-wrong-owner" || scenario === "redeem-insufficient-balance" || owner.endsWith("0002") || scenario === "readiness-empty";
+          value = noPosition ? 0n : scenario.startsWith("redeem-v2") && tokenId === BigInt(v2PositionIds[0]) ? 10_000_000n : 0n;
+        }
+      } else if (target === "0x00000000000000000000000000000000000000a1") {
+        decoded = decodeFunctionData({ abi: rpcReadAbis.v2Module, data: call.data });
+        value = scenario === "redeem-v2-unresolved" ? 0n : 1n;
+      } else {
+        process.exit(112);
+      }
+      const result = typeof value === "string"
+        ? encodeAbiParameters([{ type: "address" }], [value])
+        : typeof value === "boolean"
+        ? encodeAbiParameters([{ type: "bool" }], [value])
+        : rpcWord(value);
+      return { jsonrpc: "2.0", id: entry.id, result };
+    };
+    const rpcResult = Array.isArray(request) ? request.map(rpcResponse) : rpcResponse(request);
+    return Response.json(rpcResult);
+  }
+  if (url.hostname === "gamma-api.polymarket.com" && url.pathname === "/markets") {
+    const requestedCondition = url.searchParams.get("condition_ids")?.toLowerCase();
+    if (requestedCondition === v2ConditionId && scenario?.startsWith("redeem-v2")) {
+      body = [{ ...market, conditionId: v2ConditionId, version: "v2", positionIds: v2PositionIds }];
+    } else if (requestedCondition === conditionId) {
+      body = [{ ...market, ...(scenario === "redeem-negative-risk" ? { negRisk: true } : {}) }];
+    } else {
+      body = [];
+    }
+  } else if (url.hostname === "gamma-api.polymarket.com" && url.pathname === "/markets/1") {
     if (scenario === "provider-invalid-json") return new Response("{", { headers: { "content-type": "application/json" } });
     if (scenario === "provider-unavailable") return new Response("unavailable", { status: 503 });
     body = scenario === "provider-invalid" ? { id: false } : { ...market };
