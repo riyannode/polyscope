@@ -195,21 +195,45 @@ const soccerFixtureSchema = z.object({
     homeStats: z.object({ providerTeamId: z.string(), playedAtHome: z.number().int().nonnegative(), goalsForAverage: z.number().finite().nonnegative().nullable(), goalsAgainstAverage: z.number().finite().nonnegative().nullable() }).strict().nullable(),
     awayStats: z.object({ providerTeamId: z.string(), playedAway: z.number().int().nonnegative(), goalsForAverage: z.number().finite().nonnegative().nullable(), goalsAgainstAverage: z.number().finite().nonnegative().nullable() }).strict().nullable(),
     sources: z.array(z.object({ provider: z.literal("API-Football"), purpose: z.enum(["MATCH_ENRICHMENT", "TEAM_STATISTICS"]), url: z.string().url(), observedAt: z.string().datetime(),
-      teamProviderId: z.string().optional(), teamName: z.string().optional(), availability: providerAvailabilitySchema.optional(), reason: z.string().nullable().optional() }).strict()),
+      teamProviderId: z.string().optional(), teamName: z.string().optional(), availability: providerAvailabilitySchema.optional(),
+      httpStatus: z.number().int().min(100).max(599).nullable().optional(), reason: z.string().nullable().optional() }).strict()),
   }).strict().optional(),
+}).strict();
+const fixtureEvidenceStatusSchema = z.enum(["VERIFIED", "PARTIAL", "UNVERIFIED", "CONFLICTED"]);
+const fixtureIdentitySchema = z.object({
+  homeTeam: z.string().trim().min(1).max(120), awayTeam: z.string().trim().min(1).max(120),
+  kickoffUtc: z.string().datetime(),
+}).strict();
+const providerQualifiedFixtureSchema = z.object({
+  provider: z.literal("API-Football"), providerFixtureId: z.string(), providerLeagueId: z.string(), providerSeason: z.number().int(),
+  competition: z.string(), homeTeam: z.string(), providerHomeTeamId: z.string(), awayTeam: z.string(), providerAwayTeamId: z.string(),
+  kickoffUtc: z.string().datetime(), status: z.string().nullable(), homeScore: z.number().int().nonnegative().nullable(), awayScore: z.number().int().nonnegative().nullable(),
+  observedAt: z.string().datetime(), sourceUrl: z.string().url(), verificationStatus: fixtureEvidenceStatusSchema,
+  confidenceCategory: z.enum(["LOW", "MODERATE", "HIGH"]), confidenceReason: z.string(),
+  statisticsAvailability: providerAvailabilitySchema, statisticsReason: z.string().nullable(),
+  homeStats: z.object({ providerTeamId: z.string(), playedAtHome: z.number().int().nonnegative(), goalsForAverage: z.number().finite().nonnegative().nullable(), goalsAgainstAverage: z.number().finite().nonnegative().nullable() }).strict().nullable(),
+  awayStats: z.object({ providerTeamId: z.string(), playedAway: z.number().int().nonnegative(), goalsForAverage: z.number().finite().nonnegative().nullable(), goalsAgainstAverage: z.number().finite().nonnegative().nullable() }).strict().nullable(),
+  sources: z.array(z.object({ provider: z.literal("API-Football"), purpose: z.enum(["FIXTURES_AND_RESULTS", "TEAM_STATISTICS"]), url: z.string().url(), observedAt: z.string().datetime(),
+    teamProviderId: z.string().optional(), teamName: z.string().optional(), availability: providerAvailabilitySchema,
+    httpStatus: z.number().int().min(100).max(599).nullable(), reason: z.string().nullable() }).strict()),
 }).strict();
 const soccerSourceSchema = z.object({
   provider: z.enum(["football-data.org", "API-Football"]), purpose: z.enum(["FIXTURES_AND_RESULTS", "EXACT_FIXTURE", "TEAM_FORM", "MATCH_ENRICHMENT", "TEAM_STATISTICS"]),
   url: z.string().url(), observedAt: z.string().datetime(),
   teamProviderId: z.string().optional(), teamName: z.string().optional(),
-  availability: providerAvailabilitySchema.optional(), returnedResultCount: z.number().int().nonnegative().nullable().optional(),
+  availability: providerAvailabilitySchema.optional(), httpStatus: z.number().int().min(100).max(599).nullable().optional(),
+  returnedResultCount: z.number().int().nonnegative().nullable().optional(),
   reason: z.string().nullable().optional(),
 }).strict();
 const soccerResearchOutputSchema = z.object({
   availability: providerAvailabilitySchema, reason: z.string().nullable(), league: z.enum(["PL", "PD", "SA", "CL"]),
   competition: z.string(), provider: z.literal("football-data.org"), sources: z.array(soccerSourceSchema), observedAt: z.string().datetime(),
-  season: z.string().nullable(), leagueProviderId: z.string().nullable(), coverage: z.enum(["RETURNED_MATCHES", "UNAVAILABLE"]),
+  season: z.string().nullable(), leagueProviderId: z.string().nullable(), coverage: z.enum(["RETURNED_MATCHES", "FALLBACK_MATCHES", "UNAVAILABLE"]),
   returnedEventCount: z.number().int(), fixtures: z.array(soccerFixtureSchema),
+  fallbackProvider: z.object({ provider: z.literal("API-Football"), availability: providerAvailabilitySchema, reason: z.string().nullable(),
+    sourceUrl: z.string().url(), observedAt: z.string().datetime(), httpStatus: z.number().int().min(100).max(599).nullable(),
+    verificationStatus: fixtureEvidenceStatusSchema, confidenceCategory: z.enum(["LOW", "MODERATE", "HIGH"]), confidenceReason: z.string() }).strict().optional(),
+  fallbackFixtures: z.array(providerQualifiedFixtureSchema).optional(),
 }).strict();
 const soccerEdgeOutputSchema = z.object({
   probabilityStatus: z.enum(["AVAILABLE", "UNAVAILABLE"]), probabilityReason: z.string().nullable(),
@@ -230,12 +254,29 @@ const soccerEdgeOutputSchema = z.object({
   effectiveBuyCostPerShare: z.string().nullable(), grossProbabilityPriceDifference: z.string().nullable(), netEdgePerShare: z.string().nullable(),
   estimatedExpectedValuePusd: z.string().nullable(), quoteObservedAt: z.string().datetime().nullable(), quoteFreshness: z.enum(["FRESH", "STALE", "UNKNOWN"]),
   calculationAssumptions: z.array(z.string()),
+  identityEvidence: z.array(z.object({ provider: z.string(), url: z.string().url(), observedAt: z.string().datetime(), publishedAt: z.string().datetime().nullable(),
+    verificationStatus: fixtureEvidenceStatusSchema, confidenceCategory: z.enum(["LOW", "MODERATE", "HIGH"]), confidenceReason: z.string(),
+    competition: z.string(), homeTeam: z.string(), awayTeam: z.string(), kickoffUtc: z.string().datetime() }).strict()).optional(),
+  marketMapping: z.object({ provider: z.literal("Polymarket Gamma"), url: z.string().url(), observedAt: z.string().datetime(),
+    marketId: z.string(), question: z.string(), outcome: z.string(), competition: z.string(), homeTeam: z.string(), awayTeam: z.string(),
+    kickoffUtc: z.string().datetime(), outcomeMapping: z.enum(["HOME_WIN", "DRAW", "AWAY_WIN"]),
+    resolutionType: z.enum(["REGULATION_1X2", "OTHER", "UNKNOWN"]), resolutionRules: z.string() }).strict().optional(),
 }).strict();
+const identityEvidenceSchema = z.object({ provider: z.string().trim().min(1).max(120), url: z.string().url(), observedAt: z.string().datetime(),
+  publishedAt: z.string().datetime().nullable(), verificationStatus: fixtureEvidenceStatusSchema,
+  confidenceCategory: z.enum(["LOW", "MODERATE", "HIGH"]), confidenceReason: z.string().min(1).max(500),
+  competition: z.string().min(1).max(120), homeTeam: z.string().min(1).max(120), awayTeam: z.string().min(1).max(120), kickoffUtc: z.string().datetime() }).strict();
+const marketMappingSchema = z.object({ provider: z.literal("Polymarket Gamma"), url: z.string().url(), observedAt: z.string().datetime(),
+  marketId: z.string(), question: z.string(), outcome: z.string(), competition: z.string(), homeTeam: z.string(), awayTeam: z.string(),
+  kickoffUtc: z.string().datetime(), outcomeMapping: z.enum(["HOME_WIN", "DRAW", "AWAY_WIN"]),
+  resolutionType: z.enum(["REGULATION_1X2", "OTHER", "UNKNOWN"]), resolutionRules: z.string().min(1).max(4_000) }).strict();
 const apiFootballFixtureSchema = z.object({
-  fixture: z.object({ id: z.number().int().positive(), date: z.string().datetime({ offset: true }) }).passthrough(),
+  fixture: z.object({ id: z.number().int().positive(), date: z.string().datetime({ offset: true }),
+    status: z.object({ short: z.string() }).passthrough().optional() }).passthrough(),
   league: z.object({ id: z.number().int().positive(), name: z.string().min(1), season: z.number().int() }).passthrough(),
   teams: z.object({ home: z.object({ id: z.number().int().positive(), name: z.string().min(1) }).passthrough(),
     away: z.object({ id: z.number().int().positive(), name: z.string().min(1) }).passthrough() }).passthrough(),
+  goals: z.object({ home: z.number().int().nonnegative().nullable(), away: z.number().int().nonnegative().nullable() }).passthrough().optional(),
 }).passthrough();
 const apiFootballFixturesResponseSchema = z.object({ response: z.array(apiFootballFixtureSchema) }).passthrough();
 const apiFootballTeamStatsSchema = z.object({
@@ -345,8 +386,8 @@ async function getJson(url: string): Promise<unknown> {
 }
 
 type ProviderFetchResult =
-  | { ok: true; data: unknown }
-  | { ok: false; reason: string };
+  | { ok: true; data: unknown; httpStatus: number }
+  | { ok: false; reason: string; httpStatus?: number };
 
 function footballDataHttpReason(status: number): string {
   switch (status) {
@@ -362,19 +403,21 @@ function footballDataHttpReason(status: number): string {
 }
 
 async function getProviderJson(url: string): Promise<ProviderFetchResult> {
+  let httpStatus: number | undefined;
   try {
     const response = await fetch(url, {
       headers: { accept: "application/json" },
       redirect: "error",
       signal: AbortSignal.timeout(2_500),
     });
-    if (!response.ok) return { ok: false, reason: footballDataHttpReason(response.status) };
+    httpStatus = response.status;
+    if (!response.ok) return { ok: false, reason: footballDataHttpReason(response.status), httpStatus: response.status };
     const body = await boundedResponseText(response, 1_000_000);
     try {
       const data: unknown = JSON.parse(body);
-      return { ok: true, data };
+      return { ok: true, data, httpStatus: response.status };
     } catch {
-      return { ok: false, reason: "football-data.org returned invalid JSON." };
+      return { ok: false, reason: "football-data.org returned invalid JSON.", httpStatus: response.status };
     }
   } catch (error) {
     return {
@@ -384,19 +427,22 @@ async function getProviderJson(url: string): Promise<ProviderFetchResult> {
         : error instanceof DOMException && error.name === "TimeoutError"
           ? "football-data.org request timed out."
           : "football-data.org request failed before receiving a response.",
+      ...(httpStatus === undefined ? {} : { httpStatus }),
     };
   }
 }
 
 async function getApiFootballJson(url: string): Promise<ProviderFetchResult> {
+  let httpStatus: number | undefined;
   try {
     const response = await fetch(url, {
       headers: { accept: "application/json" },
       redirect: "error",
       signal: AbortSignal.timeout(2_500),
     });
-    if (response.status === 204) return { ok: false, reason: "API-Football returned HTTP 204 with no data for this endpoint or competition." };
-    if (!response.ok) return { ok: false, reason: `API-Football returned HTTP ${response.status}. Check the host-scoped API key, endpoint access, and account coverage.` };
+    httpStatus = response.status;
+    if (response.status === 204) return { ok: false, reason: "API-Football returned HTTP 204 with no data for this endpoint or competition.", httpStatus: response.status };
+    if (!response.ok) return { ok: false, reason: `API-Football returned HTTP ${response.status}. Check the host-scoped API key, endpoint access, and account coverage.`, httpStatus: response.status };
     const body = await boundedResponseText(response, 1_000_000);
     try {
       const data: unknown = JSON.parse(body);
@@ -405,17 +451,17 @@ async function getApiFootballJson(url: string): Promise<ProviderFetchResult> {
       const hasErrors = Array.isArray(errors) ? errors.length > 0
         : typeof errors === "object" && errors !== null ? Object.keys(errors).length > 0
           : errors !== undefined && errors !== null && errors !== "";
-      if (hasErrors) return { ok: false, reason: "API-Football reported an endpoint error; check credentials, parameters, competition coverage, and account limits." };
-      return { ok: true, data };
+      if (hasErrors) return { ok: false, reason: "API-Football reported an endpoint error; check credentials, parameters, competition coverage, and account limits.", httpStatus: response.status };
+      return { ok: true, data, httpStatus: response.status };
     } catch {
-      return { ok: false, reason: "API-Football returned invalid JSON." };
+      return { ok: false, reason: "API-Football returned invalid JSON.", httpStatus: response.status };
     }
   } catch (error) {
     return { ok: false, reason: error instanceof Error && error.message === "response_too_large"
       ? "API-Football response exceeded the 1 MB limit."
       : error instanceof DOMException && error.name === "TimeoutError"
         ? "API-Football request timed out."
-        : "API-Football request failed before receiving a response." };
+        : "API-Football request failed before receiving a response.", ...(httpStatus === undefined ? {} : { httpStatus }) };
   }
 }
 
@@ -639,6 +685,53 @@ function numericAverage(value: string | number | null | undefined): number | nul
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : null;
 }
 
+async function getApiFootballTeamStatistics(match: z.infer<typeof apiFootballFixtureSchema>, fixtureDate: string) {
+  const cutoffDate = addDays(fixtureDate, -1);
+  const homeStatsUrl = apiFootballUrl("teams/statistics", {
+    league: String(match.league.id), team: String(match.teams.home.id), season: String(match.league.season), date: cutoffDate,
+  });
+  const awayStatsUrl = apiFootballUrl("teams/statistics", {
+    league: String(match.league.id), team: String(match.teams.away.id), season: String(match.league.season), date: cutoffDate,
+  });
+  const [homeResponse, awayResponse] = await Promise.all([getApiFootballJson(homeStatsUrl), getApiFootballJson(awayStatsUrl)]);
+  const mapStats = (response: ProviderFetchResult) => {
+    if (!response.ok) return { stats: null, reason: response.reason, httpStatus: response.httpStatus ?? null };
+    const parsed = apiFootballTeamStatsResponseSchema.safeParse(response.data);
+    if (!parsed.success) return { stats: null, reason: "API-Football returned an unexpected team-statistics response shape.", httpStatus: response.httpStatus };
+    return { stats: parsed.data.response, reason: null, httpStatus: response.httpStatus };
+  };
+  const homeResponseStats = mapStats(homeResponse);
+  const awayResponseStats = mapStats(awayResponse);
+  const homeStats = homeResponseStats.stats ? {
+    providerTeamId: String(match.teams.home.id), playedAtHome: homeResponseStats.stats.fixtures.played.home ?? 0,
+    goalsForAverage: numericAverage(homeResponseStats.stats.goals.for.average.home),
+    goalsAgainstAverage: numericAverage(homeResponseStats.stats.goals.against.average.home),
+  } : null;
+  const awayStats = awayResponseStats.stats ? {
+    providerTeamId: String(match.teams.away.id), playedAway: awayResponseStats.stats.fixtures.played.away ?? 0,
+    goalsForAverage: numericAverage(awayResponseStats.stats.goals.for.average.away),
+    goalsAgainstAverage: numericAverage(awayResponseStats.stats.goals.against.average.away),
+  } : null;
+  const complete = homeStats !== null && awayStats !== null && homeStats.playedAtHome > 0 && awayStats.playedAway > 0
+    && homeStats.goalsForAverage !== null && homeStats.goalsAgainstAverage !== null
+    && awayStats.goalsForAverage !== null && awayStats.goalsAgainstAverage !== null;
+  const observedAt = new Date().toISOString();
+  const sources = [
+    { provider: "API-Football" as const, purpose: "TEAM_STATISTICS" as const, url: homeStatsUrl, observedAt,
+      teamProviderId: String(match.teams.home.id), teamName: match.teams.home.name,
+      availability: homeStats ? "AVAILABLE" as const : "UNAVAILABLE" as const, httpStatus: homeResponseStats.httpStatus, reason: homeResponseStats.reason },
+    { provider: "API-Football" as const, purpose: "TEAM_STATISTICS" as const, url: awayStatsUrl, observedAt,
+      teamProviderId: String(match.teams.away.id), teamName: match.teams.away.name,
+      availability: awayStats ? "AVAILABLE" as const : "UNAVAILABLE" as const, httpStatus: awayResponseStats.httpStatus, reason: awayResponseStats.reason },
+  ];
+  return {
+    availability: complete ? "AVAILABLE" as const : "UNAVAILABLE" as const,
+    reason: complete ? null : [homeResponseStats.reason, awayResponseStats.reason].filter((reason): reason is string => reason !== null).join(" ")
+      || "API-Football did not supply positive venue sample counts and goals-for/against averages for both teams.",
+    homeStats, awayStats, sources,
+  };
+}
+
 async function getApiFootballEnrichment(fixture: z.infer<typeof soccerFixtureSchema>, league: SoccerLeague) {
   const fixtureDate = fixture.kickoffUtc.slice(0, 10);
   const fixturesUrl = apiFootballUrl("fixtures", { date: fixtureDate, timezone: "UTC" });
@@ -672,57 +765,96 @@ async function getApiFootballEnrichment(fixture: z.infer<typeof soccerFixtureSch
     competition: match.league.name, homeTeam: match.teams.home.name, homeTeamProviderId: String(match.teams.home.id),
     awayTeam: match.teams.away.name, awayTeamProviderId: String(match.teams.away.id), kickoffUtc: new Date(match.fixture.date).toISOString(),
   };
-  const cutoffDate = addDays(fixtureDate, -1);
-  const homeStatsUrl = apiFootballUrl("teams/statistics", {
-    league: String(match.league.id), team: String(match.teams.home.id), season: String(match.league.season), date: cutoffDate,
-  });
-  const awayStatsUrl = apiFootballUrl("teams/statistics", {
-    league: String(match.league.id), team: String(match.teams.away.id), season: String(match.league.season), date: cutoffDate,
-  });
-  const [homeResponse, awayResponse] = await Promise.all([getApiFootballJson(homeStatsUrl), getApiFootballJson(awayStatsUrl)]);
-  const mapStats = (response: ProviderFetchResult) => {
-    if (!response.ok) return { stats: null, reason: response.reason };
-    const parsed = apiFootballTeamStatsResponseSchema.safeParse(response.data);
-    if (!parsed.success) return { stats: null, reason: "API-Football returned an unexpected team-statistics response shape." };
-    const stats = parsed.data.response;
-    return { stats, reason: null };
-  };
-  const homeResponseStats = mapStats(homeResponse);
-  const awayResponseStats = mapStats(awayResponse);
-  const home = {
-    stats: homeResponseStats.stats ? {
-      providerTeamId: String(match.teams.home.id), playedAtHome: homeResponseStats.stats.fixtures.played.home ?? 0,
-      goalsForAverage: numericAverage(homeResponseStats.stats.goals.for.average.home), goalsAgainstAverage: numericAverage(homeResponseStats.stats.goals.against.average.home),
-    } : null,
-    reason: homeResponseStats.reason,
-  };
-  const away = {
-    stats: awayResponseStats.stats ? {
-      providerTeamId: String(match.teams.away.id), playedAway: awayResponseStats.stats.fixtures.played.away ?? 0,
-      goalsForAverage: numericAverage(awayResponseStats.stats.goals.for.average.away), goalsAgainstAverage: numericAverage(awayResponseStats.stats.goals.against.average.away),
-    } : null,
-    reason: awayResponseStats.reason,
-  };
-  const complete = home.stats !== null && away.stats !== null && home.stats.playedAtHome > 0 && away.stats.playedAway > 0
-    && home.stats.goalsForAverage !== null && home.stats.goalsAgainstAverage !== null
-    && away.stats.goalsForAverage !== null && away.stats.goalsAgainstAverage !== null;
-  const statsObservedAt = new Date().toISOString();
-  const sources: Array<{ provider: "API-Football"; purpose: "MATCH_ENRICHMENT" | "TEAM_STATISTICS"; url: string; observedAt: string;
-    teamProviderId?: string; teamName?: string; availability: "AVAILABLE" | "UNAVAILABLE"; reason: string | null }> = [
-    { provider: "API-Football", purpose: "MATCH_ENRICHMENT", url: fixturesUrl, observedAt, availability: "AVAILABLE", reason: null },
-    { provider: "API-Football", purpose: "TEAM_STATISTICS", url: homeStatsUrl, observedAt: statsObservedAt, teamProviderId: String(match.teams.home.id), teamName: match.teams.home.name,
-      availability: home.stats ? "AVAILABLE" : "UNAVAILABLE", reason: home.reason },
-    { provider: "API-Football", purpose: "TEAM_STATISTICS", url: awayStatsUrl, observedAt: statsObservedAt, teamProviderId: String(match.teams.away.id), teamName: match.teams.away.name,
-      availability: away.stats ? "AVAILABLE" : "UNAVAILABLE", reason: away.reason },
+  const statistics = await getApiFootballTeamStatistics(match, fixtureDate);
+  const sources = [
+    { provider: "API-Football" as const, purpose: "MATCH_ENRICHMENT" as const, url: fixturesUrl, observedAt,
+      availability: "AVAILABLE" as const, httpStatus: listing.httpStatus, reason: null },
+    ...statistics.sources,
   ];
   return {
-    availability: complete ? "AVAILABLE" as const : "UNAVAILABLE" as const,
-    reason: complete ? null : [home.reason, away.reason].filter((reason): reason is string => reason !== null).join(" ")
-      || "API-Football did not supply positive venue sample counts and goals-for/against averages for both teams.",
-    sourceUrl: fixturesUrl, observedAt, matchIdentity,
-    homeStats: home.stats,
-    awayStats: away.stats,
+    availability: statistics.availability, reason: statistics.reason,
+    sourceUrl: fixturesUrl, observedAt, matchIdentity, homeStats: statistics.homeStats, awayStats: statistics.awayStats,
     sources,
+  };
+}
+
+async function getApiFootballFallback(league: SoccerLeague, date: string, fixtureIdentity?: z.infer<typeof fixtureIdentitySchema>, exactFixtureRequested = false) {
+  const sourceUrl = apiFootballUrl("fixtures", { date, timezone: "UTC" });
+  const observedAt = new Date().toISOString();
+  const listing = await getApiFootballJson(sourceUrl);
+  const unavailable = (reason: string, httpStatus: number | null, verificationStatus: z.infer<typeof fixtureEvidenceStatusSchema> = "UNVERIFIED") => ({
+    diagnostic: {
+      provider: "API-Football" as const, availability: "UNAVAILABLE" as const, reason, sourceUrl, observedAt, httpStatus,
+      verificationStatus, confidenceCategory: "LOW" as const,
+      confidenceReason: "No unique, independently corroborated target fixture was established.",
+    },
+    fixtures: [] as z.infer<typeof providerQualifiedFixtureSchema>[],
+  });
+  if (!listing.ok) return unavailable(listing.reason, listing.httpStatus ?? null);
+  const parsed = apiFootballFixturesResponseSchema.safeParse(listing.data);
+  if (!parsed.success) return unavailable("API-Football returned an unexpected fixtures response shape.", listing.httpStatus);
+  const dayFixtures = parsed.data.response.filter((fixture) => providerCompetitionMatches(league, fixture.league.name)
+    && new Date(fixture.fixture.date).toISOString().slice(0, 10) === date);
+  if (dayFixtures.length === 0) return unavailable("API-Football returned a valid response with no fixtures for the requested competition and UTC date.", listing.httpStatus);
+
+  let selected: z.infer<typeof apiFootballFixtureSchema>[] = [];
+  let verificationStatus: z.infer<typeof fixtureEvidenceStatusSchema> = "PARTIAL";
+  let confidenceReason = "The fixture is attributed to one provider only; it has not been independently corroborated.";
+  if (fixtureIdentity) {
+    const targetKickoff = Date.parse(fixtureIdentity.kickoffUtc);
+    selected = dayFixtures.filter((fixture) => normalizedTeamName(fixture.teams.home.name) === normalizedTeamName(fixtureIdentity.homeTeam)
+      && normalizedTeamName(fixture.teams.away.name) === normalizedTeamName(fixtureIdentity.awayTeam)
+      && Date.parse(fixture.fixture.date) === targetKickoff);
+    if (selected.length !== 1) return unavailable(selected.length === 0
+      ? "No API-Football fixture matched the supplied competition, home and away teams, and exact UTC kickoff."
+      : "Multiple API-Football fixtures matched the supplied identity; no fixture was selected.", listing.httpStatus,
+    selected.length > 1 ? "CONFLICTED" : "UNVERIFIED");
+  } else if (exactFixtureRequested) {
+    selected = dayFixtures;
+    verificationStatus = "UNVERIFIED";
+    confidenceReason = "The football-data.org fixture ID is a separate namespace; exact matching requires team names and UTC kickoff.";
+  } else {
+    selected = dayFixtures;
+  }
+
+  const fixtures: z.infer<typeof providerQualifiedFixtureSchema>[] = [];
+  for (const fixture of selected) {
+    const exact = fixtureIdentity !== undefined;
+    const statistics = exact ? await getApiFootballTeamStatistics(fixture, date) : null;
+    const kickoffUtc = new Date(fixture.fixture.date).toISOString();
+    fixtures.push(providerQualifiedFixtureSchema.parse({
+      provider: "API-Football", providerFixtureId: String(fixture.fixture.id), providerLeagueId: String(fixture.league.id),
+      providerSeason: fixture.league.season, competition: fixture.league.name,
+      homeTeam: fixture.teams.home.name, providerHomeTeamId: String(fixture.teams.home.id),
+      awayTeam: fixture.teams.away.name, providerAwayTeamId: String(fixture.teams.away.id), kickoffUtc,
+      status: fixture.fixture.status?.short ?? null, homeScore: fixture.goals?.home ?? null, awayScore: fixture.goals?.away ?? null,
+      observedAt, sourceUrl, verificationStatus: exact ? "PARTIAL" : verificationStatus,
+      confidenceCategory: "LOW", confidenceReason: exact ? confidenceReason : exactFixtureRequested
+        ? "Date and competition match, but this candidate was not matched to the requested fixture identity."
+        : "API-Football is the sole provider for this fixture evidence; no independent corroboration was supplied.",
+      statisticsAvailability: statistics?.availability ?? "UNAVAILABLE",
+      statisticsReason: statistics?.reason ?? (exactFixtureRequested
+        ? "Team statistics were not requested because the API-Football candidate was not matched to an exact fixture identity."
+        : "Team statistics were not requested during date-scoped fixture discovery."),
+      homeStats: statistics?.homeStats ?? null, awayStats: statistics?.awayStats ?? null,
+      sources: [
+        { provider: "API-Football", purpose: "FIXTURES_AND_RESULTS", url: sourceUrl, observedAt, availability: "AVAILABLE", httpStatus: listing.httpStatus, reason: null },
+        ...(statistics?.sources.map((source) => ({ ...source, purpose: "TEAM_STATISTICS" as const })) ?? []),
+      ],
+    }));
+  }
+  const resultVerification: z.infer<typeof fixtureEvidenceStatusSchema> = fixtureIdentity ? "PARTIAL" : verificationStatus;
+  const missingStats = fixtures.find((fixture) => fixture.statisticsAvailability === "UNAVAILABLE")?.statisticsReason;
+  const resultReason = fixtureIdentity ? `A unique API-Football fixture matched the supplied identity, but it is not cross-provider verified.${missingStats ? ` Statistics: ${missingStats}` : ""}` : exactFixtureRequested
+    ? "API-Football candidates are date-scoped only; the football-data.org fixture ID was not used to guess a match."
+    : "Fixtures are API-Football-only evidence and are not cross-provider verified.";
+  return {
+    diagnostic: {
+      provider: "API-Football" as const, availability: "AVAILABLE" as const, reason: resultReason, sourceUrl, observedAt,
+      httpStatus: listing.httpStatus, verificationStatus: resultVerification, confidenceCategory: "LOW" as const,
+      confidenceReason: fixtureIdentity ? confidenceReason : "One provider supplied these fixtures; no independent source corroborated the target identity.",
+    },
+    fixtures,
   };
 }
 
@@ -807,7 +939,8 @@ async function getSoccerNews(limit: number, teams: string[]): Promise<z.infer<ty
 }
 
 async function getSoccerResearch(input: {
-  league: SoccerLeague; date?: string; days: number; fixtureId?: string; limit: number; includeApiFootball: boolean;
+  league: SoccerLeague; date?: string; days: number; fixtureId?: string; fixtureIdentity?: z.infer<typeof fixtureIdentitySchema>;
+  limit: number; includeApiFootball: boolean;
 }): Promise<z.infer<typeof soccerResearchOutputSchema>> {
   const definition = SPORTS_COMPETITIONS[input.league];
   const startDate = input.date ?? new Date().toISOString().slice(0, 10);
@@ -819,26 +952,71 @@ async function getSoccerResearch(input: {
   const fixturesResponse = await getProviderJson(fixturesUrl);
   const sources: z.infer<typeof soccerSourceSchema>[] = [{
     provider: "football-data.org", purpose: input.fixtureId ? "EXACT_FIXTURE" : "FIXTURES_AND_RESULTS",
-    url: fixturesUrl, observedAt: new Date().toISOString(),
+    url: fixturesUrl, observedAt: new Date().toISOString(), availability: "UNAVAILABLE", httpStatus: null, reason: null,
   }];
   const unavailable = (reason: string, season: string | null = null) => soccerResearchOutputSchema.parse({
     availability: "UNAVAILABLE", reason, league: input.league, competition: definition.name,
     provider: "football-data.org", sources, observedAt, season, leagueProviderId: input.league,
     coverage: "UNAVAILABLE", returnedEventCount: 0, fixtures: [],
   });
-  if (!fixturesResponse.ok) return unavailable(fixturesResponse.reason);
+  const fallbackAfterPrimaryFailure = async (reason: string, httpStatus: number | null) => {
+    const primarySource = sources[0];
+    if (primarySource) {
+      primarySource.availability = "UNAVAILABLE";
+      primarySource.httpStatus = httpStatus;
+      primarySource.reason = reason;
+    }
+    const fallbackDate = input.fixtureIdentity?.kickoffUtc.slice(0, 10) ?? startDate;
+    const fallback = await getApiFootballFallback(input.league, fallbackDate, input.fixtureIdentity, input.fixtureId !== undefined);
+    const hasFallbackFixtures = fallback.fixtures.length > 0;
+    sources.push({
+      provider: "API-Football", purpose: "FIXTURES_AND_RESULTS", url: fallback.diagnostic.sourceUrl,
+      observedAt: fallback.diagnostic.observedAt, availability: fallback.diagnostic.availability,
+      httpStatus: fallback.diagnostic.httpStatus, returnedResultCount: fallback.fixtures.length, reason: fallback.diagnostic.reason,
+    });
+    return soccerResearchOutputSchema.parse({
+      availability: hasFallbackFixtures ? "AVAILABLE" : "UNAVAILABLE",
+      reason: hasFallbackFixtures ? null : `${reason} API-Football fallback: ${fallback.diagnostic.reason}`,
+      league: input.league, competition: definition.name, provider: "football-data.org", sources, observedAt,
+      season: null, leagueProviderId: input.league, coverage: hasFallbackFixtures ? "FALLBACK_MATCHES" : "UNAVAILABLE",
+      returnedEventCount: fallback.fixtures.length, fixtures: [], fallbackProvider: fallback.diagnostic,
+      fallbackFixtures: fallback.fixtures,
+    });
+  };
+  if (!fixturesResponse.ok) return fallbackAfterPrimaryFailure(fixturesResponse.reason, fixturesResponse.httpStatus ?? null);
 
   let matches: z.infer<typeof footballDataMatchSchema>[];
   if (input.fixtureId) {
     const parsed = footballDataMatchSchema.safeParse(fixturesResponse.data);
-    matches = parsed.success && String(parsed.data.id) === input.fixtureId ? [parsed.data] : [];
+    if (!parsed.success) return fallbackAfterPrimaryFailure("football-data.org returned an unexpected exact-fixture response shape.", fixturesResponse.httpStatus);
+    if (String(parsed.data.id) !== input.fixtureId || parsed.data.competition?.code !== input.league) {
+      return fallbackAfterPrimaryFailure("football-data.org exact-fixture response did not match the requested fixture ID and competition.", fixturesResponse.httpStatus);
+    }
+    matches = [parsed.data];
   } else {
     const parsed = footballDataMatchesSchema.safeParse(fixturesResponse.data);
-    matches = parsed.success ? parsed.data.matches : [];
+    if (!parsed.success) return fallbackAfterPrimaryFailure("football-data.org returned an unexpected fixtures response shape.", fixturesResponse.httpStatus);
+    if (parsed.data.matches.length === 0) {
+      const primarySource = sources[0];
+      if (primarySource) {
+        primarySource.availability = "AVAILABLE";
+        primarySource.httpStatus = fixturesResponse.httpStatus;
+        primarySource.returnedResultCount = 0;
+        primarySource.reason = "Valid HTTP response contained zero fixtures; no provider fallback was attempted.";
+      }
+      return unavailable("football-data.org returned a valid empty fixture list for this competition and date window.");
+    }
+    matches = parsed.data.matches;
   }
   matches = matches.filter((match) => match.competition?.code === input.league);
   if (!input.fixtureId) matches = matches.filter((match) => match.utcDate.slice(0, 10) >= startDate && match.utcDate.slice(0, 10) <= endDate);
-  if (matches.length === 0) return unavailable("football-data.org returned no verified fixtures or results for this competition and date window.");
+  if (matches.length === 0) return fallbackAfterPrimaryFailure("football-data.org response contained no fixtures matching the requested competition and date window.", fixturesResponse.httpStatus);
+  const primarySource = sources[0];
+  if (primarySource) {
+    primarySource.availability = "AVAILABLE";
+    primarySource.httpStatus = fixturesResponse.httpStatus;
+    primarySource.returnedResultCount = matches.length;
+  }
 
   const exactMatch = input.fixtureId ? matches[0] : undefined;
   let homeRecentResults: z.infer<typeof soccerObservedResultSchema>[] = [];
@@ -917,7 +1095,7 @@ async function getSoccerResearch(input: {
       match.id === exactMatch?.id ? awayFormReason : "Select one exact fixture to request this team's last five completed league results.",
     ))
     .filter((fixture): fixture is z.infer<typeof soccerFixtureSchema> => fixture !== null);
-  if (fixtures.length === 0) return unavailable("football-data.org response did not match the requested competition schema.");
+  if (fixtures.length === 0) return fallbackAfterPrimaryFailure("football-data.org response did not match the supported fixture schema.", fixturesResponse.httpStatus);
   if (exactMatch) {
     const exactFixture = fixtures.find((fixture) => fixture.fixtureId === String(exactMatch.id));
     if (exactFixture) {
@@ -1425,21 +1603,40 @@ function formVenueGoals(results: z.infer<typeof soccerObservedResultSchema>[], v
 }
 
 function analyzeSoccerEdge(input: {
-  fixture: z.infer<typeof soccerFixtureSchema>;
+  fixture: z.infer<typeof soccerFixtureSchema> | z.infer<typeof providerQualifiedFixtureSchema>;
   quote: z.infer<typeof quoteResultSchema>;
   outcome: "HOME_WIN" | "DRAW" | "AWAY_WIN";
   marketResolutionType: "REGULATION_1X2" | "OTHER" | "UNKNOWN";
   marketResolutionRules: string;
+  identityEvidence?: z.infer<typeof identityEvidenceSchema>[];
+  marketMapping?: z.infer<typeof marketMappingSchema>;
 }) {
   const now = new Date().toISOString();
-  const enrichment = input.fixture.apiFootball;
-  const home = enrichment?.homeStats ?? null;
-  const away = enrichment?.awayStats ?? null;
-  const homeRecentVenue = formVenueGoals(input.fixture.homeRecentResults, "HOME");
-  const awayRecentVenue = formVenueGoals(input.fixture.awayRecentResults, "AWAY");
-  const hasApiFootballSources = enrichment?.sources.filter((source) => source.purpose === "TEAM_STATISTICS" && source.availability === "AVAILABLE").length === 2;
-  const hasFormSources = input.fixture.formSources?.length === 2;
-  const apiStatisticsUsable = enrichment?.availability === "AVAILABLE" && home !== null && away !== null
+  const providerFixture = "provider" in input.fixture ? input.fixture : null;
+  const footballDataFixture = "fixtureId" in input.fixture ? input.fixture : null;
+  const fallbackFixture = providerFixture !== null;
+  const enrichment = footballDataFixture?.apiFootball ?? null;
+  const home = providerFixture?.homeStats ?? enrichment?.homeStats ?? null;
+  const away = providerFixture?.awayStats ?? enrichment?.awayStats ?? null;
+  const homeRecentVenue = footballDataFixture ? formVenueGoals(footballDataFixture.homeRecentResults, "HOME") : null;
+  const awayRecentVenue = footballDataFixture ? formVenueGoals(footballDataFixture.awayRecentResults, "AWAY") : null;
+  const apiSources = providerFixture ? providerFixture.sources : enrichment?.sources ?? [];
+  const hasApiFootballSources = apiSources.filter((source) => source.purpose === "TEAM_STATISTICS" && source.availability === "AVAILABLE").length === 2;
+  const hasFormSources = footballDataFixture?.formSources?.length === 2;
+  const normalizedFixtureIdentity = {
+    competition: normalizedProviderName(input.fixture.competition),
+    homeTeam: normalizedTeamName(input.fixture.homeTeam),
+    awayTeam: normalizedTeamName(input.fixture.awayTeam),
+    kickoffUtc: Date.parse(input.fixture.kickoffUtc),
+  };
+  const matchingIdentityEvidence = (input.identityEvidence ?? []).filter((evidence) => evidence.provider !== "API-Football"
+    && evidence.verificationStatus === "VERIFIED"
+    && normalizedProviderName(evidence.competition) === normalizedFixtureIdentity.competition
+    && normalizedTeamName(evidence.homeTeam) === normalizedFixtureIdentity.homeTeam
+    && normalizedTeamName(evidence.awayTeam) === normalizedFixtureIdentity.awayTeam
+    && Date.parse(evidence.kickoffUtc) === normalizedFixtureIdentity.kickoffUtc);
+  const apiIdentityVerified = !fallbackFixture || matchingIdentityEvidence.length > 0;
+  const apiStatisticsUsable = (fallbackFixture || enrichment?.availability === "AVAILABLE") && apiIdentityVerified && home !== null && away !== null
     && hasApiFootballSources && home.playedAtHome > 0 && away.playedAway > 0 && home.goalsForAverage !== null && home.goalsAgainstAverage !== null
     && away.goalsForAverage !== null && away.goalsAgainstAverage !== null;
   const formStatisticsUsable = hasFormSources && homeRecentVenue !== null && awayRecentVenue !== null;
@@ -1462,18 +1659,20 @@ function analyzeSoccerEdge(input: {
   };
   const sources: Array<{ provider: "API-Football" | "football-data.org"; url: string; observedAt: string }> = [];
   if (statisticsProvider === "API-Football") {
-    sources.push(...(enrichment?.sources.filter((source) => source.purpose === "TEAM_STATISTICS" && source.availability === "AVAILABLE")
+    sources.push(...(apiSources.filter((source) => source.purpose === "TEAM_STATISTICS" && source.availability === "AVAILABLE")
       .map((source) => ({ provider: "API-Football" as const, url: source.url, observedAt: source.observedAt })) ?? []));
   }
-  if (statisticsProvider === "football-data.org") {
-    sources.push(...(input.fixture.formSources ?? []));
+  if (footballDataFixture && statisticsProvider === "football-data.org") {
+    sources.push(...(footballDataFixture.formSources ?? []));
   }
   let probabilities: ReturnType<typeof estimateSoccerProbabilities> = null;
   let homeLambda: number | null = null;
   let awayLambda: number | null = null;
   let probabilityReason: string | null = null;
   if (statisticsProvider === null || homeGoalsFor === null || homeGoalsAgainst === null || awayGoalsFor === null || awayGoalsAgainst === null) {
-    probabilityReason = enrichment?.reason ?? "Venue-specific goal averages and at least one completed match for both venue samples are required for this model.";
+    probabilityReason = fallbackFixture && !apiIdentityVerified
+      ? "Independent evidence verifying the API-Football fixture identity is required before modeling this target match."
+      : enrichment?.reason ?? (fallbackFixture ? "API-Football venue statistics are missing or incomplete for the exact fixture." : "Venue-specific goal averages and at least one completed match for both venue samples are required for this model.");
   } else {
     homeLambda = (homeGoalsFor + awayGoalsAgainst) / 2;
     awayLambda = (awayGoalsFor + homeGoalsAgainst) / 2;
@@ -1487,6 +1686,7 @@ function analyzeSoccerEdge(input: {
   if (awaySample !== null && awaySample < 5) uncertainty.push(`Away venue sample is small (${awaySample} matches).`);
   uncertainty.push("The independent Poisson model assumes independent team goal counts; it is not calibrated by this implementation.");
   if (statisticsProvider === "API-Football") uncertainty.push("API-Football season-to-date venue averages and football-data.org recent form use different sample windows; differences between them are not directly comparable.");
+  if (fallbackFixture) uncertainty.push("The fallback fixture was returned by API-Football only; independent identity evidence was supplied separately and was not used as model statistics.");
   const model = {
     name: "Independent Poisson Goals Model" as const, version: "1.0.0" as const,
     expectedHomeGoals: homeLambda, expectedAwayGoals: awayLambda,
@@ -1508,11 +1708,23 @@ function analyzeSoccerEdge(input: {
   let grossDifference: string | null = null;
   let netEdge: string | null = null;
   let expectedValue: string | null = null;
+  const mapping = input.marketMapping;
+  const marketMappingMatches = !fallbackFixture || (mapping !== undefined
+    && mapping.provider === "Polymarket Gamma"
+    && mapping.marketId === input.quote.marketId && mapping.question === input.quote.question && mapping.outcome === input.quote.outcome
+    && mapping.outcomeMapping === input.outcome && mapping.resolutionType === input.marketResolutionType
+    && mapping.resolutionRules === input.marketResolutionRules
+    && normalizedProviderName(mapping.competition) === normalizedFixtureIdentity.competition
+    && normalizedTeamName(mapping.homeTeam) === normalizedFixtureIdentity.homeTeam
+    && normalizedTeamName(mapping.awayTeam) === normalizedFixtureIdentity.awayTeam
+    && Date.parse(mapping.kickoffUtc) === normalizedFixtureIdentity.kickoffUtc);
   if (input.marketResolutionType !== "REGULATION_1X2") {
     edgeStatus = "UNSUPPORTED_MARKET";
     edgeReason = "Only a market whose published resolution rules exactly match 90-minute Home/Draw/Away outcomes is supported.";
   } else if (!available || probability === null) {
     edgeReason = "No edge was calculated because the independent outcome probability is unavailable.";
+  } else if (!marketMappingMatches) {
+    edgeReason = "No market-specific edge was calculated because the supplied Polymarket market, outcome mapping, and fixture identity do not all match.";
   } else if (input.quote.side !== "BUY") {
     edgeReason = "SELL edge is not calculated without the existing position's cost basis and sale-proceeds treatment.";
   } else if (input.quote.availability !== "AVAILABLE" || input.quote.requestedSize === null || input.quote.fillableSize === null
@@ -1561,6 +1773,7 @@ function analyzeSoccerEdge(input: {
       "Expected value is fillable shares multiplied by estimated net edge per share; it is not guaranteed profitability.",
       `Market resolution rules supplied for the mapping: ${input.marketResolutionRules}`,
     ],
+    ...(fallbackFixture ? { identityEvidence: matchingIdentityEvidence, ...(mapping ? { marketMapping: mapping } : {}) } : {}),
   });
 }
 
@@ -1758,22 +1971,25 @@ async function createServer() {
     "research_soccer",
     {
       title: "Research supported soccer fixtures",
-      description: "Reads football-data.org fixtures, results, and available recent form for PL, PD, SA, or CL. Returns actual recent results and per-team counts, including partial form. Set includeApiFootball=true on an exact fixture to optionally enrich it from the x-apisports-key host-scoped API-Football provider; provider coverage, credentials, and account plan can limit fields. These tools provide API evidence, not exhaustive research. When statistics, injuries, lineups or other relevant information are missing, continue with the host's web search/browser tools before writing the final analysis.",
+      description: "Reads football-data.org fixtures, results, and available recent form for PL, PD, SA, or CL. On provider failures or unusable responses, it makes one date-scoped API-Football fixture fallback request; a valid empty football-data.org response does not trigger fallback. API-Football-only fixtures use provider-qualified IDs and are not cross-provider verified. For exact fallback matching, provide fixtureIdentity with homeTeam, awayTeam, and kickoffUtc; a football-data.org fixtureId is never reused as an API-Football ID. Set includeApiFootball=true on an exact football-data.org fixture to keep the existing optional enrichment. Returns provider diagnostics and actual recent-result counts. These tools provide API evidence, not exhaustive research. When statistics, injuries, lineups or other relevant information are missing, continue with the host's web search/browser tools before writing the final analysis. If either structured provider fails or leaves material gaps, continue with host-native search/browser tools where available; do not claim browser work unless performed.",
       inputSchema: z.object({
         league: z.enum(["PL", "PD", "SA", "CL"]),
         date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
         days: z.number().int().min(0).max(14).default(0),
         fixtureId: z.string().regex(/^[0-9]{1,20}$/).optional(),
+        fixtureIdentity: fixtureIdentitySchema.optional(),
         limit: z.number().int().min(1).max(20).default(10),
         includeApiFootball: z.boolean().default(false),
       }).strict(),
       outputSchema: soccerResearchOutputSchema,
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
     },
-    async ({ league, date, days, fixtureId, limit, includeApiFootball }) => {
+    async ({ league, date, days, fixtureId, fixtureIdentity, limit, includeApiFootball }) => {
       if (date !== undefined && !validDate(date)) throw new Error("PS_DATE_INVALID: Use a valid UTC calendar date in YYYY-MM-DD format.");
-      const structuredContent = await getSoccerResearch({ league, date, days, fixtureId, limit, includeApiFootball });
-      return { content: [{ type: "text", text: structuredContent.availability === "AVAILABLE" ? `Read ${structuredContent.fixtures.length} ${structuredContent.competition} fixtures from football-data.org.` : `${structuredContent.competition} data is unavailable: ${structuredContent.reason}` }], structuredContent };
+      const structuredContent = await getSoccerResearch({ league, date, days, fixtureId, fixtureIdentity, limit, includeApiFootball });
+      return { content: [{ type: "text", text: structuredContent.availability === "AVAILABLE"
+        ? structuredContent.fallbackFixtures?.length ? `Read ${structuredContent.fallbackFixtures.length} API-Football fallback fixtures for ${structuredContent.competition}.` : `Read ${structuredContent.fixtures.length} ${structuredContent.competition} fixtures from football-data.org.`
+        : `${structuredContent.competition} data is unavailable: ${structuredContent.reason}` }], structuredContent };
     },
   );
 
@@ -1781,12 +1997,13 @@ async function createServer() {
     "analyze_soccer_edge",
     {
       title: "Estimate soccer probabilities and Polymarket net edge",
-      description: "Deterministically estimates regulation-time Home/Draw/Away probabilities from supplied API-Football venue-specific averages, or from pre-kickoff venue-specific results returned by football-data.org when those averages are unavailable. It compares one selected outcome with supplied get_quote CLOB BUY depth and fee data. Pass the exact research_soccer fixture and quote outputs. First inspect the market's resolution rules; only mark REGULATION_1X2 when they exactly match a 90-minute Home/Draw/Away outcome. Other semantics and SELL economics are reported unsupported. This is analysis only: it does not fetch providers, create orders, impose a trading gate, or authorize a trade. API gaps remain research prompts for host-native browser/search tools.",
+      description: "Deterministically estimates regulation-time Home/Draw/Away probabilities from API-Football venue averages or football-data.org pre-kickoff same-venue form. For API-Football-only fallback fixtures, provide independently sourced VERIFIED fixture-identity evidence and an exact Polymarket market/outcome mapping; identity evidence is kept separate from model statistics. Without verified identity evidence, probabilities are UNAVAILABLE; without a matching market mapping and exact 90-minute resolution rules, market-specific edge is unavailable. Browser-researched statistics are not model inputs. This read-only analysis does not fetch providers, create orders, impose a trading gate, or authorize a trade.",
       inputSchema: z.object({
-        fixture: soccerFixtureSchema, quote: quoteResultSchema,
+        fixture: z.union([soccerFixtureSchema, providerQualifiedFixtureSchema]), quote: quoteResultSchema,
         outcome: z.enum(["HOME_WIN", "DRAW", "AWAY_WIN"]),
         marketResolutionType: z.enum(["REGULATION_1X2", "OTHER", "UNKNOWN"]),
         marketResolutionRules: z.string().min(1).max(4_000),
+        identityEvidence: z.array(identityEvidenceSchema).optional(), marketMapping: marketMappingSchema.optional(),
       }).strict(),
       outputSchema: soccerEdgeOutputSchema,
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },

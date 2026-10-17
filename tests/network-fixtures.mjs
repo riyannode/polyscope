@@ -136,18 +136,30 @@ globalThis.fetch = async (input, init = {}) => {
   } else if (url.hostname === "polygon-rpc.com") {
     process.exit(91);
   } else if (url.hostname === "v3.football.api-sports.io" && url.pathname === "/fixtures") {
+    if (scenario === "no-unneeded-api") process.exit(97);
     if (scenario === "api-football-403") return new Response("forbidden", { status: 403 });
     if (scenario === "api-football-204") return new Response(null, { status: 204 });
-    const league = url.searchParams.get("date") === "2026-10-17" ? "PL" : "PL";
+    if (scenario === "fallback-api-403") return new Response("forbidden", { status: 403 });
+    if (scenario === "fallback-api-204") return new Response(null, { status: 204 });
+    if (scenario === "fallback-api-invalid-json") return new Response("{", { headers: { "content-type": "application/json" } });
+    if (scenario === "fallback-api-empty") return Response.json({ errors: [], response: [] });
+    if (scenario === "fallback-api-invalid-shape") return Response.json({ errors: [], response: [{ fixture: { id: "bad" } }] });
+    const kickoff = scenario === "api-football-kickoff-conflict" || scenario === "fallback-kickoff-conflict"
+      ? "2026-10-17T20:00:00+00:00" : "2026-10-17T19:00:00+00:00";
     const fixture = {
-      fixture: { id: 90001, date: scenario === "api-football-kickoff-conflict" ? "2026-10-17T20:00:00+00:00" : "2026-10-17T19:00:00+00:00" },
-      league: { id: 39, name: apiFootballLeagueNames[league], season: 2026 },
+      fixture: { id: 90001, date: kickoff },
+      league: { id: 39, name: apiFootballLeagueNames.PL, season: 2026 },
       teams: { home: { id: 501, name: "Arsenal FC" }, away: { id: 502, name: "Chelsea" } },
     };
-    body = scenario === "api-football-api-error" ? { errors: { token: "fixture detail suppressed" }, response: [] }
-      : { errors: [], response: scenario === "api-football-mismatch" ? [] : scenario === "api-football-ambiguous" ? [fixture, { ...fixture, fixture: { ...fixture.fixture, id: 90002 } }] : [fixture] };
+    const competitionFixtures = [fixture,
+      { fixture: { id: 90002, date: "2026-10-17T19:00:00+00:00" }, league: { id: 140, name: apiFootballLeagueNames.PD, season: 2026 }, teams: { home: { id: 601, name: "Real Madrid" }, away: { id: 602, name: "Barcelona" } } },
+      { fixture: { id: 90003, date: "2026-10-17T19:00:00+00:00" }, league: { id: 135, name: apiFootballLeagueNames.SA, season: 2026 }, teams: { home: { id: 701, name: "Inter" }, away: { id: 702, name: "Milan" } } },
+      { fixture: { id: 90004, date: "2026-10-17T19:00:00+00:00" }, league: { id: 2, name: apiFootballLeagueNames.CL, season: 2026 }, teams: { home: { id: 801, name: "Paris Saint-Germain" }, away: { id: 802, name: "Bayern Munich" } } },
+    ];
+    body = scenario === "api-football-api-error" || scenario === "fallback-api-error" ? { errors: { token: "fixture detail suppressed" }, response: [] }
+      : { errors: [], response: scenario === "api-football-mismatch" ? [] : scenario === "api-football-ambiguous" || scenario === "fallback-ambiguous" ? [fixture, { ...fixture, fixture: { ...fixture.fixture, id: 90005 } }] : competitionFixtures };
   } else if (url.hostname === "v3.football.api-sports.io" && url.pathname === "/teams/statistics") {
-    if (scenario === "api-football-stats-403") return new Response("forbidden", { status: 403 });
+    if (scenario === "api-football-stats-403" || scenario === "fallback-api-stats-403") return new Response("forbidden", { status: 403 });
     const home = url.searchParams.get("team") === "501";
     body = { response: {
       fixtures: { played: { home: scenario === "api-football-empty-stats" ? 0 : home ? 8 : 4, away: scenario === "api-football-empty-stats" ? 0 : home ? 5 : 6 } },
@@ -156,6 +168,17 @@ globalThis.fetch = async (input, init = {}) => {
     } };
   } else if (url.hostname === "api.football-data.org" && url.pathname.startsWith("/v4/competitions/")) {
     const league = url.pathname.split("/")[3];
+    if (scenario?.startsWith("fallback-api-")) return new Response("provider unavailable", { status: 503 });
+    if (scenario === "fallback-ambiguous" || scenario === "fallback-kickoff-conflict") return new Response("provider unavailable", { status: 503 });
+    if (scenario === "fallback-network") throw new TypeError("fixture network unavailable");
+    if (scenario === "fallback-timeout") throw new DOMException("fixture timed out", "TimeoutError");
+    if (scenario === "fallback-http-401") return new Response("unauthorized", { status: 401 });
+    if (scenario === "fallback-http-403") return new Response("forbidden", { status: 403 });
+    if (scenario === "fallback-http-429") return new Response("rate limited", { status: 429 });
+    if (scenario === "fallback-http-503") return new Response("provider unavailable", { status: 503 });
+    if (scenario === "fallback-invalid-json") return new Response("{", { headers: { "content-type": "application/json" } });
+    if (scenario === "fallback-invalid-shape") return new Response(JSON.stringify({ matches: [{ id: "bad" }] }), { headers: { "content-type": "application/json" } });
+    if (scenario === "fallback-empty") return Response.json({ matches: [] });
     if (url.searchParams.get("dateFrom") === "2026-11-01") return new Response("provider unavailable", { status: 403 });
     body = { matches: [match(({ PL: 1001, PD: 2001, SA: 3001, CL: 4001 })[league], league, "2026-10-17")] };
   } else if (url.hostname === "api.football-data.org" && url.pathname === "/v4/matches/9999") {
@@ -183,6 +206,10 @@ globalThis.fetch = async (input, init = {}) => {
     body.homeTeam = { id: 402, name: "Brentford FC" };
     body.awayTeam = { id: 64, name: "Liverpool FC" };
   } else if (url.hostname === "api.football-data.org" && url.pathname.startsWith("/v4/matches/")) {
+    if (scenario?.startsWith("fallback-api-")) return new Response("provider unavailable", { status: 503 });
+    if (scenario === "fallback-exact-failure") return new Response("provider unavailable", { status: 503 });
+    if (scenario === "fallback-network") throw new TypeError("fixture network unavailable");
+    if (scenario === "fallback-timeout") throw new DOMException("fixture timed out", "TimeoutError");
     const id = Number(url.pathname.split("/").at(-1));
     const league = ({ 1001: "PL", 2001: "PD", 3001: "SA", 4001: "CL" })[id];
     body = match(id, league, "2026-10-17");
